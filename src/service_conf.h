@@ -26,7 +26,7 @@ inline const char* kManagedKeys[] = {
     "GGUF_FILE", "GGUF_MTP_FILE", "GGUF_VISION_FILE",
     "TOKENIZER_DIR", "MAX_CONTEXT", "PARALLEL", "KV_POOL_TOKENS", "KV_PAGED",
     "PREFILL_CHUNK", "ROPE_FACTOR",
-    "KVSNAP_MAX_GB",
+    "KVSNAP_MAX_GB", "AFFINITY",
     "ENGINE_HOST", "ENGINE_PORT", "API_HOST", "API_PORT",
 };
 inline const size_t kManagedKeysCount = sizeof(kManagedKeys) / sizeof(kManagedKeys[0]);
