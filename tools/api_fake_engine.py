@@ -175,12 +175,59 @@ def handle(conn):
                           98817, 198, 510, 15704, 29, 198, 510, 1628, 29, 198,
                           248059]
                 tokens = [(token, -0.1) for token in tokens]
-            elif n_ids <= 2:
-                tokens = [(4130, -0.5), (284, -0.25)]  # " Par" + "is"
-            elif 248069 in ids:
-                tokens = [(12675, -0.125)]  # enable_thinking=false -> "Hi"
             else:
-                tokens = [(248069, -0.75), (12675, -0.125)]  # "</think>Hi"
+                # Think-resume scenarios. The tool template embeds </think>
+                # (token 248069) in every prompt's tool instructions, so the
+                # continuation is identified by its TAIL: the API appends the
+                # closer ids [198, 248069, 271] to the prompt it resumes from,
+                # and the post-close variant (9006) continues from a prompt
+                # ending in its generated [248069, 271]. First runs end with
+                # the template's generation prompt (the <think> opener),
+                # never with the closer.
+                tail3 = ids[-3:] if len(ids) >= 3 else []
+                tail2 = ids[-2:] if len(ids) >= 2 else []
+                resumed_prompt = (tail3 == [198, 248069, 271] or
+                                  tail2 == [248069, 271])
+                think_only = [(198, -0.1), (27, -0.1), (1628, -0.1),
+                              (27362, -0.1), (67017, -0.1), (29, -0.1)]
+                if resumed_prompt and " 9005 " in line:
+                    # 9005's FIRST resumed run (the un-rotated client seed
+                    # 9005 still sits in the SAMPLE field): EOS without
+                    # emitting any token. The API must retry the identical
+                    # continuation with a rotated seed; the retried run
+                    # misses this exact-seed branch and lands in the
+                    # resumed_prompt branch below.
+                    tokens = []
+                elif resumed_prompt:
+                    # Any other think-resume continuation: a complete answer.
+                    tokens = [(12675, -0.125)]  # "Hi"
+                elif "9004" in fields:
+                    # Think-only EOS: the reply dies inside the unclosed
+                    # <think> block (no </think>, no content, no tool call).
+                    # Text: "\n<function=get_weather>" — plausible thinking
+                    # that never closes the think block. The API must
+                    # synthesize "\n</think>\n\n" and resume.
+                    tokens = think_only
+                elif "9005" in fields:
+                    tokens = think_only
+                elif "9006" in fields:
+                    # EOS right after a bare </think>: reasoning closes but
+                    # the answer never starts. The API must resume WITHOUT
+                    # emitting a second closer; the continuation (tail
+                    # [248069, 271]) lands in the resumed_prompt branch.
+                    tokens = [(248069, -0.1), (271, -0.1)]
+                elif "9007" in fields:
+                    # Think-only EOS with tool_choice=required: the API must
+                    # NOT resume (the raw text has no answer split to
+                    # evaluate), so exactly one generation happens and the
+                    # reply is replayed as one think-only tool call.
+                    tokens = think_only
+                elif n_ids <= 2:
+                    tokens = [(4130, -0.5), (284, -0.25)]  # " Par" + "is"
+                elif 248069 in ids:
+                    tokens = [(12675, -0.125)]  # enable_thinking=false -> "Hi"
+                else:
+                    tokens = [(248069, -0.75), (12675, -0.125)]  # "</think>Hi"
             for token, logprob in tokens:
                 send_line(conn, f"T {req} {token} {logprob}")
             send_line(conn, f"D {req} done {n_ids} {len(tokens)} 1.0 2.0 0 0 0 0 0")

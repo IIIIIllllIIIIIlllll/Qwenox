@@ -666,6 +666,7 @@ struct GenSpec {
 struct GenOutcome {
     std::string text;
     std::string reason;  // OpenAI finish_reason
+    std::vector<int> tokens;  // generated token ids (for think-resume continuation)
     long long n_prompt = 0;
     long long n_gen = 0;
     double prefill_ms = 0.0;
@@ -730,7 +731,9 @@ GenOutcome run_generation(GenSpec& spec,
     p.bias = spec.bias;
     p.logprobs = spec.logprobs;
     p.mrope_grids = spec.mrope_grids;
-    p.patches = std::move(spec.patches);
+    // Not moved: the caller may need the patches again for a think-resume
+    // continuation run (same prompt + generated ids).
+    p.patches = spec.patches;
     p.snaps = spec.snaps;
     p.ckpt = g_ckpt_ids;
 
@@ -819,6 +822,7 @@ GenOutcome run_generation(GenSpec& spec,
 
     out.text = full;
     out.n_prompt = r.n_prompt;
+    out.tokens = r.tokens;
     // A cancelled request comes back as `D <req> cancel 0 0 0.0 0.0`, which
     // carries no counts, so fall back to what we actually emitted (a stop
     // sequence cancels the turn after the tokens that produced it).
@@ -883,6 +887,192 @@ GenOutcome run_generation(GenSpec& spec,
         reqstat::record(e);
     }
     return out;
+}
+
+/*
+ * Token ids of "\n</think>\n\n": a bare newline closing the (unclosed) think
+ * block, the added-token </think> itself, then the blank line the template
+ * puts between </think> and the answer.
+ */
+constexpr int kThinkCloseId = 248069;
+const std::vector<int> kThinkCloseTailIds = {198, kThinkCloseId, 271};
+const std::string kThinkCloseText = "\n</think>\n\n";
+
+void split_reasoning(const std::string& text, bool thinking_enabled,
+                     std::string* reasoning, std::string* content);
+
+/*
+ * Usage fields that must be summed when a turn is generated in two runs
+ * (original + think-resume continuation). n_prompt is deliberately NOT
+ * summed: the continuation prompt is an internal implementation detail
+ * (original ids + generated ids), and the client-facing prompt_tokens must
+ * stay the original request's prompt size.
+ */
+void merge_gen_outcome(GenOutcome* total, const GenOutcome& part) {
+    total->n_gen += part.n_gen;
+    total->prefill_ms += part.prefill_ms;
+    total->decode_ms += part.decode_ms;
+    total->rounds += part.rounds;
+    total->commit += part.commit;
+    total->proposed += part.proposed;
+    if (total->ttft_ms <= 0.0 || part.ttft_ms < total->ttft_ms) total->ttft_ms = part.ttft_ms;
+    if (!part.logprobs.empty()) {
+        total->logprobs.insert(total->logprobs.end(), part.logprobs.begin(),
+                               part.logprobs.end());
+    }
+    total->tokens.insert(total->tokens.end(), part.tokens.begin(), part.tokens.end());
+}
+
+/*
+ * Fallback for a model quirk: the model sometimes ends its turn while the
+ * reply is still inside the unclosed <think> block (no </think>, no visible
+ * content, no tool call). Clients then see a reasoning-only turn with
+ * finish_reason=stop, and termination checks replay it as an empty assistant
+ * exemplar that few-shots the model into repeating the behavior. To keep
+ * clients unaffected, detect the pattern and continue generation after a
+ * synthesized "</think>": the synthesized closer is streamed first (the
+ * splitter emits the buffered reasoning and starts content mode), then a
+ * second run is launched with the original prompt + generated ids + the
+ * closer ids appended. The tokenizer cache makes the continuation prefill
+ * incremental, so the retry costs only the newly decoded tokens.
+ *
+ * The continuation itself can hit EOS on its first step (the model still
+ * believes the turn is over). Nothing has been streamed for it, so identical
+ * continuations are retried a few times; if all of them come back empty, the
+ * whole generation is retried once from the original prompt (near-free under
+ * the tokenizer cache, and a fresh think block succeeds at the same rate as
+ * any first attempt). Only if that retry is think-only too does the request
+ * degrade to the pre-fix reasoning-only behavior.
+ */
+GenOutcome run_generation_with_think_resume(
+    GenSpec& spec, bool thinking_enabled, bool tool_forced,
+    const std::function<bool(const std::string&)>& on_delta, const std::string& log_tag,
+    const std::function<bool()>& on_wait = {}) {
+    // The engine sampler is deterministic for a given context + seed, so
+    // retries with the same seed replay the identical early EOS. Every retry
+    // must carry a fresh seed; derive them from the client's seed when there
+    // is one, from a fixed constant otherwise.
+    unsigned long long retry_seed = spec.seeded ? spec.seed : 0x51CEBEEFull;
+    auto next_seed = [&retry_seed]() {
+        retry_seed = retry_seed * 6364136223846793005ULL + 1442695040888963407ULL;
+        return retry_seed;
+    };
+    constexpr int kMaxResumeAttempts = 3;
+    constexpr int kMaxFullAttempts = 2;  // original run + one full retry
+    GenOutcome total;
+    bool have_total = false;
+    for (int full_attempt = 1; full_attempt <= kMaxFullAttempts; ++full_attempt) {
+        if (full_attempt > 1 && spec.sample) {
+            spec.seed = next_seed();
+            spec.seeded = true;
+        }
+        GenOutcome run = run_generation(spec, on_delta, log_tag, on_wait);
+        if (run.client_gone) {
+            if (have_total) total.client_gone = true;
+            return have_total ? total : run;
+        }
+        // Early-EOS detection: the turn ended normally but produced no visible
+        // answer. Two variants share this signature -- the reply dies inside
+        // the unclosed <think> block, or right after a bare </think> with
+        // neither content nor a tool call. Both confuse termination checks
+        // into replaying an empty assistant exemplar that few-shots the model
+        // into repeating the behavior. Forced tool choice skips the
+        // think/answer split (the raw text goes straight to the tool
+        // parser), so the empty-answer signature cannot be evaluated there
+        // and resume stays off.
+        std::string run_reasoning, run_answer;
+        if (!tool_forced) split_reasoning(run.text, thinking_enabled, &run_reasoning, &run_answer);
+        const bool resumable =
+            thinking_enabled && !tool_forced &&
+            run.reason == "stop" && !run.hit_stop &&
+            !run.tokens.empty() && run_answer.empty();
+        if (!resumable) {
+            if (!have_total) return run;
+            total.text += run.text;
+            total.reason = run.reason;
+            total.hit_stop = run.hit_stop;
+            merge_gen_outcome(&total, run);
+            return total;
+        }
+
+        const bool unclosed =
+            run.text.find("</think>") == std::string::npos &&
+            run.text.find("</thinking>") == std::string::npos &&
+            run.text.find("</ think>") == std::string::npos &&
+            run.text.find("</think >") == std::string::npos;
+        fprintf(stderr,
+                "REQ %s ended with an empty answer (%s): resuming generation\n",
+                log_tag.c_str(), unclosed ? "inside <think>" : "after </think>");
+        if (unclosed) {
+            // Mirror the synthesized closer into the stream and the outcome
+            // text so the client's splitter and non-streaming
+            // split_reasoning() see the same think/answer boundary.
+            if (on_delta && !on_delta(kThinkCloseText)) {
+                total.client_gone = true;
+                return have_total ? total : run;
+            }
+            run.text += kThinkCloseText;
+        }
+        // Account the first (empty-answer) run now; empty resume attempts
+        // below must not inflate the usage the client sees.
+        total.text += run.text;
+        total.reason = run.reason;
+        total.hit_stop = run.hit_stop;
+        merge_gen_outcome(&total, run);
+        have_total = true;
+
+        GenSpec resume = spec;
+        resume.ids = spec.ids;
+        resume.ids.reserve(spec.ids.size() + run.tokens.size() + kThinkCloseTailIds.size());
+        resume.ids.insert(resume.ids.end(), run.tokens.begin(), run.tokens.end());
+        if (unclosed)
+            resume.ids.insert(resume.ids.end(), kThinkCloseTailIds.begin(),
+                              kThinkCloseTailIds.end());
+        // The original SNAPS cuts index into the original prompt only; the
+        // continuation prompt is longer, so the hints no longer apply.
+        resume.snaps.clear();
+        resume.logprobs = false;  // split logprobs across two runs cannot be merged faithfully
+        if (resume.max_tokens > 0) {
+            const long long used = static_cast<long long>(run.tokens.size());
+            if (resume.max_tokens > used) resume.max_tokens -= static_cast<int>(used);
+            else resume.max_tokens = 1;
+        }
+        bool resumed = false;
+        for (int attempt = 1; attempt <= kMaxResumeAttempts && !resumed; ++attempt) {
+            if (attempt > 1 && resume.sample) {
+                // Same seed => identical (empty) output; rotate to escape the
+                // deterministic replay of the early EOS.
+                resume.seed = next_seed();
+                resume.seeded = true;
+            }
+            GenOutcome rest = run_generation(resume, on_delta, log_tag, on_wait);
+            if (rest.client_gone) {
+                total.client_gone = true;
+                return total;
+            }
+            if (rest.tokens.empty() && rest.text.empty()) {
+                fprintf(stderr,
+                        "REQ %s: resume attempt %d/%d hit EOS immediately, retrying\n",
+                        log_tag.c_str(), attempt, kMaxResumeAttempts);
+                continue;
+            }
+            total.text += rest.text;
+            total.reason = rest.reason;
+            total.hit_stop = total.hit_stop || rest.hit_stop;
+            merge_gen_outcome(&total, rest);
+            resumed = true;
+        }
+        if (resumed) return total;
+        if (full_attempt < kMaxFullAttempts) {
+            fprintf(stderr,
+                    "REQ %s: resume produced no output after %d attempts, retrying full "
+                    "generation\n",
+                    log_tag.c_str(), kMaxResumeAttempts);
+        }
+    }
+    // Every full attempt was empty-answer and every resume came back empty:
+    // degrade gracefully to the pre-fix behavior instead of failing.
+    return total;
 }
 
 // -------------------------------------------------------------- request io --
@@ -2713,8 +2903,8 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
     };
 
     if (!stream) {
-        GenOutcome o = run_generation(
-            spec, nullptr, id,
+        GenOutcome o = run_generation_with_think_resume(
+            spec, rr.thinking_enabled, tool_setup.choice.forced(), nullptr, id,
             [st]() { return st == nullptr || !st->disconnected(); });
         std::string reasoning, answer;
         if (tool_setup.choice.forced())
@@ -2790,8 +2980,8 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
         if (st->disconnected()) return false;
         return send_frame(st, text_chunk("content", ""));
     };
-    GenOutcome o = run_generation(
-        spec,
+    GenOutcome o = run_generation_with_think_resume(
+        spec, rr.thinking_enabled, tool_setup.choice.forced(),
         [&](const std::string& d) {
             if (st->disconnected()) return false;
             if (tool_setup.choice.forced()) return dispatch_tool_events(parser.feed(d));

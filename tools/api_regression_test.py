@@ -259,6 +259,108 @@ def main():
           "上海" in json.loads(required_call["function"]["arguments"])["city"],
           "chat-tool-required-multiple", raw[:1000])
 
+    # ---- think-resume: the fake engine ends some replies inside the
+    # unclosed <think> block or right after </think>. The API must detect
+    # the empty answer, synthesize the closer, resume, and present ONE
+    # normal response (reasoning + answer/tool calls) to the client.
+
+    # seed 9004, non-stream: think-only EOS, resumed run answers "Hi"
+    # (the continuation prompt carries the closer id 248069).
+    resume_body = dict(tool_body, seed=9004)
+    status, _, raw = request(args.base, "/v1/chat/completions", resume_body)
+    resume = json.loads(raw)
+    resume_msg = resume["choices"][0]["message"]
+    resume_usage = resume["usage"]
+    check(status == 200 and resume["choices"][0]["finish_reason"] == "stop" and
+          resume_msg["content"] == "Hi" and
+          resume_msg.get("reasoning_content") == "\n<function=get_weather>",
+          "chat-think-resume-nonstream", raw[:1200])
+    # prompt_tokens must reflect the client's prompt, not the internal
+    # continuation prompt (which is longer).
+    check(resume_usage["prompt_tokens"] < resume_usage["completion_tokens"] * 64,
+          "chat-think-resume-usage-prompt", raw[:1200])
+
+    # seed 9004, stream: the same turn streamed. The client sees reasoning
+    # deltas, then content "Hi"; no duplicate tool-call or double closer.
+    status, _, raw = request(args.base, "/v1/chat/completions",
+                             dict(resume_body, stream=True))
+    frames = parse_sse(raw)
+    streamed_reasoning = "".join(
+        frame["choices"][0]["delta"].get("reasoning_content", "")
+        for frame in frames
+        if isinstance(frame, dict) and frame.get("choices")
+        and "reasoning_content" in frame["choices"][0].get("delta", {}))
+    streamed_content = "".join(
+        frame["choices"][0]["delta"].get("content", "")
+        for frame in frames
+        if isinstance(frame, dict) and frame.get("choices")
+        and "content" in frame["choices"][0].get("delta", {}))
+    streamed_finish = None
+    for frame in frames:
+        if isinstance(frame, dict) and frame.get("choices"):
+            streamed_finish = frame["choices"][0].get("finish_reason") or streamed_finish
+    check(streamed_finish == "stop" and streamed_content == "Hi" and
+          streamed_reasoning == "\n<function=get_weather>",
+          "chat-think-resume-stream", raw[:1600])
+
+    # seed 9005: think-only EOS, first resumed run EOS-es immediately, the
+    # retried continuation succeeds. The client must still see one clean
+    # answer, and the fake engine's 9005-first-resume branch only matches
+    # the un-rotated seed, so a pass here proves the retry rotated it.
+    retry_body = dict(tool_body, seed=9005)
+    status, _, raw = request(args.base, "/v1/chat/completions", retry_body)
+    retry = json.loads(raw)
+    retry_msg = retry["choices"][0]["message"]
+    check(status == 200 and retry["choices"][0]["finish_reason"] == "stop" and
+          retry_msg["content"] == "Hi",
+          "chat-think-resume-retry-after-empty", raw[:1200])
+
+    # seed 9006: EOS right after a bare </think>. The resumed answer must
+    # arrive without a second closer and without duplicating the reasoning.
+    after_body = {
+        "messages": [{"role": "user", "content": "weather 9006"}],
+        "tools": tools,
+        "temperature": 1,
+        "seed": 9006,
+        "max_tokens": 80,
+    }
+    status, _, raw = request(args.base, "/v1/chat/completions", after_body)
+    after = json.loads(raw)
+    after_msg = after["choices"][0]["message"]
+    check(status == 200 and after["choices"][0]["finish_reason"] == "stop" and
+          after_msg["content"] == "Hi" and
+          after_msg.get("reasoning_content") == "",
+          "chat-think-resume-after-close-nonstream", raw[:1200])
+    status, _, raw = request(args.base, "/v1/chat/completions",
+                             dict(after_body, stream=True))
+    frames = parse_sse(raw)
+    after_reasoning = "".join(
+        frame["choices"][0]["delta"].get("reasoning_content", "")
+        for frame in frames
+        if isinstance(frame, dict) and frame.get("choices")
+        and "reasoning_content" in frame["choices"][0].get("delta", {}))
+    after_content = "".join(
+        frame["choices"][0]["delta"].get("content", "")
+        for frame in frames
+        if isinstance(frame, dict) and frame.get("choices")
+        and "content" in frame["choices"][0].get("delta", {}))
+    check(after_content == "Hi" and after_reasoning == "",
+          "chat-think-resume-after-close-stream", raw[:1600])
+
+    # seed 9007 with tool_choice=required: no resume must happen (one
+    # generation only). The think-only reply is raw text to the forced
+    # parser: "<function=get_weather>" without its closer is a partial
+    # call, so finish_reason must be "length" and no tool call may be
+    # emitted — and crucially it must not loop resuming.
+    forced_resume_body = dict(tool_body, seed=9007, tool_choice="required")
+    status, _, raw = request(args.base, "/v1/chat/completions", forced_resume_body)
+    forced_resume = json.loads(raw)
+    forced_calls = forced_resume["choices"][0]["message"].get("tool_calls", [])
+    check(status == 200 and
+          forced_resume["choices"][0]["finish_reason"] == "length" and
+          not forced_calls,
+          "chat-think-resume-forced-partial-length", raw[:1200])
+
     response_tools = [
         {"type": "function", "name": "get_weather",
          "parameters": tools[0]["function"]["parameters"]},
