@@ -186,8 +186,12 @@ def handle(conn):
                 # never with the closer.
                 tail3 = ids[-3:] if len(ids) >= 3 else []
                 tail2 = ids[-2:] if len(ids) >= 2 else []
+                # A continuation prompt ends with either the synthesized
+                # closer ids [198, 248069, 271], the generated closer pair
+                # [248069, 271] (9006), or 9008's generated [248069, 220]
+                # (closer + space).
                 resumed_prompt = (tail3 == [198, 248069, 271] or
-                                  tail2 == [248069, 271])
+                                  tail2 in ([248069, 271], [248069, 220]))
                 think_only = [(198, -0.1), (27, -0.1), (1628, -0.1),
                               (27362, -0.1), (67017, -0.1), (29, -0.1)]
                 if resumed_prompt and " 9005 " in line:
@@ -216,6 +220,28 @@ def handle(conn):
                     # emitting a second closer; the continuation (tail
                     # [248069, 271]) lands in the resumed_prompt branch.
                     tokens = [(248069, -0.1), (271, -0.1)]
+                elif "9008" in fields:
+                    # </think> followed by a single space, then EOS: the
+                    # answer is whitespace-only. split_reasoning only strips
+                    # leading newlines, so " " passes as non-empty content
+                    # and the whitespace-only reply would escape the resume
+                    # detection while clients trim it away. The API must
+                    # treat it as an empty answer and resume.
+                    tokens = [(248069, -0.1), (220, -0.1)]
+                elif "9009" in fields:
+                    # A hallucinated tool call: complete <tool_call> block
+                    # naming a function that is NOT in the client's tools
+                    # list. The old parser entered Broken and silently
+                    # swallowed everything after </think>, so clients saw a
+                    # reasoning-only turn. The call must be surfaced in the
+                    # standard tool_calls shape so the client agent can
+                    # reject it with a tool error and the model self-correct.
+                    # Text: "</think>\n\n<tool_call>\n<function=ghost_tool>\n<parameter=city>\n北京\n</parameter>\n</function>\n</tool_call>"
+                    tokens = [(t, -0.1) for t in [
+                        248069, 271, 248058, 198, 27, 1628, 28, 37372, 22076,
+                        29, 198, 27, 15704, 28, 8656, 29, 198, 98116, 198,
+                        510, 15704, 29, 198, 510, 1628, 29, 198, 248059,
+                    ]]
                 elif "9007" in fields:
                     # Think-only EOS with tool_choice=required: the API must
                     # NOT resume (the raw text has no answer split to

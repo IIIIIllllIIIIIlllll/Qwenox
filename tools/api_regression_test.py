@@ -347,6 +347,63 @@ def main():
     check(after_content == "Hi" and after_reasoning == "",
           "chat-think-resume-after-close-stream", raw[:1600])
 
+    # seed 9008: </think> followed by a single space, then EOS. The answer
+    # is whitespace-only and must be treated as empty (clients trim it into
+    # a reasoning-only turn otherwise). The resumed answer lands after the
+    # whitespace, so content is " Hi" — non-empty is what matters.
+    ws_body = {
+        "messages": [{"role": "user", "content": "weather 9008"}],
+        "tools": tools,
+        "temperature": 1,
+        "seed": 9008,
+        "max_tokens": 80,
+    }
+    status, _, raw = request(args.base, "/v1/chat/completions", ws_body)
+    ws = json.loads(raw)
+    ws_msg = ws["choices"][0]["message"]
+    check(status == 200 and ws["choices"][0]["finish_reason"] == "stop" and
+          ws_msg["content"].strip() == "Hi",
+          "chat-think-resume-whitespace-answer", raw[:1200])
+
+    # seed 9009: a hallucinated tool call naming a function that is not in
+    # the tools list. The call must be surfaced in the standard tool_calls
+    # shape (the old parser swallowed the block, leaving clients a
+    # reasoning-only turn) so the client agent can reject it with a tool
+    # error and the model self-correct.
+    ghost_body = {
+        "messages": [{"role": "user", "content": "weather 9009"}],
+        "tools": tools,
+        "temperature": 1,
+        "seed": 9009,
+        "max_tokens": 80,
+    }
+    status, _, raw = request(args.base, "/v1/chat/completions", ghost_body)
+    ghost = json.loads(raw)
+    ghost_msg = ghost["choices"][0]["message"]
+    ghost_calls = ghost_msg.get("tool_calls") or []
+    check(status == 200 and ghost["choices"][0]["finish_reason"] == "tool_calls" and
+          len(ghost_calls) == 1 and
+          ghost_calls[0]["function"]["name"] == "ghost_tool" and
+          json.loads(ghost_calls[0]["function"]["arguments"]) == {"city": "北京"},
+          "chat-unknown-tool-standard-shape", raw[:1200])
+    status, _, raw = request(args.base, "/v1/chat/completions",
+                             dict(ghost_body, stream=True))
+    frames = parse_sse(raw)
+    ghost_finish = None
+    ghost_name, ghost_args = "", ""
+    for frame in frames:
+        if not isinstance(frame, dict) or not frame.get("choices"):
+            continue
+        item = frame["choices"][0]
+        ghost_finish = item.get("finish_reason") or ghost_finish
+        for tc in item.get("delta", {}).get("tool_calls", []):
+            function = tc.get("function", {})
+            ghost_name += function.get("name", "")
+            ghost_args += function.get("arguments", "")
+    check(ghost_finish == "tool_calls" and ghost_name == "ghost_tool" and
+          json.loads(ghost_args) == {"city": "北京"},
+          "chat-unknown-tool-stream", raw[:1600])
+
     # seed 9007 with tool_choice=required: no resume must happen (one
     # generation only). The think-only reply is raw text to the forced
     # parser: "<function=get_weather>" without its closer is a partial

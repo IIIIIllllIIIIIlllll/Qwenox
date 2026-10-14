@@ -99,6 +99,11 @@ class StreamParser {
     size_t next_index_ = 0;
     size_t argument_count_ = 0;
     std::string parameter_key_;
+    // True while parsing a <tool_call> whose function name is not in the
+    // tools list. The call is still surfaced to the client in the standard
+    // tool_calls shape so the agent can reject it and self-correct; only
+    // the required-parameter validation is skipped (no schema to check).
+    bool unknown_call_ = false;
     std::vector<std::string> parameter_types_;
     bool stream_parameter_ = false;
     bool value_started_ = false;

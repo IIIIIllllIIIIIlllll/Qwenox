@@ -438,6 +438,7 @@ void StreamParser::start_call(std::string name, std::vector<Event>* events) {
     current_.index = next_index_++;
     current_.id = make_id_ ? make_id_() : std::string();
     current_.name = std::move(name);
+    unknown_call_ = !function_exists(tools_, current_.name);
     argument_count_ = 0;
     events->push_back(Event{EventType::CallStart, current_.index, current_.id,
                             current_.name, {}});
@@ -482,6 +483,14 @@ void StreamParser::finish_parameter(std::string raw, std::vector<Event>* events)
 }
 
 bool StreamParser::valid_call() const {
+    // A hallucinated function name still reaches the client as a standard
+    // tool_call (the agent rejects it and self-corrects); without a schema
+    // there is nothing to validate beyond a parseable arguments object.
+    if (unknown_call_) {
+        const json args = json::parse(
+            current_.arguments + (argument_count_ == 0 ? "{}" : "}"), nullptr, false);
+        return args.is_object();
+    }
     json args = json::parse(current_.arguments + (argument_count_ == 0 ? "{}" : "}"),
                             nullptr, false);
     if (!args.is_object()) return false;
@@ -560,9 +569,10 @@ std::vector<Event> StreamParser::pump(bool final) {
                 *out = json::parse(text, nullptr, false);
                 if (out->is_discarded())
                     *out = json::parse(python_literals_to_json(text), nullptr, false);
+                // Unknown function names pass through too (see start_call):
+                // the client agent rejects them and the model self-corrects.
                 return out->is_object() && out->contains("name") &&
                        (*out)["name"].is_string() &&
-                       function_exists(tools_, (*out)["name"].get<std::string>()) &&
                        (forced_name_.empty() ||
                         (*out)["name"].get<std::string>() == forced_name_);
             };
@@ -667,7 +677,17 @@ std::vector<Event> StreamParser::pump(bool final) {
                 continue;
             }
             if (!function_exists(tools_, buffer_.substr(at, close - at))) {
-                state_ = State::Broken;
+                // The model hallucinated a function name that is not in the
+                // tools list. Swallowing the block (the old Broken path)
+                // silently hides everything the model said after </think>:
+                // clients then see a reasoning-only turn, and agent-loop
+                // termination checks replay it as an empty assistant
+                // exemplar. Surface the call in the standard tool_calls
+                // shape instead, so the client agent can reject it with a
+                // tool error and let the model self-correct.
+                start_call(buffer_.substr(at, close - at), &events);
+                buffer_.erase(0, close + 1);
+                state_ = State::Between;
                 continue;
             }
             start_call(buffer_.substr(at, close - at), &events);

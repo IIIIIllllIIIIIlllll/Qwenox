@@ -976,16 +976,35 @@ GenOutcome run_generation_with_think_resume(
         // the unclosed <think> block, or right after a bare </think> with
         // neither content nor a tool call. Both confuse termination checks
         // into replaying an empty assistant exemplar that few-shots the model
-        // into repeating the behavior. Forced tool choice skips the
-        // think/answer split (the raw text goes straight to the tool
-        // parser), so the empty-answer signature cannot be evaluated there
-        // and resume stays off.
+        // into repeating the behavior. The answer is judged after stripping
+        // ALL whitespace (not just the leading newlines split_reasoning
+        // removes): the model sometimes emits "</think> " with trailing
+        // spaces, and a whitespace-only answer would otherwise pass as
+        // content while clients trim it away and show a reasoning-only turn.
+        // Forced tool choice skips the think/answer split (the raw text goes
+        // straight to the tool parser), so the empty-answer signature cannot
+        // be evaluated there and resume stays off.
         std::string run_reasoning, run_answer;
         if (!tool_forced) split_reasoning(run.text, thinking_enabled, &run_reasoning, &run_answer);
+        const auto is_blank = [](const std::string& s) {
+            for (unsigned char c : s)
+                if (c != ' ' && c != '\t' && c != '\n' && c != '\r' &&
+                    c != '\f' && c != '\v')
+                    return false;
+            return true;
+        };
+        // A hallucinated tool call (function name not in the client's list)
+        // is surfaced as a standard tool_call downstream, so the raw text
+        // carries a <tool_call> block even though the think/answer split
+        // yields an empty answer. That turn is NOT empty — resuming would
+        // duplicate the call.
+        const bool has_tool_call_text =
+            run.text.find("<tool_call>") != std::string::npos ||
+            run.text.find("{\"name\"") != std::string::npos;
         const bool resumable =
             thinking_enabled && !tool_forced &&
             run.reason == "stop" && !run.hit_stop &&
-            !run.tokens.empty() && run_answer.empty();
+            !run.tokens.empty() && !has_tool_call_text && is_blank(run_answer);
         if (!resumable) {
             if (!have_total) return run;
             total.text += run.text;
