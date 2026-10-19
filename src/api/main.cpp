@@ -3362,7 +3362,9 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
     if (!dispatch_tool_events(parser.feed(tool_setup.choice.parser_prefix(tool_format)))) return;
     auto on_wait = [&]() {
         if (st->disconnected()) return false;
-        return send_frame(st, text_chunk("content", ""));
+        // 协议中性 keep-alive（与 /v1/responses 相同）：空 content 帧会被转换层
+        // 当成"正文开始"，把 thinking 截成 text 在前、reasoning 在后的非法序列。
+        return st->send_raw(": keep-alive\n\n");
     };
     GenOutcome o = run_generation_guarded(
         spec, guard,
@@ -3567,6 +3569,13 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
 
         const bool incomplete = o.reason == "length" || parser.has_partial_call();
         json output = json::array();
+        if (!reasoning.empty())
+            output.push_back(
+                json{{"id", make_id("rs_")},
+                     {"type", "reasoning"},
+                     {"status", "completed"},
+                     {"summary", json::array({json{{"type", "summary_text"},
+                                                   {"text", reasoning}}})}});
         if (!parser.content().empty() || (!incomplete && parser.calls().empty())) {
             output.push_back(message_item(make_id("msg_"),
                                           incomplete ? "incomplete" : "completed",
@@ -3605,6 +3614,74 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
                      json{{"response", response_object("in_progress", json::array(), nullptr)}});
     };
 
+    // reasoning 输出项（summary 单 part）：先于 message/function_call 打开，
+    // 首个正文/工具事件前关闭。对应 chat/completions 的 reasoning_content。
+    struct ReasoningState {
+        bool open = false;
+        int output_index = -1;
+        std::string id;
+        std::string summary;
+    } rstate;
+    auto reasoning_item = [&](const char* status) {
+        return json{{"id", rstate.id},
+                    {"type", "reasoning"},
+                    {"status", status},
+                    {"summary", rstate.summary.empty()
+                                    ? json::array()
+                                    : json::array({json{{"type", "summary_text"},
+                                                        {"text", rstate.summary}}})}};
+    };
+    auto start_reasoning = [&]() {
+        if (rstate.open) return true;
+        if (!ensure_created()) return false;
+        rstate.open = true;
+        rstate.output_index = next_output_index++;
+        rstate.id = make_id("rs_");
+        rstate.summary.clear();
+        if (!event("response.output_item.added",
+                   json{{"output_index", rstate.output_index},
+                        {"item", reasoning_item("in_progress")}}))
+            return false;
+        return event("response.reasoning_summary_part.added",
+                     json{{"item_id", rstate.id},
+                          {"output_index", rstate.output_index},
+                          {"summary_index", 0},
+                          {"part", json{{"type", "summary_text"}, {"text", ""}}}});
+    };
+    auto finish_reasoning = [&]() {
+        if (!rstate.open) return true;
+        if (!event("response.reasoning_summary_text.done",
+                   json{{"item_id", rstate.id},
+                        {"output_index", rstate.output_index},
+                        {"summary_index", 0},
+                        {"text", rstate.summary}}))
+            return false;
+        if (!event("response.reasoning_summary_part.done",
+                   json{{"item_id", rstate.id},
+                        {"output_index", rstate.output_index},
+                        {"summary_index", 0},
+                        {"part", json{{"type", "summary_text"},
+                                      {"text", rstate.summary}}}}))
+            return false;
+        json item = reasoning_item("completed");
+        if (!event("response.output_item.done",
+                   json{{"output_index", rstate.output_index}, {"item", item}}))
+            return false;
+        put_output(rstate.output_index, std::move(item));
+        rstate.open = false;
+        return true;
+    };
+    auto emit_reasoning = [&](const std::string& delta) {
+        if (delta.empty()) return true;
+        if (!start_reasoning()) return false;
+        rstate.summary += delta;
+        return event("response.reasoning_summary_text.delta",
+                     json{{"item_id", rstate.id},
+                          {"output_index", rstate.output_index},
+                          {"summary_index", 0},
+                          {"delta", delta}});
+    };
+
     struct MessageState {
         bool open = false;
         int output_index = -1;
@@ -3613,6 +3690,7 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
     } message;
     auto start_message = [&]() {
         if (message.open) return true;
+        if (!finish_reasoning()) return false;
         if (!ensure_created()) return false;
         message.open = true;
         message.output_index = next_output_index++;
@@ -3681,7 +3759,7 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
             if (parsed.index >= call_states.size()) call_states.resize(parsed.index + 1);
             CallState& call = call_states[parsed.index];
             if (parsed.type == toolparse::EventType::CallStart) {
-                if (!finish_message() || !ensure_created()) return false;
+                if (!finish_reasoning() || !finish_message() || !ensure_created()) return false;
                 call.open = true;
                 call.output_index = next_output_index++;
                 call.item_id = make_id("fc_");
@@ -3737,6 +3815,7 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
             if (tool_setup.choice.forced()) return dispatch_tool_events(parser.feed(delta));
             std::string reasoning_delta, content_delta;
             splitter.feed(delta, &reasoning_delta, &content_delta);
+            if (!emit_reasoning(reasoning_delta)) return false;
             return dispatch_tool_events(parser.feed(content_delta));
         },
         id, on_wait);
@@ -3744,11 +3823,12 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
     if (!tool_setup.choice.forced()) {
         std::string reasoning_delta, content_delta;
         splitter.finish(&reasoning_delta, &content_delta);
+        if (!emit_reasoning(reasoning_delta)) return;
         if (!dispatch_tool_events(parser.feed(content_delta))) return;
         if (!dispatch_tool_events(parser.feed(o.reasoning_calls))) return;
     }
     if (!dispatch_tool_events(parser.finish())) return;
-    if (!finish_message() || !ensure_created()) return;
+    if (!finish_reasoning() || !finish_message() || !ensure_created()) return;
 
     bool partial_call = parser.has_partial_call();
     for (CallState& call : call_states) {
@@ -4191,12 +4271,15 @@ void messages_impl(const http::Request& q, http::Response* r, http::Stream* st) 
     const bool stream = bool_field(p.body, "stream", false) && st != nullptr;
     const std::string id = make_id("msg_");
 
-    // Anthropic counts cache reads apart from input_tokens.
+    // Anthropic counts prompt cache reads apart from input_tokens. KVSNAP
+    // resume counts restored generation state in n_cached, but that state is
+    // not client-visible prompt cache and must not produce negative usage.
     auto usage = [&](const GenOutcome* o) {
-        const long long prompt = o != nullptr && o->n_prompt > 0
-                                     ? o->n_prompt
-                                     : static_cast<long long>(spec.ids.size());
-        const long long cached = o != nullptr ? o->n_cached : 0;
+        const long long prompt = static_cast<long long>(spec.ids.size());
+        const long long reported_cached = o != nullptr ? o->n_cached : 0;
+        const long long cached = reported_cached >= 0 && reported_cached <= prompt
+                                     ? reported_cached
+                                     : 0;
         json u{{"input_tokens", prompt - cached},
                {"cache_creation_input_tokens", 0},
                {"cache_read_input_tokens", cached},

@@ -28,6 +28,12 @@ serve_init() {
   KV_PAGED="${KV_PAGED:-1}"
   KV_POOL_TOKENS="${KV_POOL_TOKENS:-0}"
   PARALLEL="${PARALLEL:-1}"
+  KVSNAP_MIN="${KVSNAP_MIN:-4096}"
+  KVSNAP_PARK_MIN="${KVSNAP_PARK_MIN:-$KVSNAP_MIN}"
+  PARK="${PARK:-1}"
+  PARK_WAIT_MS="${PARK_WAIT_MS:-5000}"
+  PARK_MAX_ATTEMPTS="${PARK_MAX_ATTEMPTS:-8}"
+  KV_RESERVE_DECODE="${KV_RESERVE_DECODE:-4096}"
   CONC_PREFILL_CHUNK="${CONC_PREFILL_CHUNK:-8192}"
   PREFILL_CHUNK="${PREFILL_CHUNK:-0}"
   MAX_IMAGES="${MAX_IMAGES:-8}"
@@ -62,10 +68,13 @@ serve_init() {
     value="${!key}"
     [[ "$value" =~ ^[1-9][0-9]*$ && ${#value} -le 8 ]] || fail "$key 必须为正整数"
   done
-  for key in KVSNAP_MAX_GB RCKPT_MAX KV_POOL_TOKENS MTP_GAMMA CONC_PREFILL_CHUNK PREFILL_CHUNK; do
+  for key in KVSNAP_MAX_GB KVSNAP_MIN KVSNAP_PARK_MIN RCKPT_MAX KV_POOL_TOKENS MTP_GAMMA CONC_PREFILL_CHUNK PREFILL_CHUNK PARK_WAIT_MS PARK_MAX_ATTEMPTS KV_RESERVE_DECODE; do
     value="${!key}"
     [[ "$value" =~ ^(0|[1-9][0-9]*)$ && ${#value} -le 8 ]] || fail "$key 必须为非负整数"
   done
+  [[ "$PARK" =~ ^[01]$ ]] || fail 'PARK 必须为 0 或 1'
+  (( PARK_WAIT_MS >= 500 )) || fail 'PARK_WAIT_MS 必须至少为 500 ms'
+  (( PARK_MAX_ATTEMPTS >= 1 && PARK_MAX_ATTEMPTS <= 32 )) || fail 'PARK_MAX_ATTEMPTS 范围为 1–32'
   [[ "$PLE_URING" =~ ^[01]$ ]] || fail 'PLE_URING 必须为 0 或 1'
   [[ "$KV_PAGED" =~ ^[01]$ ]] || fail 'KV_PAGED 必须为 0 或 1'
   [[ "$PARALLEL" =~ ^[1-8]$ ]] || fail 'PARALLEL 范围为 1–8'
@@ -140,6 +149,10 @@ serve_run() {
   if (( CONC_PREFILL_CHUNK > 0 )); then export QWENOX_CONC_PREFILL_CHUNK="$CONC_PREFILL_CHUNK"; fi
   export QWENOX_INDEX_FUSED2=1 QWENOX_PP_MOE_OUT=1 QWENOX_INDEX_STREAM_SELECT=1
   if (( KVSNAP_MAX_GB )); then export QWENOX_KVSNAP=1; else export QWENOX_KVSNAP=0; fi
+  export QWENOX_KVSNAP_MIN="$KVSNAP_MIN" QWENOX_KVSNAP_PARK_MIN="$KVSNAP_PARK_MIN"
+  if (( PARK )); then export QWENOX_PARK=1; else export QWENOX_PARK=0; fi
+  export QWENOX_PARK_WAIT_MS="$PARK_WAIT_MS" QWENOX_PARK_MAX_ATTEMPTS="$PARK_MAX_ATTEMPTS"
+  export QWENOX_KV_RESERVE_DECODE="$KV_RESERVE_DECODE"
   # PLE io_uring 聚集由 service.conf 的 PLE_URING 控制；引擎只查 QWENOX_PLE_URING
   # 的存在性（设 0 也会开），故 0 时必须不导出。
   if (( PLE_URING )); then export QWENOX_PLE_URING=1; fi

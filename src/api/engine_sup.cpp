@@ -304,12 +304,23 @@ bool start(const std::string& root, const svcconf::Conf& conf, std::string* err)
     }
     const std::string engine_host = svcconf::cfg(conf, "ENGINE_HOST", engine_net::kDefaultHost);
     long engine_port = 8730, max_context = 262144, mtp_gamma = 0, kvsnap_max_gb = 20,
-         rckpt_max = 8, kv_paged = 1, kv_pool_tokens = 0, parallel = 1, max_images = 8,
-         prefill_chunk = 0, rope_original = 262144;
+         kvsnap_min = 4096, kvsnap_park_min = 4096, park = 1, park_wait_ms = 5000,
+         park_max_attempts = 8, kv_reserve_decode = 4096, rckpt_max = 8, kv_paged = 1,
+         kv_pool_tokens = 0, parallel = 1, max_images = 8, prefill_chunk = 0,
+         rope_original = 262144;
     svcconf::parse_int(svcconf::cfg(conf, "ENGINE_PORT", "8730"), &engine_port);
     svcconf::parse_int(svcconf::cfg(conf, "MAX_CONTEXT", "262144"), &max_context);
     svcconf::parse_int(svcconf::cfg(conf, "MTP_GAMMA", "0"), &mtp_gamma);
     svcconf::parse_int(svcconf::cfg(conf, "KVSNAP_MAX_GB", "20"), &kvsnap_max_gb);
+    const std::string kvsnap_min_s = svcconf::cfg(conf, "KVSNAP_MIN", "4096");
+    const std::string kvsnap_park_min_s =
+        svcconf::cfg(conf, "KVSNAP_PARK_MIN", kvsnap_min_s);
+    svcconf::parse_int(kvsnap_min_s, &kvsnap_min);
+    svcconf::parse_int(kvsnap_park_min_s, &kvsnap_park_min);
+    svcconf::parse_int(svcconf::cfg(conf, "PARK", "1"), &park);
+    svcconf::parse_int(svcconf::cfg(conf, "PARK_WAIT_MS", "5000"), &park_wait_ms);
+    svcconf::parse_int(svcconf::cfg(conf, "PARK_MAX_ATTEMPTS", "8"), &park_max_attempts);
+    svcconf::parse_int(svcconf::cfg(conf, "KV_RESERVE_DECODE", "4096"), &kv_reserve_decode);
     svcconf::parse_int(svcconf::cfg(conf, "RCKPT_MAX", "8"), &rckpt_max);
     svcconf::parse_int(svcconf::cfg(conf, "KV_PAGED", "1"), &kv_paged);
     svcconf::parse_int(svcconf::cfg(conf, "KV_POOL_TOKENS", "0"), &kv_pool_tokens);
@@ -362,6 +373,12 @@ bool start(const std::string& root, const svcconf::Conf& conf, std::string* err)
     for (const char* f : flags) SetEnvironmentVariableA(f, "1");
     SetEnvironmentVariableA("QWENOX_KVSNAP", kvsnap_max_gb ? "1" : "0");
     SetEnvironmentVariableA("QWENOX_KVSNAP_MAX_GB", std::to_string(kvsnap_max_gb).c_str());
+    SetEnvironmentVariableA("QWENOX_KVSNAP_MIN", std::to_string(kvsnap_min).c_str());
+    SetEnvironmentVariableA("QWENOX_KVSNAP_PARK_MIN", std::to_string(kvsnap_park_min).c_str());
+    SetEnvironmentVariableA("QWENOX_PARK", park ? "1" : "0");
+    SetEnvironmentVariableA("QWENOX_PARK_WAIT_MS", std::to_string(park_wait_ms).c_str());
+    SetEnvironmentVariableA("QWENOX_PARK_MAX_ATTEMPTS", std::to_string(park_max_attempts).c_str());
+    SetEnvironmentVariableA("QWENOX_KV_RESERVE_DECODE", std::to_string(kv_reserve_decode).c_str());
     // KVSNAP_DIR（见 service.conf）：缓存放在它下面的 qwenox-kvsnap 子目录；
     // 留空时不动 QWENOX_KVSNAP_DIR（引擎默认 data\kvsnap，外部指定照常生效）
     {

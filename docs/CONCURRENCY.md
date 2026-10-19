@@ -58,12 +58,17 @@ rckpt 检查点连同 MTP 层的页一起钉住，恢复后继续 MTP 投机（`
 - **槽位复用**：新请求优先选 hist 是其严格前缀的空闲槽位（多轮对话免 prefill），其次
   空槽，再次连接已断开的最久未用槽，最后最久未用槽。
 - **池不够时**（按顺序）：先淘汰 RAM 检查点；再丢空闲槽位的 KV（最久未用优先）；
-  还不够就**中断后来的请求**（在它下一次拿 GPU 时失败）；如果申请者本身就是最后来的，
-  则它自己失败。先来的请求永远不会因为后来的请求被牺牲。
-- **API 表现**：被中断的请求如果已经流出 token，返回 503
-  （`aborted by the engine ... shared KV context full`）；还没出 token 就失败则返回 400。
-  池恢复后同样的请求单独重试即可成功。
-- kvsnap（SSD 快照）与 rckpt（RAM 检查点）照常工作，检查点同样钉住池里的页。
+  还不够时，处于可挂起安全点、且快照长度达到 `QWENOX_KVSNAP_PARK_MIN` 的较晚请求会
+  先 capture 到 KVSNAP、释放 KV 页，之后按 FIFO 恢复；恢复 ticket 会跨暂时性容量不足保留，
+  不会被新请求插队。先来的请求永远不会因为后来的请求被牺牲。
+- **park 边界**：plain decode 和 vision 请求的中途 park 仍关闭；短状态、快照目录不可用、
+  writer 失败、取消/断连或超过 `QWENOX_PARK_MAX_ATTEMPTS` 时沿用有界的 abort/error fallback。
+  `QWENOX_KVSNAP_MIN` 控制普通回合结束后的长期 cache，`QWENOX_KVSNAP_PARK_MIN` 单独控制
+  临时 park snapshot；后者未设置时继承前者。
+- **API 表现**：透明恢复的请求对客户端继续输出；无法 park 或被硬中断的请求如果已经流出 token，
+  返回 503（`aborted by the engine ... shared KV context full`），还没出 token 则返回 400。
+- kvsnap（SSD 快照）与 rckpt（RAM 检查点）照常工作，检查点同样钉住池里的页。MTP checkpoint
+  只有 trunk pages 与非零 MTP sections 都发布后才对 restore 可见。
 
 日志关键字：`[kvpage] pool dry: dropped idle slot`、`aborting the later request`、
 `serve: req N failed:`。

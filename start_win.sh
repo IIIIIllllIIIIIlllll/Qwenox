@@ -67,6 +67,12 @@ ROPE_BETA_SLOW="${ROPE_BETA_SLOW:-1}"
 ROPE_ATTN_SCALE="${ROPE_ATTN_SCALE:-0}"
 MTP_GAMMA="${MTP_GAMMA:-0}"
 KVSNAP_MAX_GB="${KVSNAP_MAX_GB:-20}"
+KVSNAP_MIN="${KVSNAP_MIN:-4096}"
+KVSNAP_PARK_MIN="${KVSNAP_PARK_MIN:-$KVSNAP_MIN}"
+PARK="${PARK:-1}"
+PARK_WAIT_MS="${PARK_WAIT_MS:-5000}"
+PARK_MAX_ATTEMPTS="${PARK_MAX_ATTEMPTS:-8}"
+KV_RESERVE_DECODE="${KV_RESERVE_DECODE:-4096}"
 RCKPT_MAX="${RCKPT_MAX:-8}"
 # 分页 KV（见 service.conf）：默认开启，页池 = 一条 MAX_CONTEXT 序列。
 # Windows 的 arena 上限 95 GiB：v2 权重 512K 池（KV_POOL_TOKENS=524288）用 92–94 GiB，放得下；
@@ -91,6 +97,13 @@ if [[ "$engine_connect_host" == 0.0.0.0 ]]; then engine_connect_host=127.0.0.1; 
 [[ "$ENGINE_PORT" != "$API_PORT" ]] || fail 'ENGINE_PORT 与 API_PORT 必须不同'
 [[ "$MTP_GAMMA" =~ ^[0-8]$ ]] || fail 'MTP_GAMMA 范围为 0–8（0=引擎按模式自选 greedy 4 / 采样自适应）'
 [[ "$KVSNAP_MAX_GB" =~ ^(0|[1-9][0-9]*)$ ]] || fail 'KVSNAP_MAX_GB 必须为非负整数'
+for key in KVSNAP_MIN KVSNAP_PARK_MIN PARK_WAIT_MS PARK_MAX_ATTEMPTS KV_RESERVE_DECODE; do
+  value="${!key}"
+  [[ "$value" =~ ^(0|[1-9][0-9]*)$ && ${#value} -le 8 ]] || fail "$key 必须为非负整数"
+done
+[[ "$PARK" =~ ^[01]$ ]] || fail 'PARK 必须为 0 或 1'
+(( PARK_WAIT_MS >= 500 )) || fail 'PARK_WAIT_MS 必须至少为 500 ms'
+(( PARK_MAX_ATTEMPTS >= 1 && PARK_MAX_ATTEMPTS <= 32 )) || fail 'PARK_MAX_ATTEMPTS 范围为 1–32'
 [[ "$RCKPT_MAX" =~ ^(0|[1-9][0-9]*)$ ]] || fail 'RCKPT_MAX 必须为非负整数'
 [[ "$KV_PAGED" =~ ^[01]$ ]] || fail 'KV_PAGED 必须为 0 或 1'
 [[ "$KV_POOL_TOKENS" =~ ^(0|[1-9][0-9]*)$ && ${#KV_POOL_TOKENS} -le 8 ]] || fail 'KV_POOL_TOKENS 必须为非负整数'
@@ -155,7 +168,11 @@ export QWENOX_GDN_STREAM=1 QWENOX_GDN_WAVE=1 QWENOX_NOWARMUP=1
 export QWENOX_GEMM_WMMA=1 QWENOX_GDN_FUSED=1
 export QWENOX_INDEX_FUSED2=1 QWENOX_PP_MOE_OUT=1 QWENOX_INDEX_STREAM_SELECT=1
 if (( KVSNAP_MAX_GB )); then export QWENOX_KVSNAP=1; else export QWENOX_KVSNAP=0; fi
-export QWENOX_KVSNAP_MAX_GB="$KVSNAP_MAX_GB" QWENOX_RCKPT_MAX="$RCKPT_MAX"
+export QWENOX_KVSNAP_MAX_GB="$KVSNAP_MAX_GB" QWENOX_KVSNAP_MIN="$KVSNAP_MIN" \
+  QWENOX_KVSNAP_PARK_MIN="$KVSNAP_PARK_MIN" QWENOX_RCKPT_MAX="$RCKPT_MAX"
+if (( PARK )); then export QWENOX_PARK=1; else export QWENOX_PARK=0; fi
+export QWENOX_PARK_WAIT_MS="$PARK_WAIT_MS" QWENOX_PARK_MAX_ATTEMPTS="$PARK_MAX_ATTEMPTS" \
+  QWENOX_KV_RESERVE_DECODE="$KV_RESERVE_DECODE"
 # KVSNAP_DIR（见 service.conf）留空时不动 QWENOX_KVSNAP_DIR
 KVSNAP_DIR="${KVSNAP_DIR-}"
 if [[ -n "$KVSNAP_DIR" ]]; then

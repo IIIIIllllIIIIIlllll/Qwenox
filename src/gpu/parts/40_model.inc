@@ -9182,6 +9182,48 @@ struct GpuModel {
     return true;
   }
 
+  void sms_failure(int row, bool draft, int k, const char* why) {
+    fprintf(stderr, "sms: %s slot=%d pos=%d %s row=%d top_k=%d\n",
+            why, bound_, pos, draft ? "draft" : "verify", row, k);
+    if (k > 0 && k <= 64)
+      for (int j = 0; j < k; j++)
+        fprintf(stderr, "sms: topk[%d] id=%d value=%.9g\n", j,
+                sms_out_ids[(size_t)row * k + j],
+                sms_out_vals[(size_t)row * k + j]);
+    std::vector<float> raw(g_cfg.vocab);
+    const float* src = draft ? d_logits : d_logits_b + (size_t)row * g_cfg.vocab;
+    const hipError_t err = hipMemcpy(raw.data(), src, raw.size() * sizeof(float),
+                                     hipMemcpyDeviceToHost);
+    if (err != hipSuccess) {
+      fprintf(stderr, "sms: 读取原始 logits 失败：%s\n", hipGetErrorString(err));
+      return;
+    }
+    size_t finite = 0, nan = 0, pinf = 0, ninf = 0;
+    float lo = INFINITY, hi = -INFINITY;
+    for (float v : raw) {
+      if (std::isfinite(v)) {
+        finite++;
+        lo = fminf(lo, v);
+        hi = fmaxf(hi, v);
+      } else if (std::isnan(v)) {
+        nan++;
+      } else if (v > 0) {
+        pinf++;
+      } else {
+        ninf++;
+      }
+    }
+    fprintf(stderr,
+            "sms: raw finite=%zu nan=%zu +inf=%zu -inf=%zu min=%.9g max=%.9g\n",
+            finite, nan, pinf, ninf, lo, hi);
+    if (k > 0 && k <= 64)
+      for (int j = 0; j < k; j++) {
+        const int id = sms_out_ids[(size_t)row * k + j];
+        if (id >= 0 && id < g_cfg.vocab)
+          fprintf(stderr, "sms: raw[topk[%d]] id=%d value=%.9g\n", j, id, raw[id]);
+      }
+  }
+
   // prepare_sparse on candidate row `row` (draft: row 0 of the d_logits
   // pass). QWENOX_SMS_CHECK=1 also replays the dense prepare() on the raw
   // logits row and compares the two distributions (support + probabilities).
@@ -9189,8 +9231,13 @@ struct GpuModel {
   void sms_prep(Sampler& s, int row, bool draft,
                 typename Sampler::SDist& out) {
     const int k = s.top_k;
-    s.prepare_sparse(sms_out_ids.data() + (size_t)row * k,
-                     sms_out_vals.data() + (size_t)row * k, k, out);
+    try {
+      s.prepare_sparse(sms_out_ids.data() + (size_t)row * k,
+                       sms_out_vals.data() + (size_t)row * k, k, out);
+    } catch (const std::exception& e) {
+      sms_failure(row, draft, k, e.what());
+      throw;
+    }
     static const bool chk = getenv("QWENOX_SMS_CHECK") != nullptr;
     if (!chk) return;
     static long n = 0, bad = 0;
@@ -9248,6 +9295,10 @@ struct GpuModel {
     };
     while ((int)out.size() < gen && pos < maxctx) {
       yield_point();  // round top: only persistent slot state is live
+      // 回合顶预分配本回合的 KV 行（trunk+MTP 同表，ngram 回合最坏 ~72 行）：
+      // 让池子干涸只在回合顶（持有回合、状态干净的安全点）触发 starve/park，
+      // 不在会合批次执行中途。
+      if (kv_paged) kv_reserve(std::min(pos + 80, maxctx));
       if (chist.size() != (size_t)pos)
         throw std::runtime_error("ngram: token history and trunk position disagree");
       ngram.observe(chist);
@@ -9723,6 +9774,7 @@ struct GpuModel {
     auto T0 = std::chrono::steady_clock::now();
     while ((int)out.size() < gen) {
       yield_point();  // round top: mtp_pos == pos-1, d_R == h_{pos-1}
+      if (kv_paged) kv_reserve(std::min(pos + 80, maxctx));  // 回合顶预分配（见 ngram 循环注释）
       int q = pos - 1;  // trunk processed through q
       if (d_iraw) vg_dump_buf("irT", 2, d_iraw, 512 * 4);  // P3-B bisect
       int g = std::min(gctl.cur, gen - (int)out.size());
@@ -10003,6 +10055,7 @@ struct GpuModel {
     };
     while ((int)out.size() < gen && pos < maxctx) {
       yield_point();  // round top: only persistent slot state is live
+      if (kv_paged) kv_reserve(std::min(pos + 80, maxctx));  // 回合顶预分配
       if (chist.size() != (size_t)pos)
         throw std::runtime_error(
             "chain: token history and trunk position disagree");
@@ -10360,12 +10413,14 @@ struct GpuModel {
   template <typename Sampler>
   std::vector<int> spec_loop_sample(
       int cur, int gen, int gamma, Sampler& sampler,
-      const std::function<bool(int, float)>& emit = nullptr) {
+      const std::function<bool(int, float)>& emit = nullptr,
+      GammaCtl* saved_gamma = nullptr) {
     last_spec_rounds = last_spec_commit = last_spec_rollbacks = 0;
     live_spec_rounds = live_spec_commits = live_spec_proposed = 0;
     std::vector<int> out;
     out.reserve(gen + 1);
-    GammaCtl gctl(gamma, true);
+    GammaCtl local_gamma(gamma, true);
+    GammaCtl& gctl = saved_gamma ? *saved_gamma : local_gamma;
     std::vector<int> drafts(8);
     std::vector<float> draft_lps(8), verify_logits, p_row(g_cfg.vocab);
     std::vector<std::vector<float>> q_rows(8);
@@ -10378,6 +10433,7 @@ struct GpuModel {
     auto T0 = std::chrono::steady_clock::now();
     while ((int)out.size() < gen) {
       yield_point();  // round top: mtp_pos == pos-1, d_R == h_{pos-1}
+      if (kv_paged) kv_reserve(std::min(pos + 80, maxctx));  // 回合顶预分配
       int q = pos - 1;
       int g = std::min(spec_conf() > 0 ? kSpecConfMax : gctl.cur,
                        gen - (int)out.size());
@@ -10637,17 +10693,20 @@ struct GpuModel {
   template <typename Sampler>
   std::vector<int> spec_loop_chain_sample(
       int cur, int gen, int gamma, Sampler& sampler, bool mtp_ok,
-      const std::function<bool(int, float)>& emit = nullptr, bool seeded = false) {
+      const std::function<bool(int, float)>& emit = nullptr, bool seeded = false,
+      GammaCtl* saved_gamma = nullptr, OccGamma* saved_occ = nullptr) {
     last_spec_rounds = last_spec_commit = last_spec_rollbacks =
         last_spec_proposed = 0;
     live_spec_rounds = live_spec_commits = live_spec_proposed = 0;
     std::vector<int> out;
     out.reserve(std::max(0, gen));
     const int maxg = std::min({64, std::max(1, ngram.n_max), maxbatch - 1});
-    GammaCtl gctl(std::max(0, gamma), true);  // 0 = adaptive MTP rounds
+    GammaCtl local_gamma(std::max(0, gamma), true);
+    GammaCtl& gctl = saved_gamma ? *saved_gamma : local_gamma;
     std::vector<int> drafts(8);
     std::vector<float> draft_lps(8), verify_logits, p_row(g_cfg.vocab);
-    std::vector<std::vector<float>> q_rows(8);
+    std::vector<std::vector<float>> q_rows(8), q_raw_vals(8);
+    std::vector<std::vector<int>> q_raw_ids(8);
     int depth_hits[8] = {0}, depth_tot[8] = {0};
     int accepted = 0, ng_rounds = 0, mtp_rounds = 0, ng_roll = 0,
         mtp_roll = 0, fallback = 0, ng_keep = 0, ng_prop = 0;
@@ -10672,7 +10731,8 @@ struct GpuModel {
     // QWENOX_VR_SAMPLE=0 keeps sampled requests out of the rendezvous.
     static const bool vr_sample = !env_zero("QWENOX_VR_SAMPLE");
     const bool vr_on = vr_sample && mtp_ok && vseg_pool_fn != nullptr;
-    OccGamma occ(true, nslots, false, seeded);  // sampled drafts: serial per slot
+    OccGamma local_occ(true, nslots, false, seeded);
+    OccGamma& occ = saved_occ ? *saved_occ : local_occ;
     struct VrLoopS {
       GpuModel& m;
       bool on;
@@ -10689,6 +10749,7 @@ struct GpuModel {
     std::vector<float> pool_vals;
     while ((int)out.size() < gen && pos < maxctx) {
       yield_point();  // round top: only persistent slot state is live
+      if (kv_paged) kv_reserve(std::min(pos + 80, maxctx));  // 回合顶预分配
       if (chist.size() != (size_t)pos)
         throw std::runtime_error(
             "chain-sample: token history and trunk position disagree");
@@ -11002,6 +11063,10 @@ struct GpuModel {
             drafts[j] =
                 draft_sampler.draw_prepared(q_rows[j], &draft_lps[j], false);
           } else {
+            q_raw_ids[j].assign(sms_out_ids.begin(),
+                                sms_out_ids.begin() + sampler.top_k);
+            q_raw_vals[j].assign(sms_out_vals.begin(),
+                                 sms_out_vals.begin() + sampler.top_k);
             sms_prep(draft_sampler, 0, true, q_sd[j]);
             drafts[j] =
                 draft_sampler.draw_sparse(q_sd[j], &draft_lps[j], false);
@@ -11116,20 +11181,45 @@ struct GpuModel {
         int next;
         float next_lp = 0.0f;
         target_view.rng = sampler.rng;
-        if (a < g) {
-          next = (smg_v && q_sparse[a])
-                     ? target_view.sample_residual_sparse(p_sd[a], q_sd[a],
-                                                          &next_lp)
-                     : target_view.sample_residual(p_row, q_dense(a),
-                                                   &next_lp);
-        } else if (smg_v) {
-          sms_prep(target_view, g, false, p_sd[g]);
-          next = target_view.draw_sparse(p_sd[g], &next_lp, false);
-        } else {
-          std::copy_n(verify_logits.data() + (size_t)g * g_cfg.vocab,
-                      g_cfg.vocab, p_row.data());
-          target_view.prepare(p_row);
-          next = target_view.draw_prepared(p_row, &next_lp, false);
+        try {
+          if (a < g) {
+            next = (smg_v && q_sparse[a])
+                       ? target_view.sample_residual_sparse(p_sd[a], q_sd[a],
+                                                            &next_lp)
+                       : target_view.sample_residual(p_row, q_dense(a),
+                                                     &next_lp);
+          } else if (smg_v) {
+            sms_prep(target_view, g, false, p_sd[g]);
+            next = target_view.draw_sparse(p_sd[g], &next_lp, false);
+          } else {
+            std::copy_n(verify_logits.data() + (size_t)g * g_cfg.vocab,
+                        g_cfg.vocab, p_row.data());
+            target_view.prepare(p_row);
+            next = target_view.draw_prepared(p_row, &next_lp, false);
+          }
+        } catch (const std::exception& e) {
+          fprintf(stderr,
+                  "chain-sample: 采样失败 slot=%d base=%d gamma=%d row=%d "
+                  "generated=%zu target_rng=%llu draft_rng=%llu accept_rng=%llu\n",
+                  bound_, q + 1, g, a, out.size(),
+                  (unsigned long long)target_view.rng,
+                  (unsigned long long)draft_sampler.rng,
+                  (unsigned long long)accept_sampler.rng);
+          if (smg_v) {
+            sms_failure(a, false, sampler.top_k, e.what());
+            for (size_t j = 0; j < p_sd[a].ids.size(); j++)
+              fprintf(stderr, "chain-sample: p id=%d probability=%.9g\n",
+                      p_sd[a].ids[j], p_sd[a].pr[j]);
+          }
+          if (a < g && q_sparse[a]) {
+            for (size_t j = 0; j < q_sd[a].ids.size(); j++)
+              fprintf(stderr, "chain-sample: q id=%d probability=%.9g\n",
+                      q_sd[a].ids[j], q_sd[a].pr[j]);
+            for (size_t j = 0; j < q_raw_ids[a].size(); j++)
+              fprintf(stderr, "chain-sample: draft_topk id=%d value=%.9g\n",
+                      q_raw_ids[a][j], q_raw_vals[a][j]);
+          }
+          throw;
         }
         sampler.rng = target_view.rng;
         for (int j = 0; j < g; j++) {

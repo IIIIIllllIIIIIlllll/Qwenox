@@ -290,7 +290,8 @@ inline bool validate_conf(const Conf& conf, std::string* err) {
         return true;
     };
     long engine_port, api_port, max_context, parallel, kv_paged, kv_pool_tokens,
-        prefill_chunk, kvsnap_max_gb, rope_original;
+        prefill_chunk, kvsnap_max_gb, kvsnap_min, kvsnap_park_min, park,
+        park_wait_ms, park_max_attempts, kv_reserve_decode, rope_original;
     if (!get_int("ENGINE_PORT", 8730, 1, 65535, &engine_port)) return false;
     if (!get_int("API_PORT", 8731, 1, 65535, &api_port)) return false;
     if (!get_int("MAX_CONTEXT", 262144, 1024, 1 << 20, &max_context)) return false;
@@ -299,6 +300,12 @@ inline bool validate_conf(const Conf& conf, std::string* err) {
     if (!get_int("KV_POOL_TOKENS", 0, 0, 1 << 24, &kv_pool_tokens)) return false;
     if (!get_int("PREFILL_CHUNK", 0, 0, 1 << 20, &prefill_chunk)) return false;
     if (!get_int("KVSNAP_MAX_GB", 20, 0, 1 << 16, &kvsnap_max_gb)) return false;
+    if (!get_int("KVSNAP_MIN", 4096, 0, 1 << 24, &kvsnap_min)) return false;
+    if (!get_int("KVSNAP_PARK_MIN", kvsnap_min, 0, 1 << 24, &kvsnap_park_min)) return false;
+    if (!get_int("PARK", 1, 0, 1, &park)) return false;
+    if (!get_int("PARK_WAIT_MS", 5000, 500, 1 << 30, &park_wait_ms)) return false;
+    if (!get_int("PARK_MAX_ATTEMPTS", 8, 1, 32, &park_max_attempts)) return false;
+    if (!get_int("KV_RESERVE_DECODE", 4096, 0, 1 << 24, &kv_reserve_decode)) return false;
     if (!get_int("ROPE_ORIGINAL_CTX", 262144, 1, 1 << 30, &rope_original)) return false;
     (void)prefill_chunk;   // 只校验范围，值本身不再参与后续规则
     (void)kvsnap_max_gb;
