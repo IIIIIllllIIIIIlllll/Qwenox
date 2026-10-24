@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Front-end regression checks against the deterministic api_fake_engine.py."""
 import argparse
+import base64
 import json
 import threading
 import time
@@ -60,6 +61,27 @@ def main():
         "AQUBAScY42YAAAAASUVORK5CYII="
     )
     tiny_png_url = "data:image/png;base64," + tiny_png
+    # 与 vision_test.cpp 共用的4×4纹理，无需 Pillow 运行时依赖。
+    tiny_webps = [
+        ("VP8有损", (
+            "UklGRlYAAABXRUJQVlA4IEoAAACwAQCdASoEAAQAAUAmJagCdAEO+KbQAP3HBM/f6OT0j9jWC6C/m0SP"
+            "N/onDHyNsQoYcUHb5Gsy/mS7LvuHe9nIziE/gc0vKBKAAA=="
+        )),
+        ("VP8L无损", (
+            "UklGRmwAAABXRUJQVlA4TF8AAAAvA8AAAH9gkG0kheOYyB/d8zzIZ2xqIkmK7gUc4GBD/GsZIdSFSiJJ"
+            "cvjFD3Txi3j/UkbD4fmP/AroDAAA0BmAuZcSJXeMEiX7nq8PBAEQA0qUuJGjRIkCVxH9DzMTegA="
+        )),
+        ("VP8L透明", (
+            "UklGRngAAABXRUJQVlA4TGsAAAAvA8AAEH9gkG0kheOYyB/d8zzIZ2xqIkmK7gUc4GBD/GsZIdSFSiJJ"
+            "cvjFD3Txi3j/UkbDYQMBy9BszX7NNBP5NcCdGWAAgM4UYO59pSnljp1SlLrv6esXBAEQA0qUuJGjRIkC"
+            "VxH9DzMTegA="
+        )),
+        ("VP8X+ALPH透明", (
+            "UklGRpIAAABXRUJQVlA4WAoAAAAQAAAAAwAAAwAAQUxQSA8AAAABEAgQ0qQ5txERgd2I3QgAVlA4IFwA"
+            "AAAwAgCdASoEAAQAAUAmJbACdEyATaADX/BngAD9xwTP3+jk9I/Y1gugv5tCT/M7fzp/+LUud3cunb4d"
+            "o5MVEXy6vxO/Q3wA/8uP3AHuZM/7MNz9ef/TXW8X0MAAAA=="
+        )),
+    ]
 
     status, _, raw = get(args.base, "/memory")
     memory = json.loads(raw)
@@ -108,19 +130,6 @@ def main():
         "temperature": 0,
         "max_tokens": 4,
     }
-    status, _, raw = request(args.base, "/v1/chat/completions", vision_chat)
-    message = json.loads(raw)["choices"][0]["message"]
-    check(status == 200 and message["content"] == "Hi", "chat-vision-nonstream", raw[:500])
-
-    status, content_type, raw = request(
-        args.base, "/v1/chat/completions", dict(vision_chat, stream=True))
-    frames = parse_sse(raw)
-    content = "".join(
-        frame["choices"][0]["delta"].get("content", "")
-        for frame in frames if isinstance(frame, dict) and frame.get("choices"))
-    check(status == 200 and "text/event-stream" in content_type and content == "Hi" and
-          frames[-1] == "[DONE]", "chat-vision-stream", raw[:800])
-
     vision_response = {
         "input": [
             {"type": "input_image", "image_url": tiny_png_url},
@@ -130,18 +139,61 @@ def main():
         "temperature": 0,
         "max_output_tokens": 4,
     }
-    status, _, raw = request(args.base, "/v1/responses", vision_response)
-    response = json.loads(raw)
-    check(status == 200 and response["output"][0]["content"][0]["text"] == "Hi",
-          "responses-vision-flat-content", raw[:700])
+    image_cases = [("PNG", tiny_png_url, True)] + [
+        (name, "data:image/webp;base64," + encoded, True)
+        for name, encoded in tiny_webps
+    ]
+    valid_webp_url = "data:image/webp;base64," + tiny_webps[0][1]
+    truncated_webp = base64.b64encode(base64.b64decode(tiny_webps[0][1])[:-8]).decode("ascii")
+    # 合法base64中的损坏容器、截断图均应400，随后逐接口验证恢复。
+    image_cases.extend([
+        ("损坏WebP", "data:image/webp;base64,UklGRgQAAABXRUJQ", False),
+        ("损坏后有效WebP", valid_webp_url, True),
+        ("截断WebP", "data:image/webp;base64," + truncated_webp, False),
+        ("截断后有效WebP", valid_webp_url, True),
+    ])
+    for name, image_url, valid in image_cases:
+        vision_chat["messages"][0]["content"][0]["image_url"]["url"] = image_url
+        vision_response["input"][0]["image_url"] = image_url
+        if not valid:
+            for endpoint, path, body in [
+                ("Chat", "/v1/chat/completions", vision_chat),
+                ("Responses", "/v1/responses", vision_response),
+            ]:
+                status, content_type, raw = request(args.base, path, body)
+                payload = json.loads(raw)
+                check(status == 400 and "application/json" in content_type and
+                      "error" in payload, f"{name} {endpoint}拒绝", raw[:500])
+            continue
 
-    status, _, raw = request(args.base, "/v1/responses",
-                             dict(vision_response, stream=True))
-    events = parse_sse(raw)
-    deltas = "".join(event.get("delta", "") for event in events
-                     if event["type"] == "response.output_text.delta")
-    check(status == 200 and deltas == "Hi" and events[-1]["type"] == "response.completed",
-          "responses-vision-stream", raw[:1000])
+        status, content_type, raw = request(args.base, "/v1/chat/completions", vision_chat)
+        message = json.loads(raw)["choices"][0]["message"]
+        check(status == 200 and "application/json" in content_type and
+              message["content"] == "Hi", f"{name} Chat非流式图片", raw[:500])
+
+        status, content_type, raw = request(
+            args.base, "/v1/chat/completions", dict(vision_chat, stream=True))
+        frames = parse_sse(raw)
+        content = "".join(
+            frame["choices"][0]["delta"].get("content", "")
+            for frame in frames if isinstance(frame, dict) and frame.get("choices"))
+        check(status == 200 and "text/event-stream" in content_type and content == "Hi" and
+              frames[-1] == "[DONE]", f"{name} Chat流式图片", raw[:800])
+
+        status, content_type, raw = request(args.base, "/v1/responses", vision_response)
+        response = json.loads(raw)
+        check(status == 200 and "application/json" in content_type and
+              response["output"][0]["content"][0]["text"] == "Hi",
+              f"{name} Responses非流式图片", raw[:700])
+
+        status, content_type, raw = request(args.base, "/v1/responses",
+                                            dict(vision_response, stream=True))
+        events = parse_sse(raw)
+        deltas = "".join(event.get("delta", "") for event in events
+                         if event["type"] == "response.output_text.delta")
+        check(status == 200 and "text/event-stream" in content_type and deltas == "Hi" and
+              events[-1]["type"] == "response.completed",
+              f"{name} Responses流式图片", raw[:1000])
 
     common = {"prompt": "x", "temperature": 0, "max_tokens": 4, "stop": "Paris"}
     status, _, raw = request(args.base, "/v1/completions", common)
@@ -319,8 +371,11 @@ def main():
     check(status == 200, "engine-auto-reconnect-next-request", raw[:300])
 
     status, _, raw = get(args.base, "/health")
-    check(status == 200 and json.loads(raw).get("slots") == args.slots,
+    health = json.loads(raw)
+    check(status == 200 and health.get("slots") == args.slots,
           "health-slots", raw[:300])
+    check(status == 200 and "webp" in health.get("vision", {}).get("formats", []),
+          "health声明WebP", raw[:500])
 
     # the aborted-mid-decode failure (shared KV pool full) is a 503; streamed,
     # an SSE error event after the first token

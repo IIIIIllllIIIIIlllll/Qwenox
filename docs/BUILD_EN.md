@@ -175,9 +175,11 @@ the path if needed.
 ## Windows (TheRock)
 
 The Windows version has its own entry points, parallel to build.sh /
-start_hgn.sh, covering the engine and the API frontend
-(multimodal already supports PNG/JPEG, only WebP is not wired up; see
-PORTING-WINDOWS_EN.md):
+start_hgn.sh, covering the engine and the API frontend. Multimodal input supports
+PNG/JPEG/WebP: PNG/JPEG still use `stb_image`, while WebP requires static linking
+of the official libwebp 1.6.0 decoder-only `webpdecoder`, built as Release x64
+with `/MT`, with no additional DLLs. See the 2026-10-24 addendum in
+PORTING-WINDOWS_EN.md.
 
 ```bash
 bash build_win.sh           # all artifacts: engine, benchmark, API, root stub
@@ -185,7 +187,14 @@ bash build_win.sh bench     # standalone performance benchmark only
 bash build_win.sh api       # OpenAI API frontend → build/qwenox-win.exe (GUI tray app)
 bash build_win.sh launcher  # minimal root stub → ./start_win.exe
 bash build_win.sh test      # build ktest-win and run kernel unit tests
+bash build_win.sh vision-test # CPU image decoding tests: runs --decode-only, no model needed
 bash start_win.sh           # under Git Bash: start engine (line protocol 8730) + API (8731, --console) as two processes
+```
+
+Build a candidate API at a separate output path:
+
+```bash
+QWENOX_API_OUT=build/qwenox-webp-candidate.exe bash build_win.sh api
 ```
 
 **Double-click `start_win.exe` for daily launches**: a minimal root stub whose
@@ -240,7 +249,19 @@ dependency; it is not needed at runtime.**
 Prerequisites (**build-time only**): the
 [TheRock](https://github.com/ROCm/TheRock) Windows multi-arch package
 (default `C:\therock-dist-windows-multiarch-10.0.0\...`, overridable with
-`THEROCK=`) + Git Bash. The first build stages all runtime dependencies into
+`THEROCK=`) + Git Bash, CMake, Ninja, and the Windows SDK. Use `CMAKE` / `NINJA`
+to override tool paths.
+
+`build_win.sh` automatically downloads the official
+[libwebp-1.6.0.tar.gz](https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0.tar.gz)
+and verifies the pinned SHA-256
+`e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564`.
+WebP is a required static dependency built from source; source and caches are
+kept under `build/deps/`. License files are staged in
+`build/third-party-licenses/libwebp/`, and `release_win.sh` copies them into the
+release package.
+
+The first build stages all runtime dependencies into
 `build/`: 6 TheRock DLLs, 3 MSVC runtimes, and the actual gfx1151 kernel db
 of rocBLAS/hipBLASLt (~30M total, not the all-architecture 1.2G). **The
 artifacts are self-contained: copy `build/` to any Windows machine of the

@@ -159,7 +159,9 @@ Windows 配置回归曾可额外传入 `--launcher` 检查旧原生启动器；�
 ## Windows（TheRock）
 
 Windows 版有独立入口，与 build.sh / start_hgn.sh 并列，覆盖引擎与 API 前端
-（多模态已支持 PNG/JPEG，仅 WebP 未接，见 PORTING-WINDOWS.md）：
+（多模态支持 PNG/JPEG/WebP；PNG/JPEG 仍用 `stb_image`，WebP 强制静态链接
+官方 libwebp 1.6.0 的 decoder-only `webpdecoder`，Release x64、`/MT`，
+不新增 DLL；见 PORTING-WINDOWS.md 的 2026-10-24 补充）：
 
 ```bash
 bash build_win.sh           # 全部产物:引擎、benchmark、API、根目录入口
@@ -167,7 +169,14 @@ bash build_win.sh bench     # 只编独立性能测试工具
 bash build_win.sh api       # OpenAI API 前端 → build/qwenox-win.exe(GUI 托盘程序)
 bash build_win.sh launcher  # 根目录最小入口 → ./start_win.exe
 bash build_win.sh test      # 编 ktest-win 并运行 kernel 单测
+bash build_win.sh vision-test # CPU 图片解码测试：执行 --decode-only，无需模型
 bash start_win.sh           # Git Bash 下起引擎(行协议 8730) + API(8731,--console) 双进程
+```
+
+构建候选 API 到单独路径：
+
+```bash
+QWENOX_API_OUT=build/qwenox-webp-candidate.exe bash build_win.sh api
 ```
 
 **日常启动双击 `start_win.exe`**：根目录最小入口，只做一件事——以项目根为
@@ -208,7 +217,16 @@ QWENOX_* 环境与参数；停止 = 直接结束进程）。Linux 上启停端�
 
 前置（**仅编译期**）：[TheRock](https://github.com/ROCm/TheRock) Windows 多架构包
 （默认 `C:\therock-dist-windows-multiarch-10.0.0\...`，可用 `THEROCK=` 覆盖）+
-Git Bash。首次构建会把运行期全部依赖备进 `build/`：TheRock DLL ×6、MSVC
+Git Bash、CMake、Ninja 和 Windows SDK。可用 `CMAKE` / `NINJA` 覆盖工具路径。
+
+`build_win.sh` 自动下载官方
+[libwebp-1.6.0.tar.gz](https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0.tar.gz)，
+并校验固定 SHA-256
+`e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564`。
+WebP 是必选的源码静态构建依赖，源码与缓存均在 `build/deps/`。
+许可证位于 `build/third-party-licenses/libwebp/`，`release_win.sh` 随发行包复制。
+
+首次构建会把运行期全部依赖备进 `build/`：TheRock DLL ×6、MSVC
 运行时 ×3、rocBLAS/hipBLASLt 的 gfx1151 kernel db 真身（共 ~30M，非全架构
 1.2G）。**产物自包含：`build/` 拷到任何同架构 Windows 机器即用，无需安装
 ROCm/TheRock，也不设 HIP_PATH/ROCM_PATH**（断根实测见 PORTING-WINDOWS.md）。

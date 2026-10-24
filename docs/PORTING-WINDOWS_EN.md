@@ -7,7 +7,37 @@
 > second version was based on **measured data** from this machine (Windows +
 > gfx1151, BIOS set to 96 GiB of video memory, 128 GiB of RAM). The probe
 > source code is in `tools/winprobe/` and can be re-run.
-> **Third version: the port is complete and verified**, see the next section.
+> **Third version: the port is complete and verified**, see "Port Results" below.
+
+## Windows WebP Addendum (2026-10-24)
+
+This updates the image-decoding implementation and build procedure while retaining
+the historical context of the port and measurements below. The existing PASS
+results and end-to-end PNG measurements do not cover the new WebP path; this
+addendum adds no new measured results.
+
+- PNG/JPEG still use `stb_image`. WebP is no longer explicitly rejected: it
+  requires static linking of the official libwebp 1.6.0 decoder-only
+  `webpdecoder`, built as Release x64 with `/MT`, with no additional DLLs.
+  This is not an optional prebuilt-library approach.
+- `build_win.sh` automatically downloads the official source archive,
+  [libwebp-1.6.0.tar.gz](https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0.tar.gz),
+  and verifies the pinned SHA-256
+  `e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564`.
+  Source and caches are kept under `build/deps/`.
+- CMake, Ninja, and the Windows SDK are build-time requirements. Use `CMAKE` /
+  `NINJA` to override tool paths; these tools are not new runtime dependencies.
+- The libwebp license files are staged in `build/third-party-licenses/libwebp/`;
+  `release_win.sh` copies them into the release package.
+
+Candidate API and CPU decoding test commands (run under Git Bash):
+
+```bash
+QWENOX_API_OUT=build/qwenox-webp-candidate.exe bash build_win.sh api
+bash build_win.sh vision-test
+```
+
+`vision-test` runs `--decode-only`: CPU decoding tests only, with no model needed.
 
 ## VRAM Capacity (measured 2026-10-13, current)
 
@@ -128,24 +158,27 @@ Key implementation points (differences relative to the Linux version):
 - **API frontend** (`src/api` → `gdec-api-win.exe`): the socket layers of
   http.cpp / engine_client.cpp use the same `os_win32.h` shim (`sock_t`
   type, WSAPoll, `SO_RCVTIMEO` as DWORD milliseconds); compiled with
-  TheRock's bare clang++ (no hipcc needed, zero HIP dependencies), linking
-  only the system `ws2_32`; nlohmann/json is provided by TheRock includes.
+  TheRock's bare clang++ (no hipcc needed, zero HIP dependencies), using
+  the system `ws2_32` for sockets and requiring static linking of
+  `webpdecoder` for WebP; nlohmann/json is provided by TheRock includes.
   Beware the WinSock trap: the `peer_gone` probe must grab
   `WSAGetLastError()` **immediately** after recv fails and only then do the
   `ioctlsocket` to restore blocking — a successful call overwrites
   last-error, which was misjudged as "client disconnected" and caused
-  streaming requests to drop within seconds (fixed). Image decoding uses
-  stb_image (public-domain single header, `src/api/vendor/`) supporting
-  PNG/JPEG, compiled into the exe with zero new DLLs; end-to-end PNG image
-  Q&A verified. WebP has no equivalent single-header implementation and
-  reports an explicit error — the only remaining gap.
+  streaming requests to drop within seconds (fixed). PNG/JPEG decoding still
+  uses stb_image (public-domain single header, `src/api/vendor/`), compiled
+  into the exe with zero new DLLs; end-to-end PNG image Q&A was verified in
+  the original measurements. **2026-10-24 addendum**: WebP now requires static
+  linking of the official libwebp 1.6.0 decoder-only `webpdecoder` (Release
+  x64, `/MT`), also with no additional DLLs. See the addendum above for build
+  and test commands; the original PNG results do not establish WebP test results.
 - **origami.dll** is a static dependency of `libhipblaslt.dll` and must ship
   alongside the exe (the lld link error doesn't name it, so it's easy to
   miss).
 
 Outstanding items: the API frontend has been ported (`gdec-api-win.exe`,
-with image decoding via stb_image supporting PNG/JPEG and verified; only
-WebP reports an explicit unsupported error); a fully-filled 256K prefill has
+with PNG/JPEG decoded via stb_image and verified; WebP now uses static
+`webpdecoder`, as described in the 2026-10-24 addendum); a fully-filled 256K prefill has
 not been measured (the memory layout is verified; loading a full 256K tokens
 on this machine would take hours and is of limited value); long-run
 stability (WDDM paging, switches like `HSA_ENABLE_SDMA=0`) remains to be
@@ -267,7 +300,7 @@ s/chunk)**. This is the correct Windows equivalent of the io_uring path.
 | POSIX sockets (serve mode + `src/api/http.cpp` etc.) | ~10 sites | WinSock2 (similar API, mechanical replacement) |
 | `clock_gettime`/`localtime_r`/`unistd.h` misc | a few | standard replacements |
 | `build.sh` | single script | `build.bat`/CMake: TheRock hipcc + `-O3 -std=c++17 --offload-arch=gfx1151`, linking `rocblas.lib` + `libhipblaslt.dll.a` (note: the hipcc wrapper rejects `-l:` syntax and bare `.lib` paths; the file must be renamed to `hipblaslt.lib`) |
-| API frontend image libraries | libpng/jpeg/webp | vcpkg or prebuilt; decoupled from the engine, can be deferred |
+| API frontend image libraries | PNG/JPEG/WebP | PNG/JPEG use stb_image; 2026-10-24: WebP requires building the official libwebp 1.6.0 decoder-only `webpdecoder` from source and linking it statically, replacing the earlier vcpkg/prebuilt proposal |
 | `tools/run_capped.sh` | — | no port needed (a local deployment tool) |
 
 ## Deployment Form (verified, self-contained)
@@ -288,9 +321,10 @@ PASS). All runtime dependencies sit next to the exe:
 - Kernel db real files: `rocblas/library/gfx1151/` (17M) +
   `hipblaslt/library/gfx1151/` (13M), resolved relative to the exe and
   independent of cwd.
-- `gdec-api-win.exe` (OpenAI API frontend) has zero extra dependencies:
-  links only the system `ws2_32`, copies along with build/ and runs; image
-  decoding not wired in (text is fully functional).
+- `gdec-api-win.exe` (OpenAI API frontend, historical artifact name) needs no
+  additional image DLLs: PNG/JPEG embed stb_image; as of 2026-10-24, WebP requires
+  static linking of `webpdecoder`. Copy it with build/; the libwebp license
+  files are included in the release package (see the addendum above).
 - No device bitcode is needed at runtime (no JIT: engine kernels are
   embedded at compile time; rocBLAS/Lt load hsaco/.co directly), so neither
   `HIP_PATH` nor `ROCM_PATH` needs to be set.
@@ -314,9 +348,10 @@ PASS). All runtime dependencies sit next to the exe:
 4. Keeping the 96 GiB BIOS split as-is is fine; no VGM adjustment is needed
    (the single large-allocation path does not pass through its limits). The
    2080 Ti does not affect HIP device enumeration.
-5. ~~API frontend untouched~~ ported (see the section above); the only
-   remaining functional gap is WebP decoding, and the systemd tooling does
-   not apply to Windows.
+5. ~~API frontend untouched~~ ported (see the section above); as of 2026-10-24,
+   static WebP decoding is implemented and is no longer listed as a functional
+   gap (see the addendum for the scope of measured results). The systemd
+   tooling does not apply to Windows.
 
 ## Next Steps (all done, kept for reference)
 
@@ -331,8 +366,9 @@ PASS). All runtime dependencies sit next to the exe:
 4. ~~Kernel unit tests (`tools/ktest.cu`) all green on Windows.~~ ✅ ALL PASS
 5. ~~API frontend and service-ization wrap-up.~~ ✅ `gdec-api-win.exe` +
    `start_win.sh` dual processes, `api_live_smoke.py` 8/8 PASS, multimodal
-   (PNG image Q&A) verified end-to-end; remaining optional item: WebP
-   decoding (needs a prebuilt libwebp)
+   (PNG image Q&A) verified end-to-end. 2026-10-24 addendum: WebP now requires
+   a static source build (`webpdecoder`), not an optional prebuilt library;
+   see the addendum above for verification commands.
 
 The actual work concentrated on the arena architecture rework and the new
 loader (NO_BUFFERING direct reads), consistent with the "person-week scale"

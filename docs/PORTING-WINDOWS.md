@@ -5,7 +5,33 @@
 > **修订说明**：本文第三版。第一版的"两堵墙"结论基于公开资料推演；
 > 第二版基于本机（Windows + gfx1151，BIOS 划分 96 GiB 显存，128 GiB 内存）
 > 的**实测数据**。探针源码在 `tools/winprobe/`，可复跑。
-> **第三版：移植已完成并验证通过**，见下节。
+> **第三版：移植已完成并验证通过**，见下文“移植结果”。
+
+## Windows WebP 补充（2026-10-24）
+
+以下更新图片解码的实现与构建方式，保留下文移植和实测记录的历史语境；
+原有 PASS 和 PNG 端到端实测不覆盖新增 WebP 路径，本补充不新增实测结论。
+
+- PNG/JPEG 仍用 `stb_image`；WebP 不再明确拒绝，而是强制静态链接官方
+  libwebp 1.6.0 的 decoder-only `webpdecoder`（Release x64、`/MT`），不新增 DLL。
+  这不是可选的预编译库方案。
+- `build_win.sh` 自动下载官方源码
+  [libwebp-1.6.0.tar.gz](https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0.tar.gz)，
+  并校验固定 SHA-256
+  `e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564`。
+  源码与缓存均在 `build/deps/`。
+- 编译期需 CMake、Ninja 和 Windows SDK，可用 `CMAKE` / `NINJA` 覆盖工具路径；
+  这些工具不是新增运行期依赖。
+- libwebp 许可证位于 `build/third-party-licenses/libwebp/`，`release_win.sh` 随包复制。
+
+候选 API 与 CPU 解码测试入口（在 Git Bash 下运行）：
+
+```bash
+QWENOX_API_OUT=build/qwenox-webp-candidate.exe bash build_win.sh api
+bash build_win.sh vision-test
+```
+
+`vision-test` 执行 `--decode-only`，只做 CPU 解码测试，无需模型。
 
 ## 显存容量（2026-10-13 实测，现行）
 
@@ -114,18 +140,20 @@ OpenAI 接口）。Git Bash 下 `start_win.sh` 与 Linux `start.sh` 并列。
 - **API 前端**（`src/api` → `gdec-api-win.exe`）：http.cpp / engine_client.cpp
   的 socket 层走同一套 `os_win32.h` shim（`sock_t` 类型、WSAPoll、
   `SO_RCVTIMEO` 用 DWORD 毫秒）；用 TheRock 自带裸 clang++ 编译（无需
-  hipcc、零 HIP 依赖），仅链系统 `ws2_32`，nlohmann/json 由 TheRock
+  hipcc、零 HIP 依赖），使用系统 `ws2_32` 并静态链接 `webpdecoder`，nlohmann/json 由 TheRock
   include 提供。注意 WinSock 陷阱：`peer_gone` 探测必须在 recv 失败后
   **立即**取走 `WSAGetLastError()` 再做 `ioctlsocket` 恢复阻塞——成功
   调用会改写 last-error，误判"客户端断开"导致流式请求秒断（已修）。
-  图片解码用 stb_image（public domain 单头文件，`src/api/vendor/`）支持
-  PNG/JPEG，编译进 exe 零新增 DLL，PNG 图片问答端到端实测通过；WebP
-  无等价单头实现，明确报错，是唯一剩余缺口。
+  图片解码仍用 stb_image（public domain 单头文件，`src/api/vendor/`）支持
+  PNG/JPEG，编译进 exe 零新增 DLL，PNG 图片问答
+  端到端实测通过（原有记录）。**2026-10-24 补充**：WebP 现强制静态链接
+  官方 libwebp 1.6.0 的 decoder-only `webpdecoder`（Release x64、`/MT`），
+  同样不新增 DLL；构建和测试入口见上方补充，原有 PNG 实测不代表 WebP 已实测。
 - **origami.dll** 是 `libhipblaslt.dll` 的静态依赖，必须随 exe（lld 链接
   报错不点名它，容易漏）。
 
-未尽事项：API 前端已移植（`gdec-api-win.exe`，图片解码经 stb_image 支持
-PNG/JPEG 并实测通过，仅 WebP 明确报错未接）；256K 满填 prefill 未实测
+未尽事项：API 前端已移植（`gdec-api-win.exe`，PNG/JPEG 经 stb_image 支持
+并实测通过；WebP 已接入静态 `webpdecoder`，见 2026-10-24 补充）；256K 满填 prefill 未实测
 （内存布局已验证，全量 256K token 灌入在本机需数小时，意义有限）；
 长跑稳定性（WDDM 换页、`HSA_ENABLE_SDMA=0` 等开关）待观察。
 
@@ -220,7 +248,7 @@ PLE 每 token 仅 2.5 KB 随机读（行地址是 token 历史的哈希取模，
 | POSIX socket（serve 模式 + `src/api/http.cpp` 等） | ~10 处 | WinSock2（API 相近，机械替换） |
 | `clock_gettime`/`localtime_r`/`unistd.h` 杂项 | 少量 | 标准替代 |
 | `build.sh` | 单脚本 | `build.bat`/CMake：TheRock hipcc + `-O3 -std=c++17 --offload-arch=gfx1151`，链接 `rocblas.lib` + `libhipblaslt.dll.a`（注意 hipcc 包装器不接受 `-l:` 语法与裸 `.lib` 路径，需改名为 `hipblaslt.lib`） |
-| API 前端图片库 | libpng/jpeg/webp | vcpkg 或预编译，与引擎解耦，可后置 |
+| API 前端图片库 | PNG/JPEG/WebP | PNG/JPEG 用 stb_image；2026-10-24：WebP 必须从官方 libwebp 1.6.0 源码构建并静态链接 decoder-only `webpdecoder`，替代原先 vcpkg/预编译设想 |
 | `tools/run_capped.sh` | — | 无需移植（本机部署工具） |
 
 ## 部署形态（已验证，自包含）
@@ -237,8 +265,9 @@ TheRock 目录改名、HIP_PATH/ROCM_PATH 清空后 ktest 仍 ALL PASS）。运�
   （官方可再分发，覆盖未装 VC++ Redistributable 的裸机）。
 - kernel db 真身：`rocblas/library/gfx1151/`（17M）+
   `hipblaslt/library/gfx1151/`（13M），exe 相对路径解析，与 cwd 无关。
-- `gdec-api-win.exe`（OpenAI API 前端）零额外依赖：仅链系统 `ws2_32`，
-  随 build/ 一起拷走即用；图片解码未接（文本全功能）。
+- `gdec-api-win.exe`（OpenAI API 前端，历史产物名）无需额外图片 DLL：
+  PNG/JPEG 内嵌 stb_image；2026-10-24 起 WebP 必须静态链接 `webpdecoder`。
+  随 build/ 一起拷走；libwebp 许可证随发行包复制（见上方补充）。
 - 运行期不需要 device bitcode（无 JIT：引擎 kernel 编译期内嵌，rocBLAS/Lt
   直接载 hsaco/.co），`HIP_PATH`/`ROCM_PATH` 均不必设。
 - 建议引擎初始化时加 arena 自验（写读校验 pattern），对驱动回归一票否决。
@@ -254,8 +283,8 @@ TheRock 目录改名、HIP_PATH/ROCM_PATH 清空后 ktest 仍 ALL PASS）。运�
    社区建议的 `HSA_ENABLE_SDMA=0`/`HSA_USE_SVM=0` 稳定性开关待验证。
 4. 96 GiB BIOS 划分保持不变即可；无需 VGM 调整（单次大额分配路径不经过
    其限制）。2080 Ti 不影响 HIP 设备枚举。
-5. ~~API 前端未动~~ 已移植（见上节）；剩余唯一功能缺口是 WebP 解码，
-   systemd 工具链不适用 Windows。
+5. ~~API 前端未动~~ 已移植（见上节）；2026-10-24 已接入 WebP 静态解码，
+   不再列为功能缺口（实测范围见上方补充）；systemd 工具链不适用 Windows。
 
 ## 下一步（全部完成，留存备查）
 
@@ -266,7 +295,8 @@ TheRock 目录改名、HIP_PATH/ROCM_PATH 清空后 ktest 仍 ALL PASS）。运�
 4. ~~kernel 单测（`tools/ktest.cu`）在 Windows 全绿。~~ ✅ ALL PASS
 5. ~~API 前端与服务化收尾。~~ ✅ `gdec-api-win.exe` + `start_win.sh` 双进程，
    `api_live_smoke.py` 8/8 PASS，多模态（PNG 图片问答）端到端实测通过；
-   剩余可选：WebP 解码（需 libwebp 预编译库）
+   2026-10-24 补充：WebP 现为必选的源码静态构建（`webpdecoder`），
+   不再依赖可选预编译库，验证入口见上方补充。
 
 实际工作量集中在 arena 架构改造与新加载器（NO_BUFFERING 直读）上，
 与"人周量级"的估计一致；运行时风险项已全部实测排除或规避。

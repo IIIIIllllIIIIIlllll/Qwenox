@@ -13,8 +13,7 @@
 
 #ifdef _WIN32
 // Windows 构建不链 libpng/libjpeg：改用 stb_image（public domain 单头文件，
-// 编译进 exe，零新增 DLL）解码 PNG/JPEG，保持产物自包含。WebP 无等价单头
-// 实现，decode_image 里对其明确报错。
+// 编译进 exe，零新增 DLL）解码 PNG/JPEG；WebP 由静态 libwebp 解码。
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_STDIO
 #define STBI_ONLY_PNG
@@ -25,8 +24,8 @@
 
 #include <jpeglib.h>
 #include <png.h>
-#include <webp/decode.h>
 #endif
+#include <webp/decode.h>
 
 namespace vision {
 namespace {
@@ -143,6 +142,8 @@ bool decode_jpeg(const std::vector<uint8_t>& bytes, Image* out, std::string* err
     return true;
 }
 
+#endif
+
 bool decode_webp(const std::vector<uint8_t>& bytes, Image* out, std::string* error) {
     int width = 0, height = 0;
     if (!WebPGetInfo(bytes.data(), bytes.size(), &width, &height)) {
@@ -162,6 +163,7 @@ bool decode_webp(const std::vector<uint8_t>& bytes, Image* out, std::string* err
     return true;
 }
 
+#ifndef _WIN32
 bool decode_image(const std::vector<uint8_t>& bytes, Image* out, std::string* error) {
     if (bytes.size() >= 8 && png_sig_cmp(bytes.data(), 0, 8) == 0)
         return decode_png(bytes, out, error);
@@ -176,11 +178,8 @@ bool decode_image(const std::vector<uint8_t>& bytes, Image* out, std::string* er
 #else
 bool decode_image(const std::vector<uint8_t>& bytes, Image* out, std::string* error) {
     if (bytes.size() >= 12 && std::memcmp(bytes.data(), "RIFF", 4) == 0 &&
-        std::memcmp(bytes.data() + 8, "WEBP", 4) == 0) {
-        *error = "WebP images are not supported in this Windows build; "
-                 "send PNG or JPEG instead";
-        return false;
-    }
+        std::memcmp(bytes.data() + 8, "WEBP", 4) == 0)
+        return decode_webp(bytes, out, error);
     int width = 0, height = 0;
     unsigned char* pixels =
         stbi_load_from_memory(bytes.data(), static_cast<int>(bytes.size()),

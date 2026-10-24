@@ -170,6 +170,11 @@ for f in "${RUNTIME_FILES[@]}"; do
     [[ -f "build/$f" ]] || die "缺少运行文件：build/$f"
     cp -a "build/$f" "$OUT/build/"
 done
+for f in COPYING PATENTS AUTHORS SOURCE.txt; do
+    [[ -f "build/third-party-licenses/libwebp/$f" ]] || die "缺少 libwebp 许可文件：$f（请重建 Windows API）"
+done
+mkdir -p "$OUT/build/third-party-licenses"
+cp -a build/third-party-licenses/libwebp "$OUT/build/third-party-licenses/"
 cp -a "build/rocblas/library/$GPU_ARCH" "$OUT/build/rocblas/library/"
 cp -a "build/hipblaslt/library/$GPU_ARCH" "$OUT/build/hipblaslt/library/"
 # rocBLAS 顶层可能还有按架构命名的 fallback 分片（KB 级）

@@ -22,10 +22,10 @@ step() { echo; echo "== $*"; }
 step "编译（$OUT）"
 VFLAGS=()
 LIBS=(-lpng -ljpeg -lwebp -lpthread)
-# 本机没有 libjpeg/libwebp 头文件时 vision.cpp 走 stb 解码分支（测试不解码图片）
+# 没有 libjpeg 头文件时仅 PNG/JPEG 改走 stb；共享 WebP 解码仍需 libwebp。
 if ! echo '#include <jpeglib.h>' | "$CXX" -x c++ -E - >/dev/null 2>&1; then
-  VFLAGS=(-D_WIN32 -Wno-error); LIBS=(-lpthread)
-  echo "（无 jpeglib.h：vision.cpp 用 stb 分支编译）"
+  VFLAGS=(-D_WIN32 -Wno-error); LIBS=(-lwebp -lpthread)
+  echo "（无 jpeglib.h：PNG/JPEG 用 stb 分支，WebP 仍链接 libwebp）"
 fi
 "$CXX" -O2 -std=c++17 tools/gen_static_inc.cpp -o "$OUT/gen_static_inc" &&
   "$OUT/gen_static_inc" src/api/static src/api/static_gen.inc || fail=1

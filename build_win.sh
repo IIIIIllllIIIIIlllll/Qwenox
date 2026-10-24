@@ -9,6 +9,9 @@
 #   bash build_win.sh launcher   # 根目录最小入口 → ./start_win.exe（双击拉起 API）
 #   bash build_win.sh settings   # 根目录设置工具 → ./settings_win.exe（双击配置/检查，不启动服务）
 #   bash build_win.sh test       # 编 build/ktest-win.exe 并运行 kernel 单测
+#   bash build_win.sh vision-test # 纯 CPU 图片解码回归，不加载模型
+#   QWENOX_API_OUT=build/qwenox-webp-candidate.exe bash build_win.sh api
+#                                # 独立候选 API，不覆盖正在运行的默认 exe
 #   bash build_win.sh npu        # NPU 检测工具（仅 Windows）→ build/npucheck-win.exe
 #                                #   （GUI）+ build/npuio.exe + build/gpuload.exe；
 #                                #   XRT 头/def 与 xclbin/insts 不进仓库，默认取自
@@ -43,7 +46,7 @@ export HIP_PATH="$TR_WIN"
 unset ROCM_PATH HIP_PATH_64 HIP_PATH_71 HIP_PATH_72
 GPU_ARCH="${GPU_ARCH:-gfx1151}"
 TARGET="${1:-all}"
-[[ "$TARGET" == all || "$TARGET" == engine || "$TARGET" == bench || "$TARGET" == api || "$TARGET" == launcher || "$TARGET" == settings || "$TARGET" == test || "$TARGET" == npu ]] || { sed -n '2,17p' "$0" >&2; exit 2; }
+[[ "$TARGET" == all || "$TARGET" == engine || "$TARGET" == bench || "$TARGET" == api || "$TARGET" == launcher || "$TARGET" == settings || "$TARGET" == test || "$TARGET" == vision-test || "$TARGET" == npu ]] || { sed -n '2,17p' "$0" >&2; exit 2; }
 
 # HIP 工具链/winlibs/kernel db 只服务 engine/bench/test；api 与 launcher 是纯主机 C++，
 # 在没有本机 gfx 分片 kernel db 的机器上（如只部署 API 的机器）也应能编译。
@@ -229,25 +232,90 @@ gui_ldflags() {
     fi
 }
 
+# 固定官方源码与校验值，只构建解码静态库；缓存和许可文件均在 build/。
+prepare_webp() {
+    local version=1.6.0
+    local sha=e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564
+    local url="https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-$version.tar.gz"
+    local archive="$ROOT/build/deps/libwebp-$version.tar.gz"
+    local src="$ROOT/build/deps/libwebp-$version"
+    local cc="$TR/lib/llvm/bin/clang-cl.exe"
+    local cmake="${CMAKE:-cmake}" ninja="${NINJA:-ninja}" rc='' mt='' f
+    if ! command -v "$cmake" >/dev/null 2>&1; then
+        cmake='/c/Program Files/CMake/bin/cmake.exe'
+    fi
+    if ! command -v "$ninja" >/dev/null 2>&1; then
+        local vswhere='/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe'
+        local vs
+        vs="$("$vswhere" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 \
+              -property installationPath | tr -d '\r')"
+        ninja="$(cygpath -u "$vs")/Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja/ninja.exe"
+    fi
+    for f in '/c/Program Files (x86)/Windows Kits/10/bin/'*/x64/rc.exe; do
+        [[ ! -x "$f" ]] || rc="$f"
+    done
+    [[ -z "$rc" ]] || mt="${rc%/*}/mt.exe"
+    for f in "$cmake" "$ninja" "$cc" "$rc" "$mt"; do
+        command -v "$f" >/dev/null 2>&1 || {
+            echo "缺少 WebP 构建工具：$f（需要 CMake、Ninja、TheRock 和 Windows SDK）" >&2
+            return 1
+        }
+    done
+    cmake="$(command -v "$cmake")"
+    ninja="$(command -v "$ninja")"
+    mkdir -p "$ROOT/build/deps"
+    if [[ ! -f "$archive" ]]; then
+        curl --fail --location --retry 2 --connect-timeout 20 --max-time 180 \
+          "$url" -o "$archive.tmp" && mv "$archive.tmp" "$archive" || return 1
+    fi
+    printf '%s  %s\n' "$sha" "$archive" | sha256sum -c - || return 1
+    tar -xzf "$archive" -C "$ROOT/build/deps"
+    local tool_id
+    tool_id="$(printf '%s\n' "$(cygpath -m "$TR")" "$("$cc" --version)" | sha256sum)"
+    local out="$ROOT/build/deps/webp-$version-x64-mt-${tool_id:0:12}"
+    local opts=() feature
+    for feature in ANIM_UTILS CWEBP DWEBP GIF2WEBP IMG2WEBP VWEBP WEBPINFO LIBWEBPMUX WEBPMUX EXTRAS; do
+        opts+=("-DWEBP_BUILD_${feature}=OFF")
+    done
+    "$cmake" -S "$(cygpath -m "$src")" -B "$(cygpath -m "$out")" -G Ninja \
+      "-DCMAKE_MAKE_PROGRAM=$(cygpath -m "$ninja")" \
+      "-DCMAKE_C_COMPILER=$(cygpath -m "$cc")" \
+      "-DCMAKE_LINKER=$(cygpath -m "$TR/lib/llvm/bin/lld-link.exe")" \
+      "-DCMAKE_AR=$(cygpath -m "$TR/lib/llvm/bin/llvm-lib.exe")" \
+      "-DCMAKE_RC_COMPILER=$(cygpath -m "$rc")" "-DCMAKE_MT=$(cygpath -m "$mt")" \
+      -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded \
+      -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DWEBP_LINK_STATIC=ON "${opts[@]}"
+    "$cmake" --build "$(cygpath -m "$out")" --target webpdecoder --parallel
+    WEBP_INCLUDE="$(cygpath -m "$src/src")"
+    WEBP_LIB="$(cygpath -m "$out/libwebpdecoder.lib")"
+    [[ -f "$out/libwebpdecoder.lib" ]] || { echo '缺少 WebP 静态解码库' >&2; return 1; }
+    local notices="$ROOT/build/third-party-licenses/libwebp"
+    mkdir -p "$notices"
+    cp "$src/COPYING" "$src/PATENTS" "$src/AUTHORS" "$notices/"
+    printf 'libwebp %s\nSource: %s\nSHA-256: %s\nStatic decoder; Release x64 /MT\n' \
+      "$version" "$url" "$sha" > "$notices/SOURCE.txt"
+}
+
 build_api() {
     # OpenAI HTTP 前端：纯主机 C++，用 TheRock 自带 clang++（不拖 HIP 依赖）。
-    # vision.cpp 的图片解码在 Windows 上走 stb_image（vendor 单头文件，
-    # 编译进 exe，零新增 DLL），支持 PNG/JPEG；WebP 明确报错。
+    # PNG/JPEG 走 stb_image，WebP 静态链接 libwebp，零新增 DLL。
     # Windows 上是 GUI 子系统托盘程序（默认无控制台，--console 恢复），
     # 取代旧 start_win.exe 启动器的生态位：托盘菜单/网页 #/engine 启停引擎。
-    # 15 个 TU 互相独立，多核并行编译后一次链接。
+    # 16 个 TU 互相独立，多核并行编译后一次链接。
     CXX="$TR/lib/llvm/bin/clang++.exe"
     [[ -x "$CXX" ]] || { echo "找不到 TheRock clang++: $CXX" >&2; exit 1; }
+    prepare_webp
+    local api_out="${QWENOX_API_OUT:-build/qwenox-win.exe}"
     gen_static_inc
     gui_ldflags
     mkiconres src/qwenox_win.rc build/qwenox_win.res qwenox-win.exe
-    echo "[编译] build/qwenox-win.exe（16 个 TU 并行）"
+    echo "[编译] $api_out（16 个 TU 并行，静态 WebP）"
     local srcs=(http engine_client tokenizer chat_template json_py toolparse vision
                 reqstat reqstat_read power engine_sup tray_win snap_cuts reqlog diagpack main)
     local dbg=() pdbl=()
     if (( PDB_ON )); then
       dbg=(-g)
-      "$CXX" -dumpmachine | grep -q msvc && { dbg+=(-gcodeview); mapfile -t pdbl < <(pdb_link build/qwenox-win.pdb); }
+      "$CXX" -dumpmachine | grep -q msvc && { dbg+=(-gcodeview); mapfile -t pdbl < <(pdb_link "${api_out%.exe}.pdb"); }
     fi
     local objdir=build/.api-obj
     mkdir -p "$objdir"
@@ -264,7 +332,7 @@ build_api() {
     local pids=() s i fail=0
     for s in "${srcs[@]}"; do
         "$CXX" -O2 -std=c++17 ${dbg[@]+"${dbg[@]}"} -D_CRT_SECURE_NO_WARNINGS "${VER_FLAGS[@]}" \
-          -Isrc/api -Ithird_party -Ithird_party/miniz -I"$TR/include" \
+          -Isrc/api -Ithird_party -Ithird_party/miniz -I"$TR/include" -I"$WEBP_INCLUDE" \
           -c "src/api/$s.cpp" -o "$objdir/$s.o" >"$objdir/$s.log" 2>&1 &
         pids+=($!)
     done
@@ -273,8 +341,18 @@ build_api() {
     done
     [[ $fail == 0 ]] || exit 1
     # wevtapi：诊断包读 Windows 事件日志（diagpack.cpp）
-    "$CXX" "$objdir"/*.o -lws2_32 -lshell32 -luser32 -lgdi32 -ladvapi32 -lwevtapi \
-      "${GUI_LDFLAGS[@]}" ${RES[@]+"${RES[@]}"} ${pdbl[@]+"${pdbl[@]}"} -o build/qwenox-win.exe
+    "$CXX" "$objdir"/*.o "$WEBP_LIB" -lws2_32 -lshell32 -luser32 -lgdi32 -ladvapi32 -lwevtapi \
+      "${GUI_LDFLAGS[@]}" ${RES[@]+"${RES[@]}"} ${pdbl[@]+"${pdbl[@]}"} -o "$api_out.tmp"
+    mv -f "$api_out.tmp" "$api_out"
+}
+
+build_vision_test() {
+    CXX="$TR/lib/llvm/bin/clang++.exe"
+    prepare_webp
+    "$CXX" -O2 -std=c++17 -D_CRT_SECURE_NO_WARNINGS -Isrc/api -Ithird_party \
+      -I"$WEBP_INCLUDE" src/api/vision_test.cpp src/api/vision.cpp src/api/tokenizer.cpp \
+      "$WEBP_LIB" -o build/vision-test-win.exe
+    build/vision-test-win.exe --decode-only
 }
 
 # exe 资源（可选）：文件图标 + PerMonitorV2 manifest。优先 TheRock 的 llvm-rc，
@@ -399,6 +477,7 @@ case "$TARGET" in
   launcher) build_launcher ;;
   settings) build_settings ;;
   test) build_test ;;
+  vision-test) build_vision_test ;;
   npu) build_npu ;;
 esac
 echo '[完成] 编译输出位于 build/；启动服务用 ./start_win.exe（或 bash start_win.sh），改配置用 ./settings_win.exe'
