@@ -110,7 +110,8 @@ const I18N = {
     "eng.e_start": "启动失败：{m}", "eng.e_stop": "停止失败：{m}",
     "cfg.title": "服务配置（service.conf）",
     "cfg.hint": "保存写入 service.conf（原内容备份为 .bak），下次启动引擎时生效；运行中的引擎与 API 端口不受影响。环境变量覆盖的键已置灰。",
-    "cfg.grp_weights": "权重文件", "cfg.grp_ctx": "上下文与并发", "cfg.grp_net": "端口与监听",
+    "cfg.grp_weights": "权重文件", "cfg.grp_ctx": "推理设置", "cfg.grp_net": "端口与监听",
+    "cfg.aff_off": "不限制", "cfg.aff_ccd1": "亲和到 CCD 1",
     "cfg.weights_ver": "权重版本",
     "cfg.ver_v1": "V1（单文件，n-gram 内嵌主权重）",
     "cfg.ver_v2": "V2（主权重 + 独立 n-gram 文件）",
@@ -230,7 +231,8 @@ const I18N = {
     "cfg.hint": "Saving writes service.conf (previous content backed up to .bak) and takes effect " +
       "on the next engine start; the running engine and API port are unaffected. " +
       "Keys overridden by environment variables are disabled.",
-    "cfg.grp_weights": "Weight files", "cfg.grp_ctx": "Context & concurrency", "cfg.grp_net": "Ports & listen",
+    "cfg.grp_weights": "Weight files", "cfg.grp_ctx": "Inference", "cfg.grp_net": "Ports & listen",
+    "cfg.aff_off": "Unrestricted", "cfg.aff_ccd1": "Pin to CCD 1",
     "cfg.weights_ver": "Weights version",
     "cfg.ver_v1": "V1 (single file, n-gram embedded)",
     "cfg.ver_v2": "V2 (main weights + separate n-gram)",
@@ -1243,7 +1245,7 @@ async function renderRequests(force) {
 }
 
 // ---------------- 引擎 / 设置（service.conf + 启停） ----------------
-// 数据源：GET/POST /admin/config（20 个受管键，与托盘面板相同）、
+// 数据源：GET/POST /admin/config（21 个受管键，与托盘面板相同）、
 // GET /admin/files（工作空间内的受限目录浏览，权重路径键的"浏览"弹窗数据）、
 // GET /admin/engine/status、POST /admin/engine/start|stop（仅 Windows）。
 // Linux 上隐藏启停按钮、显示提示，只保留配置编辑（保存后下次启动生效）。
@@ -1253,7 +1255,7 @@ const CFG_GROUPS = [
       "MTP_FILE", "VISION_FILE", "GGUF_FILE", "GGUF_MTP_FILE", "GGUF_VISION_FILE",
       "TOKENIZER_DIR"] },
   { title: "cfg.grp_ctx", keys: ["MAX_CONTEXT", "PARALLEL", "KV_POOL_TOKENS", "KV_PAGED",
-      "PREFILL_CHUNK", "ROPE_FACTOR", "KVSNAP_MAX_GB"] },
+      "PREFILL_CHUNK", "ROPE_FACTOR", "KVSNAP_MAX_GB", "AFFINITY"] },
   { title: "cfg.grp_net", keys: ["ENGINE_HOST", "ENGINE_PORT", "API_HOST", "API_PORT"] },
 ];
 // 权重组键带"浏览"弹窗（数据来自 /admin/files，仍可手输）：
@@ -1330,6 +1332,15 @@ function buildCfgForm() {
       if (key === "KV_PAGED") {
         inp = document.createElement("select");
         for (const [v, k] of [["1", "ovr.bool_on"], ["0", "ovr.bool_off"]]) {
+          const o = document.createElement("option");
+          o.value = v;
+          o.textContent = t(k);
+          inp.appendChild(o);
+        }
+      } else if (key === "AFFINITY") {
+        // 开关化：只暴露 不限制 / 亲和到 CCD 1（落盘值 "" / "upper-half"）
+        inp = document.createElement("select");
+        for (const [v, k] of [["", "cfg.aff_off"], ["upper-half", "cfg.aff_ccd1"]]) {
           const o = document.createElement("option");
           o.value = v;
           o.textContent = t(k);
@@ -1517,7 +1528,11 @@ async function loadConfig() {
     const j = await getJSON("/admin/config");
     for (const key of Object.keys(cfgInputs)) {
       const inp = cfgInputs[key];
-      inp.value = (j.values && j.values[key]) || "";
+      let val = (j.values && j.values[key]) || "";
+      // AFFINITY 是开关化下拉：conf 里手写的任何非空 mask 都归为"亲和到 CCD 1"，
+      // 保存时规格化为 upper-half
+      if (key === "AFFINITY") val = val ? "upper-half" : "";
+      inp.value = val;
       const envOvr = (j.env_overridden || []).includes(key);
       inp.disabled = envOvr;
       cfgBadges[key].classList.toggle("hidden", !envOvr);
@@ -1627,6 +1642,11 @@ function renderEngineAll() {
   if (kv) {
     kv.options[0].textContent = t("ovr.bool_on");
     kv.options[1].textContent = t("ovr.bool_off");
+  }
+  const aff = cfgInputs["AFFINITY"];
+  if (aff) {
+    aff.options[0].textContent = t("cfg.aff_off");
+    aff.options[1].textContent = t("cfg.aff_ccd1");
   }
   for (const key of CFG_FILE_KEYS)
     if (cfgInputs[key]) cfgInputs[key].placeholder = t("cfg.pick_ph");

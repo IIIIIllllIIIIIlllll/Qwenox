@@ -5024,6 +5024,28 @@ int main(int argc, char** argv) {
         if (freopen(lp.c_str(), "ab", stdout)) setvbuf(stdout, nullptr, _IONBF, 0);
         if (freopen(lp.c_str(), "ab", stderr)) setvbuf(stderr, nullptr, _IONBF, 0);
     }
+    // 处理器亲和性（service.conf AFFINITY，仅 Windows）：钉 API 自身；引擎子
+    // 进程由 engine_sup 在 spawn 时钉。mask 先与系统可用逻辑处理器求交。
+    {
+        const std::string aff = svcconf::cfg(g_svc_conf, "AFFINITY", "");
+        unsigned long long m = svcconf::parse_affinity(aff);
+        if (m) {
+            DWORD_PTR pm = 0, sm = 0;
+            if (GetProcessAffinityMask(GetCurrentProcess(), &pm, &sm)) m &= sm;
+            if (!m)
+                fprintf(stderr, "qwenox-api: WARNING: AFFINITY \"%s\" has no CPU in"
+                                " common with this system\n", aff.c_str());
+            else if (!SetProcessAffinityMask(GetCurrentProcess(),
+                                             static_cast<DWORD_PTR>(m)))
+                fprintf(stderr, "qwenox-api: WARNING: SetProcessAffinityMask(api)"
+                                " failed, error %lu\n", GetLastError());
+            else
+                fprintf(stderr, "qwenox-api: affinity mask 0x%llX\n", m);
+        } else if (!aff.empty()) {
+            fprintf(stderr, "qwenox-api: WARNING: AFFINITY \"%s\" not parseable"
+                            " (upper-half | mask), ignored\n", aff.c_str());
+        }
+    }
 #endif
     // API 自己的崩溃报告（crash-api-*），与引擎同目录
     crashdiag::install("api", QWENOX_VERSION_FULL);

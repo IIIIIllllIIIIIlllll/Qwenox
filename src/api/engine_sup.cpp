@@ -404,6 +404,23 @@ bool start(const std::string& root, const svcconf::Conf& conf, std::string* err)
     const std::string rope_slow_s = svcconf::cfg(conf, "ROPE_BETA_SLOW", "1");
     const std::string rope_attn_s = svcconf::cfg(conf, "ROPE_ATTN_SCALE", "0");
 
+    // 处理器亲和性（AFFINITY，仅 Windows）：spawn 时钉引擎子进程；API 自身
+    // 的钉核在 main.cpp。与系统可用逻辑处理器求交，交集为空则放弃并告警。
+    DWORD_PTR affinity = 0;
+    {
+        const std::string aff = svcconf::cfg(conf, "AFFINITY", "");
+        unsigned long long m = svcconf::parse_affinity(aff);
+        DWORD_PTR pm = 0, sm = 0;
+        if (m && GetProcessAffinityMask(GetCurrentProcess(), &pm, &sm)) m &= sm;
+        if (m) {
+            affinity = static_cast<DWORD_PTR>(m);
+            fprintf(stderr, "qwenox-api: engine affinity mask 0x%llX\n", m);
+        } else if (!aff.empty()) {
+            fprintf(stderr, "qwenox-api: WARNING: AFFINITY \"%s\" not applied"
+                            " to engine\n", aff.c_str());
+        }
+    }
+
     // 启动前文件检查（同 launch_win.cpp 启动检查；overlay 缺失只警告并跳过）
     const std::string exe = root + "\\build\\qwenox-engine-win.exe";
     if (!file_exists(exe)) {
@@ -563,6 +580,9 @@ bool start(const std::string& root, const svcconf::Conf& conf, std::string* err)
         }
     }
     if (g_job) AssignProcessToJobObject(g_job, pi.hProcess);  // 失败也不影响运行
+    if (affinity && !SetProcessAffinityMask(pi.hProcess, affinity))
+        fprintf(stderr, "qwenox-api: WARNING: SetProcessAffinityMask(engine)"
+                        " failed, error %lu\n", GetLastError());
     CloseHandle(pi.hThread);
 
     FILE* log = fopen(log_path.c_str(), "wb");

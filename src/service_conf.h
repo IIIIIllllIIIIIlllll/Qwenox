@@ -13,6 +13,7 @@
 #include <cstring>
 #include <map>
 #include <string>
+#include <thread>
 
 namespace svcconf {
 
@@ -27,7 +28,7 @@ inline const char* kManagedKeys[] = {
     "GGUF_FILE", "GGUF_MTP_FILE", "GGUF_VISION_FILE",
     "TOKENIZER_DIR", "MAX_CONTEXT", "PARALLEL", "KV_POOL_TOKENS", "KV_PAGED",
     "PREFILL_CHUNK", "ROPE_FACTOR",
-    "KVSNAP_MAX_GB", "KVSNAP_DIR", "MOE_A4",
+    "KVSNAP_MAX_GB", "KVSNAP_DIR", "MOE_A4", "AFFINITY",
     "ENGINE_HOST", "ENGINE_PORT", "API_HOST", "API_PORT",
 };
 inline const size_t kManagedKeysCount = sizeof(kManagedKeys) / sizeof(kManagedKeys[0]);
@@ -180,6 +181,23 @@ inline bool parse_double(const std::string& s, double* out) {
     if (!end || *end || end == s.c_str() || n != n || n < 0) return false;
     *out = n;
     return true;
+}
+
+// AFFINITY（仅 Windows 生效；Linux 由 taskset 负责）：解析进程亲和性配置为
+// mask。空串或解析失败返回 0（调用方按需告警）。"upper-half" = 上半逻辑
+// 处理器（双 CCD 机型钉 CCD1）；其余按 strtoull base 0 解析（支持 0x 前缀）。
+inline unsigned long long parse_affinity(const std::string& s) {
+    if (s.empty()) return 0;
+    if (s == "upper-half") {
+        const unsigned n = std::thread::hardware_concurrency();
+        if (n < 2 || n > 64) return 0;
+        const unsigned long long all = n == 64 ? ~0ull : ((1ull << n) - 1);
+        return all & (~0ull << (n / 2));
+    }
+    char* end = nullptr;
+    const unsigned long long m = strtoull(s.c_str(), &end, 0);
+    if (end == s.c_str() || !end || *end) return 0;
+    return m;
 }
 
 // 读 "# <prefix><value>" 注释标记行（如 "# start_win: weights=v2"）；没有返回空串。
@@ -335,6 +353,12 @@ inline bool validate_conf(const Conf& conf, std::string* err) {
     }
     if (rope_factor > 1 && max_context > rope_factor * rope_original) {
         *err = "MAX_CONTEXT exceeds ROPE_FACTOR*ROPE_ORIGINAL_CTX (YaRN limit)";
+        return false;
+    }
+    const std::string affinity = cfg(conf, "AFFINITY", "");
+    if (!affinity.empty() && !parse_affinity(affinity)) {
+        *err = "AFFINITY must be empty, \"upper-half\", or a non-zero integer mask"
+               " (got \"" + affinity + "\")";
         return false;
     }
     return true;

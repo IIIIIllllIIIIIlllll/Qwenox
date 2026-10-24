@@ -5,14 +5,16 @@
 // CreateWindowExW 自建窗口 + 子控件，代码内布局。
 //
 // 面板分 4 页，顶部 4 个 BS_PUSHLIKE|BS_AUTORADIOBUTTON 切换（不引入 comctl32）：
-//   第 1 页 权重：V1（w4b 单文件）/ V2（主体+独立 n-gram）/ GGUF 版本选择，
 //          各版本只显示自己相关的文件行；GGUF 由 qwenox-win 按 weights=gguf 标记
 //          直接启动（GGUF_FILE 首分片 + GGUF_MTP_FILE + GGUF_VISION_FILE）。
 //          V2 另有"prefill 4-bit 加速"勾选框（MOE_A4，勾 = 3 / 不勾 = 0，会降低
 //          prompt 部分精度，检查区出 [警告] 说明代价；V1/GGUF 不显示、原值保留）。
-//   第 2 页 上下文与并发：MAX_CONTEXT / PARALLEL / 并发总池（KV_POOL_TOKENS）/
+//   第 2 页 推理设置：MAX_CONTEXT / PARALLEL / 并发总池（KV_POOL_TOKENS）/
 //          KV_PAGED / PREFILL_CHUNK / KV 快照（KVSNAP_MAX_GB + KVSNAP_DIR）/
-//          YaRN 勾选（ROPE_FACTOR 按上限自动推导）。
+//          YaRN 勾选（ROPE_FACTOR 按上限自动推导）/
+//          处理器亲和性勾选（不限制 / 亲和到 CCD 1，落盘 AFFINITY ""/upper-half）。
+//          GGUF 仅保存（本机服务由 start_win.exe 启动，只支持 hgn；GGUF 配置供 Linux
+//          bash start_gguf.sh 使用）。
 //          ROPE_ORIGINAL_CTX 不做 UI 行（用户不该改）：校验仍从 g_conf/环境读，
 //          也不在 kManagedKeys 里，save_conf 永远不会改写 conf 中的该行。
 //   第 3 页 端口与监听：ENGINE_HOST / ENGINE_PORT / API_HOST / API_PORT。
@@ -135,11 +137,11 @@ void panel_lang_resolve() {
 using svcconf::kManagedKeys;
 using svcconf::is_optional_file_key;
 
-// 环境变量覆盖提示归属的页：0 权重 / 1 上下文 / 2 端口。
+// 环境变量覆盖提示归属的页：0 权重 / 1 推理 / 2 端口。
 int page_of_key(const std::string& k) {
     if (k == "MAX_CONTEXT" || k == "PARALLEL" || k == "KV_POOL_TOKENS" || k == "KV_PAGED" ||
         k == "PREFILL_CHUNK" || k == "ROPE_FACTOR" || k == "KVSNAP_MAX_GB" ||
-        k == "KVSNAP_DIR")
+        k == "KVSNAP_DIR" || k == "AFFINITY")
         return 1;
     if (k == "ENGINE_HOST" || k == "ENGINE_PORT" || k == "API_HOST" || k == "API_PORT")
         return 2;
@@ -381,6 +383,7 @@ struct PanelVals {
     std::string kvsnap_max_gb;
     std::string kvsnap_dir;  // KVSNAP_DIR：空 = 引擎默认 data\kvsnap
     std::string moe_a4 = "0";  // MOE_A4：0 关，1–3 开（只对 V2 生效）
+    std::string affinity;
     std::string engine_host, engine_port, api_host, api_port;
 };
 
@@ -418,6 +421,7 @@ PanelVals panel_vals_from_conf() {
     v.kvsnap_max_gb = cfg("KVSNAP_MAX_GB", "20");
     v.kvsnap_dir = cfg_optional("KVSNAP_DIR", "");
     v.moe_a4 = cfg("MOE_A4", "0");
+    v.affinity = cfg("AFFINITY", "");
     v.engine_host = cfg("ENGINE_HOST", "127.0.0.1");
     v.engine_port = cfg("ENGINE_PORT", "8730");
     v.api_host = cfg("API_HOST", "0.0.0.0");
@@ -467,6 +471,7 @@ std::map<std::string, std::string> panel_vals_to_conf(const PanelVals& v) {
     while (!kdir.empty() && (kdir.back() == '\\' || kdir.back() == '/')) kdir.pop_back();
     m["KVSNAP_DIR"] = kdir;
     m["MOE_A4"] = v.moe_a4;
+    m["AFFINITY"] = v.affinity;
     m["ENGINE_HOST"] = v.engine_host;
     m["ENGINE_PORT"] = v.engine_port;
     m["API_HOST"] = v.api_host;
@@ -620,7 +625,7 @@ void check_weights_page(CheckLines& c, const PanelVals& v) {
         check_line(c, kLvPass, TR("tokenizer：", "tokenizer: ") + v.tok + "\\tokenizer.json");
 }
 
-// 第 2 页：上下文与并发、YaRN 的数值校验（与启动流程同一套规则）。
+// 第 2 页：推理设置（上下文/并发/YaRN）的数值校验（与启动流程同一套规则）。
 void check_context_page(CheckLines& c, const PanelVals& v) {
     // 说明行（不参与判定，恒在列表最上方）
     c.text += TR("· 单请求上限：一条请求的输入+输出最大 token 数，模型原生 262144。\r\n",
@@ -1087,7 +1092,7 @@ enum PanelId : int {
     kBrGguf, kBrGgufMtp, kBrGgufVision,
     kOffOverlay, kOffMtp, kOffVision, kOffGgufMtp, kOffGgufVision,
     kEdMaxctx, kCbMaxctxPreset, kCbParallel, kEdKvPool, kCkKvPaged, kEdPrefill,
-    kCkYarn, kEdKvsnap, kEdKvsnapDir, kBrKvsnapDir,
+    kCkYarn, kEdKvsnap, kEdKvsnapDir, kBrKvsnapDir, kCkAffinity,
     kEdEHost, kEdEPort, kEdAHost, kEdAPort,
     kEdOut1, kEdOut2, kEdOut3, kEdReport, kEdSummary, kBtnLang,
     kCkMoeA4,
@@ -1109,6 +1114,7 @@ struct PanelCtl {
     HWND yarn = nullptr;  // "YaRN 长上下文扩展" 勾选框（ROPE_FACTOR 自动推导，无编辑行）
     HWND kvsnap = nullptr;
     HWND kvsnap_dir = nullptr, kvsnap_dir_br = nullptr;
+    HWND affinity = nullptr;
     HWND ehost = nullptr, eport = nullptr, ahost = nullptr, aport = nullptr;
     HWND out1 = nullptr, out2 = nullptr, out3 = nullptr, report = nullptr, summary = nullptr;
 };
@@ -1315,6 +1321,9 @@ PanelVals panel_collect() {
         v.moe_a4 = get_check(g_pc.moe_a4) ? (a4_keep != "0" ? a4_keep : "3") : "0";
     else
         v.moe_a4 = a4_keep;
+    // 亲和性开关化：勾 = upper-half（CCD 1），不勾 = 不限制；conf 里手写的
+    // 任何非空 mask 在面板上都显示为勾，保存时规格化为 upper-half
+    v.affinity = get_check(g_pc.affinity) ? "upper-half" : "";
     v.engine_host = get_edit(g_pc.ehost);
     v.engine_port = get_edit(g_pc.eport);
     v.api_host = get_edit(g_pc.ahost);
@@ -1920,6 +1929,7 @@ LRESULT CALLBACK panel_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             case kCkKvPaged: panel_recheck(); return 0;
             case kCkYarn: panel_recheck(); return 0;
             case kCkMoeA4: panel_recheck(); return 0;
+            case kCkAffinity: panel_recheck(); return 0;
             default: break;
         }
     }
@@ -2035,7 +2045,7 @@ PanelResult panel_run() {
 
     // ---- 分页切换（恒可见）：BS_PUSHLIKE 单选按钮，不引入 comctl32
     const wchar_t* tab_names[4] = {TR(L"1 权重", L"1 Weights"),
-                                   TR(L"2 上下文与并发", L"2 Context & parallel"),
+                                   TR(L"2 推理设置", L"2 Inference"),
                                    TR(L"3 端口与监听", L"3 Ports & listen"),
                                    TR(L"4 显存检查", L"4 VRAM check")};
     for (int i = 0; i < 4; ++i) {
@@ -2099,7 +2109,7 @@ PanelResult panel_run() {
                      WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL,
                      12, 254, 624, kListBottom - 254, L"", kEdOut1);
 
-    // ---- 第 2 页：上下文与并发、YaRN（行尾无 hint，说明在第 2 页检查列表顶部）
+    // ---- 第 2 页：推理设置（上下文/并发/YaRN/亲和性，行尾无 hint，说明在检查列表顶部）
     int y2 = 46;
     plabel(1, h, kLblX, y2, TR(L"单请求上限 (token)", L"Per-request context (tokens)"));
     g_pc.maxctx = pctl(1, h, L"Edit", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kEdX, y2, 120,
@@ -2172,6 +2182,13 @@ PanelResult panel_run() {
     set_edit(g_pc.kvsnap_dir, init.kvsnap_dir);
     g_pc.kvsnap_dir_br = pctl(1, h, L"Button", BS_PUSHBUTTON, kBrX, y2 - 1, kBrW, 24,
                               TR(L"浏览…", L"Browse"), kBrKvsnapDir);
+    y2 += 26;
+    plabel(1, h, kLblX, y2, TR(L"处理器亲和性", L"CPU affinity"));
+    g_pc.affinity = pctl(1, h, L"Button", BS_AUTOCHECKBOX | WS_TABSTOP, kEdX, y2, 400, 20,
+                         TR(L"亲和到 CCD 1（双 CCD 机型）", L"Pin to CCD 1 (dual-CCD systems)"),
+                         kCkAffinity);
+    SendMessageW(g_pc.affinity, BM_SETCHECK,
+                 init.affinity.empty() ? BST_UNCHECKED : BST_CHECKED, 0);
     y2 += 26;
     g_pc.out2 = pctl(1, h, L"Edit",
                      WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL,
