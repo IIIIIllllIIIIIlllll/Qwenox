@@ -8,13 +8,15 @@ tools/conc_verify.sh drives it; every subcommand exits 0 on PASS.
   ctl  --slots N     INFO kv_slots, PING latency under load, cancel (running/queued)
   ovf                shared-pool overflow (engine: N=2, small --maxctx, rckpt off):
                      the LATER request fails, the earlier one is untouched
+  replay --wire W --state S --port P：原样重放实际 GEN，串行重复及多轮混合并发逐 token 对拍；不比较投机统计
 
 A flow is a list of turns on one connection; conversation turns extend the
 previous turn's prompt + output, so they exercise live-state continuation
 (n_cached > 0) while other sequences interleave on the GPU. Each flow has a
 unique prefix, so no request can hit another's cache.
 """
-import argparse, json, os, socket, sys, threading, time
+import argparse, json, os, socket, sys, tempfile, threading, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from qwentok import Tokenizer
@@ -344,15 +346,114 @@ def cmd_ovf():
     return ok
 
 
+def cmd_replay(args):
+    requests = []
+    with args.wire.open() as reader:
+        for line in reader:
+            fields = json.loads(line)['line'].split()
+            if fields and fields[0] == 'GEN':
+                requests.append(fields)
+    indices = list(map(int, args.cases.split(',')))
+    if not indices or len(set(indices)) != len(indices) or any(i < 0 or i >= len(requests) for i in indices):
+        raise ValueError('--cases 必须指定互不重复且存在的 GEN 序号')
+    state = dict(wire=str(args.wire), port=args.port, cases=indices, baseline={},
+                 repeats={}, waves=[], wave_elapsed=[], checks=[], passed=False)
+    started = time.monotonic()
+
+    def save():
+        handle = tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=args.state.parent,
+                                             prefix=args.state.name + '.', suffix='.tmp', delete=False)
+        temporary = Path(handle.name)
+        try:
+            with handle:
+                json.dump(state, handle, ensure_ascii=False, indent=2)
+            temporary.replace(args.state)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def run(index):
+        fields = list(requests[index])
+        fields[1] = '1'
+        c = None
+        started = time.monotonic()
+        try:
+            c = Conn(timeout=args.timeout)
+            c.sock.sendall((' '.join(fields) + '\n').encode())
+            result = c.read_gen()
+        except Exception as error:
+            result = dict(tokens=[], reason='error', error=f'{type(error).__name__}: {error}')
+        finally:
+            if c is not None:
+                try:
+                    c.f.close()
+                finally:
+                    c.close()
+        result['elapsed'] = time.monotonic() - started
+        return result
+
+    def check(label, index, actual):
+        expected = state['baseline'][str(index)]
+        same_tokens = expected['tokens'] == actual['tokens']
+        passed = (actual['reason'] in ('done', 'length') and bool(actual['tokens'])
+                  and same_tokens and expected['reason'] == actual['reason'])
+        state['checks'].append(dict(label=label, case=index, passed=passed,
+                                    first_difference=None if same_tokens else first_diff(expected['tokens'], actual['tokens']),
+                                    expected_reason=expected['reason'], actual_reason=actual['reason']))
+        print(f'{label} case={index}: {"MATCH" if passed else "DIFF"}', flush=True)
+
+    save()
+    try:
+        for index in indices:
+            state['baseline'][str(index)] = run(index)
+            check('baseline', index, state['baseline'][str(index)])
+            save()
+        for index in indices:
+            actual = run(index)
+            state['repeats'][str(index)] = actual
+            check('repeat', index, actual)
+            save()
+        for wave in range(args.waves):
+            results = {}
+            state['waves'].append(results)
+            wave_started = time.monotonic()
+            with ThreadPoolExecutor(max_workers=len(indices)) as pool:
+                futures = {pool.submit(run, index): index for index in indices}
+                for future in as_completed(futures):
+                    index = futures[future]
+                    actual = future.result()
+                    results[str(index)] = actual
+                    check(f'wave-{wave + 1}', index, actual)
+                    save()
+            state['wave_elapsed'].append(time.monotonic() - wave_started)
+            save()
+        state['passed'] = all(item['passed'] for item in state['checks'])
+        return state['passed']
+    finally:
+        state['elapsed'] = time.monotonic() - started
+        save()
+
+
 def main():
+    global PORT
     ap = argparse.ArgumentParser()
-    ap.add_argument('cmd', choices=['seq', 'conc', 'cmp', 'ctl', 'ovf'])
+    ap.add_argument('cmd', choices=['seq', 'conc', 'cmp', 'ctl', 'ovf', 'replay'])
     ap.add_argument('--tag')
     ap.add_argument('--a')
     ap.add_argument('--b')
     ap.add_argument('--slots', type=int, default=4)
+    ap.add_argument('--port', type=int, default=PORT)
+    ap.add_argument('--wire', type=Path, help='replay：包含实际 GEN 行的 JSONL 采集记录')
+    ap.add_argument('--state', type=Path, help='replay：原子保存完整结果的 JSON 文件')
+    ap.add_argument('--cases', default='0,1', help='replay：从零开始的 GEN 序号')
+    ap.add_argument('--waves', type=int, default=3, help='replay：混合并发轮数')
+    ap.add_argument('--timeout', type=float, default=120, help='单次 socket 读写超时；总时限另用外层 supervisor')
     x = ap.parse_args()
-    if x.cmd in ('seq', 'conc'):
+    PORT = x.port
+    if x.cmd == 'replay':
+        if not x.wire or not x.state or x.waves < 1 or not x.timeout > 0 or not 1 <= x.port <= 65535:
+            ap.error('replay 需要 --wire、--state、正数 --waves/--timeout 和合法 --port')
+        ok = cmd_replay(x)
+    elif x.cmd in ('seq', 'conc'):
         ok = cmd_run(x.tag, x.cmd == 'conc', x.slots)
     elif x.cmd == 'cmp':
         ok = cmd_cmp(x.a, x.b)
