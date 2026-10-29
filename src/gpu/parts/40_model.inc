@@ -1617,6 +1617,15 @@ struct GpuModel {
                 (int)ckpt.at("mtp.fc_hidden.weight").dtype);
       }
     }
+    // DFlash2 verify rollback snapshots (per-row GDN/conv/indexer state) are
+    // also needed without MTP weights: plain DFlash2 rolls back partial
+    // accepts through gdn_commit() and the same snapshot buffers.
+    if (!mtp_avail && getenv("QWENOX_DFLASH2")) {
+      int ngdn = g_cfg.layers - g_cfg.layers / 4;
+      DALLOC(&d_grow, (size_t)kVSnapRows * ngdn * kGdnRowF * 4);
+      DALLOC(&d_csnap, (size_t)kVSnapRows * ngdn * 3 * 10240 * 4);
+      DALLOC(&d_iproj_snap, (size_t)(g_cfg.layers / 4) * kVSnapRows * 128 * 4);
+    }
     df2_init();  // no-op unless QWENOX_DFLASH2 is set
     dense_shadow_init();  // no-op unless QWENOX_DENSE_SHADOW=1
     fprintf(stderr, "qwenox: state allocated (maxctx=%d)\n", maxctx);

@@ -14,11 +14,43 @@
 static const uint8_t* g_df2_pred_host = nullptr;  // [vocab][rank] BF16 rows
 static const uint8_t* g_df2_succ_host = nullptr;
 static int g_df2_vocab = 0;
+// Sidecars quantized to Q8_0 are dequantized to BF16 for the host selector
+// walk; BF16 sidecars keep pointing straight into the mmap.
+static std::vector<uint16_t> g_df2_pred_storage;
+static std::vector<uint16_t> g_df2_succ_storage;
+
+static uint16_t df2_f32_to_bf16(float f) {
+  uint32_t u;
+  memcpy(&u, &f, 4);
+  const uint32_t r = u + 0x7fffu + ((u >> 16) & 1u);  // RNE
+  return (uint16_t)(r >> 16);
+}
+
+static const uint8_t* df2_selector_host(const gguf::Tensor& t, const char* what,
+                                        std::vector<uint16_t>& out) {
+  if (t.nd != 2 || t.ne[0] != kDf2Rank)
+    throw std::runtime_error(std::string("dflash2: selector ") + what +
+                             " has unexpected shape");
+  if (t.type == gguf::BF16) return t.data;
+  if (t.type != gguf::Q8_0 && t.type != gguf::F32 && t.type != gguf::F16)
+    throw std::runtime_error(std::string("dflash2: selector ") + what +
+                             " has unsupported type " + gguf::type_name(t.type));
+  const uint64_t cols = t.ne[0], rows = t.ne[1], rb = t.row_bytes();
+  out.resize((size_t)rows * cols);
+  std::vector<float> f(cols);
+  for (uint64_t r = 0; r < rows; r++) {
+    gguf::dequant_row(t.type, t.data + r * rb, f.data(), cols);
+    for (uint64_t c = 0; c < cols; c++)
+      out[(size_t)r * cols + c] = df2_f32_to_bf16(f[c]);
+  }
+  return (const uint8_t*)out.data();
+}
 
 // Opens the sidecar (mmap stays alive). Nothing is added to the Checkpoint:
 // df2_init builds its own device copies (fused, q8g32 by default) straight
 // from the mmap, and the selector codebooks stay host-only (CPU chain walk,
-// 2 x 127 MiB).
+// 2 x 127 MiB). Q8_0 sidecars are accepted; the codebooks are expanded to
+// BF16 once here.
 static void df2_load_sidecar(Checkpoint& ck) {
   (void)ck;
   const char* path = getenv("QWENOX_DFLASH2");
@@ -26,16 +58,19 @@ static void df2_load_sidecar(Checkpoint& ck) {
   if (!g_gguf_df2) g_gguf_df2 = new gguf::File(path);
   const gguf::Tensor& pred = g_gguf_df2->at("selector_predecessor.weight");
   const gguf::Tensor& succ = g_gguf_df2->at("selector_successor.weight");
-  if (pred.type != gguf::BF16 || succ.type != gguf::BF16 ||
-      pred.ne[0] != kDf2Rank || succ.ne[0] != kDf2Rank)
-    throw std::runtime_error("dflash2: selector codebooks: unexpected type/shape");
-  g_df2_pred_host = pred.data;
-  g_df2_succ_host = succ.data;
+  g_df2_pred_host = df2_selector_host(pred, "predecessor", g_df2_pred_storage);
+  g_df2_succ_host = df2_selector_host(succ, "successor", g_df2_succ_storage);
+  if (pred.ne[1] != succ.ne[1])
+    throw std::runtime_error("dflash2: selector codebooks: vocab mismatch");
   g_df2_vocab = (int)pred.ne[1];
+  const std::string cb = pred.type == gguf::BF16
+                             ? std::string("BF16 codebooks")
+                             : std::string(gguf::type_name(pred.type)) +
+                                   " codebooks -> BF16";
   fprintf(stderr,
-          "dflash2: sidecar %s (5 blocks, mask=%lld, selector vocab=%d)\n", path,
+          "dflash2: sidecar %s (5 blocks, mask=%lld, selector vocab=%d, %s)\n", path,
           (long long)g_gguf_df2->kv_i("tokenizer.ggml.mask_token_id", 248077),
-          g_df2_vocab);
+          g_df2_vocab, cb.c_str());
 }
 
 // Host f32 <-> f16 (RNE) for the q8g32 scale plane.
@@ -91,33 +126,110 @@ static float df2_h2f(uint16_t h) {
 // lower acceptance, so it is not offered.
 enum Df2WQ { kDf2WBF16 = 0, kDf2WQ8 = 1 };
 
-// Row-concatenates BF16 GGUF matrices (ne[0] = cols, contiguous) and uploads
-// them as q8g32 (dtype 8: int8 [rows][cols] then f16 scales [rows][cols/32],
-// Q8_0 rounding: d = amax/127, q = round(x/d)) or BF16 (dtype 0).
+// Row-concatenates GGUF matrices (ne[0] = cols, contiguous) and uploads them
+// as q8g32 (dtype 8: int8 [rows][cols] then f16 scales [rows][cols/32], Q8_0
+// rounding: d = amax/127, q = round(x/d)) or BF16 (dtype 0). BF16 sidecars
+// keep the bit-exact fast path; Q8_0/F32/F16 rows are dequantized first.
 static WView df2_upload(const std::vector<std::string>& names, int wq,
                         size_t* bytes) {
   uint64_t cols = 0, rows = 0;
   std::vector<const gguf::Tensor*> ts;
+  bool all_bf16 = true;
   for (const std::string& n : names) {
     const gguf::Tensor& t = g_gguf_df2->at(n);
-    if (t.type != gguf::BF16 || t.nd != 2)
-      throw std::runtime_error("dflash2: " + n + " is not a BF16 matrix");
+    if (t.nd != 2 || (t.type != gguf::BF16 && t.type != gguf::Q8_0 &&
+                      t.type != gguf::F32 && t.type != gguf::F16))
+      throw std::runtime_error("dflash2: " + n + " is not a supported matrix (" +
+                               gguf::type_name(t.type) + ")");
     if (!cols) cols = t.ne[0];
     if (cols != t.ne[0]) throw std::runtime_error("dflash2: fused cols mismatch at " + n);
     rows += t.ne[1];
     ts.push_back(&t);
+    all_bf16 = all_bf16 && t.type == gguf::BF16;
   }
-  std::vector<const uint16_t*> rowp;
-  rowp.reserve(rows);
-  for (const gguf::Tensor* t : ts)
-    for (uint64_t i = 0; i < t->ne[1]; i++)
-      rowp.push_back((const uint16_t*)t->data + i * cols);
   WView w{};
   w.rows = rows;
   w.cols = cols;
+  const uint64_t ng = cols / 32;
+  if (all_bf16) {
+    std::vector<const uint16_t*> rowp;
+    rowp.reserve(rows);
+    for (const gguf::Tensor* t : ts)
+      for (uint64_t i = 0; i < t->ne[1]; i++)
+        rowp.push_back((const uint16_t*)t->data + i * cols);
+    if (wq == kDf2WBF16 || cols % 32) {
+      std::vector<uint16_t> h(rows * cols);
+      for (uint64_t r = 0; r < rows; r++) memcpy(&h[r * cols], rowp[r], cols * 2);
+      uint8_t* d = nullptr;
+      DALLOC(&d, h.size() * 2);
+      CK(hipMemcpy(d, h.data(), h.size() * 2, hipMemcpyHostToDevice));
+      w.dtype = 0;
+      w.data = d;
+      *bytes += h.size() * 2;
+      return w;
+    }
+    const uint64_t nq = rows * cols;
+    std::vector<uint8_t> h(nq + rows * ng * 2);
+    int8_t* q = (int8_t*)h.data();
+    uint16_t* s = (uint16_t*)(h.data() + nq);
+    auto work = [&](uint64_t r0, uint64_t r1) {
+      for (uint64_t r = r0; r < r1; r++) {
+        const uint16_t* src = rowp[r];
+        for (uint64_t gi = 0; gi < ng; gi++) {
+          float v[32], amax = 0.f;
+          for (int i = 0; i < 32; i++) {
+            v[i] = hgn::bf16_to_f32(src[gi * 32 + i]);
+            amax = std::max(amax, std::fabs(v[i]));
+          }
+          const uint16_t dh = df2_f2h(amax / 127.f);
+          const float dq = df2_h2f(dh), inv = dq > 0.f ? 1.f / dq : 0.f;
+          for (int i = 0; i < 32; i++) {
+            const float x = std::nearbyint(v[i] * inv);
+            q[r * cols + gi * 32 + i] = (int8_t)std::max(-127.f, std::min(127.f, x));
+          }
+          s[r * ng + gi] = dh;
+        }
+      }
+    };
+    const unsigned nt = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+    std::vector<std::thread> th;
+    for (unsigned i = 0; i < nt; i++)
+      th.emplace_back(work, rows * i / nt, rows * (i + 1) / nt);
+    for (std::thread& t : th) t.join();
+    uint8_t* d = nullptr;
+    DALLOC(&d, h.size());
+    CK(hipMemcpy(d, h.data(), h.size(), hipMemcpyHostToDevice));
+    w.dtype = 8;
+    w.data = d;
+    *bytes += h.size();
+    return w;
+  }
+
+  struct Src {
+    const gguf::Tensor* t;
+    uint64_t row;
+  };
+  std::vector<Src> src;
+  src.reserve(rows);
+  for (const gguf::Tensor* t : ts)
+    for (uint64_t i = 0; i < t->ne[1]; i++) src.push_back({t, i});
+
   if (wq == kDf2WBF16 || cols % 32) {
     std::vector<uint16_t> h(rows * cols);
-    for (uint64_t r = 0; r < rows; r++) memcpy(&h[r * cols], rowp[r], cols * 2);
+    auto work = [&](uint64_t r0, uint64_t r1) {
+      std::vector<float> f(cols);
+      for (uint64_t r = r0; r < r1; r++) {
+        const Src& s = src[r];
+        gguf::dequant_row(s.t->type, s.t->data + s.row * s.t->row_bytes(), f.data(), cols);
+        for (uint64_t c = 0; c < cols; c++)
+          h[r * cols + c] = df2_f32_to_bf16(f[c]);
+      }
+    };
+    const unsigned nt = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+    std::vector<std::thread> th;
+    for (unsigned i = 0; i < nt; i++)
+      th.emplace_back(work, rows * i / nt, rows * (i + 1) / nt);
+    for (std::thread& t : th) t.join();
     uint8_t* d = nullptr;
     DALLOC(&d, h.size() * 2);
     CK(hipMemcpy(d, h.data(), h.size() * 2, hipMemcpyHostToDevice));
@@ -126,23 +238,25 @@ static WView df2_upload(const std::vector<std::string>& names, int wq,
     *bytes += h.size() * 2;
     return w;
   }
-  const uint64_t ng = cols / 32, nq = rows * cols;
+
+  const uint64_t nq = rows * cols;
   std::vector<uint8_t> h(nq + rows * ng * 2);
   int8_t* q = (int8_t*)h.data();
   uint16_t* s = (uint16_t*)(h.data() + nq);
   auto work = [&](uint64_t r0, uint64_t r1) {
+    std::vector<float> f(cols);
     for (uint64_t r = r0; r < r1; r++) {
-      const uint16_t* src = rowp[r];
+      const Src& sr = src[r];
+      gguf::dequant_row(sr.t->type, sr.t->data + sr.row * sr.t->row_bytes(),
+                        f.data(), cols);
       for (uint64_t gi = 0; gi < ng; gi++) {
-        float v[32], amax = 0.f;
-        for (int i = 0; i < 32; i++) {
-          v[i] = hgn::bf16_to_f32(src[gi * 32 + i]);
-          amax = std::max(amax, std::fabs(v[i]));
-        }
+        float amax = 0.f;
+        for (int i = 0; i < 32; i++)
+          amax = std::max(amax, std::fabs(f[gi * 32 + i]));
         const uint16_t dh = df2_f2h(amax / 127.f);
         const float dq = df2_h2f(dh), inv = dq > 0.f ? 1.f / dq : 0.f;
         for (int i = 0; i < 32; i++) {
-          const float x = std::nearbyint(v[i] * inv);
+          const float x = std::nearbyint(f[gi * 32 + i] * inv);
           q[r * cols + gi * 32 + i] = (int8_t)std::max(-127.f, std::min(127.f, x));
         }
         s[r * ng + gi] = dh;
@@ -165,11 +279,22 @@ static WView df2_upload(const std::vector<std::string>& names, int wq,
 
 static float* df2_up_f32(const std::string& name, uint64_t want) {
   const gguf::Tensor& t = g_gguf_df2->at(name);
-  if (t.type != gguf::BF16 || t.numel() != want)
+  if (t.numel() != want ||
+      (t.type != gguf::BF16 && t.type != gguf::F32 && t.type != gguf::F16))
     throw std::runtime_error("dflash2: bad tensor " + name);
   std::vector<float> h((size_t)want);
-  const uint16_t* s = (const uint16_t*)t.data;
-  for (uint64_t i = 0; i < want; i++) h[(size_t)i] = hgn::bf16_to_f32(s[i]);
+  if (t.type == gguf::F32) {
+    memcpy(h.data(), t.data, (size_t)want * 4);
+  } else if (t.type == gguf::F16) {
+    for (uint64_t i = 0; i < want; i++) {
+      uint16_t v;
+      memcpy(&v, t.data + 2 * i, 2);
+      h[(size_t)i] = gguf::h2f(v);
+    }
+  } else {
+    const uint16_t* s = (const uint16_t*)t.data;
+    for (uint64_t i = 0; i < want; i++) h[(size_t)i] = hgn::bf16_to_f32(s[i]);
+  }
   float* d = nullptr;
   DALLOC(&d, want * 4);
   CK(hipMemcpy(d, h.data(), want * 4, hipMemcpyHostToDevice));

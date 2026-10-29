@@ -2161,13 +2161,15 @@ struct HostSampler {
 // and accept by token-id match, llama.cpp-style; only the pure-ngram
 // default stays greedy-only, see parse_gen). QWENOX_DRAFTER overrides:
 // "serial"/"0" forces serial, "ngram"/"3" pure ngram, "chain"/"4" explicit
-// chain, "mtp" the legacy MTP default.
+// chain, "dflash2"/"df2"/"2" the DFlash2 draft head (needs QWENOX_DFLASH2),
+// "mtp" the legacy MTP default.
 static int env_default_drafter() {
   const char* e = getenv("QWENOX_DRAFTER");
   if (!e) return 4;
   if (!strcmp(e, "serial") || !strcmp(e, "0")) return 0;
   if (!strcmp(e, "ngram") || !strcmp(e, "ngram-mod") || !strcmp(e, "3")) return 3;
   if (!strcmp(e, "chain") || !strcmp(e, "4")) return 4;
+  if (!strcmp(e, "dflash2") || !strcmp(e, "df2") || !strcmp(e, "2")) return 2;
   return -1;
 }
 
