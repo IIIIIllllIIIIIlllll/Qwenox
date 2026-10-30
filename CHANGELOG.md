@@ -2,6 +2,28 @@
 
 版本号记在根目录 `VERSION` 文件里，编译时写进程序。查看当前版本有三种方式：托盘菜单第一行、控制台总览页"版本"、`GET /health` 返回的 `version` 字段。引擎本身可以运行 `qwenox-engine-win.exe --version`。
 
+## v0.1.0 — 2026-10-30
+
+### 新功能
+
+- **DFlash2 独立 sidecar**：不再要求同时加载 MTP 权重；selector codebook 和草稿矩阵支持 Q8_0 / F32 / F16，BF16 sidecar 保留逐位一致的 mmap 快路径；可用 `QWENOX_DRAFTER=dflash2` 选择草稿头。
+- **QSA 检索预算可扩大到 4096 token**：`QSA_INDEXER_BUDGET=4096`，用于需要更大长上下文检索预算的场景；默认仍为 2048。
+- **Windows 支持 WebP 图片输入**：静态链接固定版本的 libwebp 解码器，不增加运行 DLL。
+- **控制台新增 Frutiger Aero 界面风格**。
+- **Windows 处理器亲和性**：`AFFINITY` 支持双 CCD 上下半区或自定义 mask，设置面板和网页控制台均可配置。
+
+### 修复
+
+- **fork cut 异常后服务永久挂起**：失败请求现在完整清理 cut / prefill 状态，避免后续 GEN 被旧状态卡住；同时修复 Windows PLE `issue()` / `wait_all()` 与 `run()` 共用 IOCP 时的竞态（#41）。
+- **Linux PLE 双 flight 并发争用**：序列化同一 io_uring ring 的提交与完成收割，避免读错行、prefill 永久挂起或进程中止（#38）。
+- **投机验证跨并发和动态 γ 的确定性**：验证与拒绝前缀重放默认使用逐行不变的计算路径，避免 greedy / fixed-seed 输出随批大小改变；`QWENOX_SPEC_ROW_INVARIANT=0` 可恢复旧快速路径。
+- 强制选择 gfx1151 APU，避免多适配器系统误选其他 GPU。
+
+### 其他
+
+- 补充不同负载下的并发解码实测与确定性开关文档。
+- 版本号 0.1.0。
+
 ## v0.0.9 — 2026-10-23
 
 ### 新功能
