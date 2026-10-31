@@ -10,8 +10,9 @@
 #   bash build_win.sh settings   # 根目录设置工具 → ./settings_win.exe（双击配置/检查，不启动服务）
 #   bash build_win.sh test       # 编 build/ktest-win.exe 并运行 kernel 单测
 #   bash build_win.sh vision-test # 纯 CPU 图片解码回归，不加载模型
+#   QWENOX_ENGINE_OUT=build/qwenox-engine-candidate.exe bash build_win.sh engine
 #   QWENOX_API_OUT=build/qwenox-webp-candidate.exe bash build_win.sh api
-#                                # 独立候选 API，不覆盖正在运行的默认 exe
+#                                # 独立候选引擎/API，不覆盖正在运行的默认 exe
 #   bash build_win.sh npu        # NPU 检测工具（仅 Windows）→ build/npucheck-win.exe
 #                                #   （GUI）+ build/npuio.exe + build/gpuload.exe；
 #                                #   XRT 头/def 与 xclbin/insts 不进仓库，默认取自
@@ -190,15 +191,16 @@ pdb_link() {  # $1 = pdb 路径；输出链接器参数（逐行）
 }
 
 build_engine() {
-    echo "[编译] build/qwenox-engine-win.exe"
+    local out="${QWENOX_ENGINE_OUT:-build/qwenox-engine-win.exe}"
+    echo "[编译] $out"
     local dbg=()
     (( PDB_ON )) && dbg=(-Xarch_host -g -Xarch_host -gcodeview)
     local pdbl=()
-    mapfile -t pdbl < <(pdb_link build/qwenox-engine-win.pdb)
+    mapfile -t pdbl < <(pdb_link "${out%.exe}.pdb")
     # 先编到临时文件再原子替换，编译失败保留上次成功的二进制（对齐 Linux build.sh）
     "$HIPCC" "${FLAGS[@]}" ${dbg[@]+"${dbg[@]}"} ${NPU_FLAGS[@]+"${NPU_FLAGS[@]}"} src/gpu/qwenox.cpp \
-      -o build/qwenox-engine-win.exe.tmp ${NPU_LINK[@]+"${NPU_LINK[@]}"} ${pdbl[@]+"${pdbl[@]}"} \
-      && mv -f build/qwenox-engine-win.exe.tmp build/qwenox-engine-win.exe
+      -o "$out.tmp" ${NPU_LINK[@]+"${NPU_LINK[@]}"} ${pdbl[@]+"${pdbl[@]}"} \
+      && mv -f "$out.tmp" "$out"
 }
 
 build_bench() {
