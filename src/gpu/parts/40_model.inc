@@ -387,6 +387,45 @@ struct GpuModel {
   void yield_point() {
     if (yield_fn) yield_fn(*this);
   }
+  // Optional round-top admission hook. [begin, end) covers both trunk and
+  // MTP logical KV writes, including provisional writes later rolled back.
+  // The callback may suspend membership while waiting, but must return with
+  // the GPU turn and the same slot bound. Throwing unwinds the loop normally.
+  struct SpecMembership {
+    GpuModel& m;
+    bool vr, dr, suspended = false;
+    SpecMembership(GpuModel& m, bool vr, bool dr) : m(m), vr(vr), dr(dr) {
+      if ((vr && (!m.vseg_round_enter_fn || !m.vseg_round_exit_fn)) ||
+          (dr && (!m.dr_round_enter_fn || !m.dr_round_exit_fn)))
+        throw std::runtime_error("spec admission: incomplete membership callbacks");
+    }
+    SpecMembership(const SpecMembership&) = delete;
+    SpecMembership& operator=(const SpecMembership&) = delete;
+    void suspend() {
+      if (suspended) return;
+      if (dr) m.dr_round_exit();
+      if (vr) m.vseg_round_exit();
+      suspended = true;
+    }
+    void resume() {
+      if (!suspended) return;
+      if (vr) m.vseg_round_enter();
+      if (dr) m.dr_round_enter();
+      suspended = false;
+    }
+    ~SpecMembership() { resume(); }
+  };
+  void (*spec_round_fn)(GpuModel&, int remaining, int64_t begin, int64_t end,
+                        SpecMembership&) = nullptr;
+  // Greedy spec_loop's caller declares its enclosing memberships explicitly.
+  // A per-call object avoids shared-model state across yield/rebind.
+  struct SpecExternalMembership { bool vr, dr; };
+  void spec_round_point(int remaining, int64_t begin, int64_t end,
+                        bool vr, bool dr) {
+    if (!spec_round_fn) return;
+    SpecMembership membership(*this, vr, dr);
+    spec_round_fn(*this, remaining, begin, end, membership);
+  }
   // 客户端断连/取消标志（serve 模式下 gen_one 指向 Conn::cancel，平时为
   // nullptr）：仅 prompt 预填期间 armed，prefill_batch 在分段间检查并抛
   // ReqCancelled。投机 verify 也走 prefill_batch，但那时该指针为空——
@@ -4378,8 +4417,15 @@ struct GpuModel {
       kv_fatal_seq("beyond maxctx", end, seq.mapped);
     const int m0 = seq.mapped;
     // pool dry: evict pinned checkpoints (LRU first) until the rows fit
-    while (!seq.reserve(kv_pool, end))
-      if (!kv_evict_one()) kv_fatal_seq("pool exhausted", end, seq.mapped);
+    try {
+      while (!seq.reserve(kv_pool, end))
+        if (!kv_evict_one()) kv_fatal_seq("pool exhausted", end, seq.mapped);
+    } catch (...) {
+      if (seq.mapped > m0)
+        CK(hipMemcpy(ptab + m0, seq.tab.data() + m0,
+                     (size_t)(seq.mapped - m0) * 4, hipMemcpyHostToDevice));
+      throw;
+    }
     CK(hipMemcpy(ptab + m0, seq.tab.data() + m0,
                  (size_t)(seq.mapped - m0) * 4, hipMemcpyHostToDevice));
     if (kv_zero_dbg)  // debug: fresh pages read as zeros, like a zeroed unpaged cache
@@ -4395,6 +4441,19 @@ struct GpuModel {
   // checkpoint shares are copied first (in practice only the partial page
   // holding `start`), then the tail is mapped. Cheap host check otherwise.
   void kv_prepare(int start, int end) { kv_prepare_seq(kv_seq, d_ptab, start, end); }
+  // The caller owns the GPU turn throughout the check and prepare. No page
+  // mutation occurs when the whole round cannot be backed immediately.
+  bool kv_prepare_nowait(int start, int end) {
+    if (start < 0 || end < start || end > maxctx) return false;
+    if (!kv_paged || start == end) return true;
+    const int last = (end + KV_PAGE - 1) / KV_PAGE;
+    int need = std::max(0, last - kv_seq.mapped);
+    for (int lp = start / KV_PAGE; lp < std::min(last, kv_seq.mapped); ++lp)
+      if (kv_pool.ref[(size_t)kv_seq.tab[(size_t)lp]] > 1) ++need;
+    if (kv_pool.nfree() < need) return false;
+    kv_prepare(start, end);
+    return true;
+  }
   void kv_prepare_seq(KvSeqTable& seq, int* ptab, int start, int end) {
     if (!kv_paged) return;
     const int lp1 = std::min(seq.mapped, (end + KV_PAGE - 1) / KV_PAGE);
@@ -9939,7 +9998,8 @@ struct GpuModel {
   // emit (optional): called with each committed token as it lands; returning
   // false aborts the loop early (serve: eos/cancel/streaming).
   std::vector<int> spec_loop(int cur, int gen, int gamma,
-                             const std::function<bool(int)>& emit = nullptr) {
+                             const std::function<bool(int)>& emit = nullptr,
+                             const SpecExternalMembership* external = nullptr) {
     last_spec_rounds = last_spec_commit = last_spec_rollbacks = 0;
     live_spec_rounds = live_spec_commits = live_spec_proposed = 0;
     std::vector<int> out;
@@ -9958,11 +10018,22 @@ struct GpuModel {
       return std::chrono::duration<double, std::milli>(b - a).count();
     };
     auto T0 = std::chrono::steady_clock::now();
-    while ((int)out.size() < gen) {
+    while ((int)out.size() < gen && pos < maxctx) {
       yield_point();  // round top: mtp_pos == pos-1, d_R == h_{pos-1}
+      if (pos < 1 || pos >= maxctx)
+        throw std::runtime_error("spec: invalid round-top context position");
+      const int remaining = gen - (int)out.size();
+      // Verify consumes cur plus g drafts and emits at most g+1 tokens.
+      // Even g=0 consumes cur and advances the MTP row at pos-1.
+      const int g_bound = std::max(0, std::min({gctl.cur, remaining - 1,
+                                                maxctx - pos - 1}));
+      if (spec_round_fn && external) {
+        spec_round_point(remaining, (int64_t)pos - 1,
+                         (int64_t)pos + g_bound + 1, external->vr, external->dr);
+      }
       int q = pos - 1;  // trunk processed through q
       if (d_iraw) vg_dump_buf("irT", 2, d_iraw, 512 * 4);  // P3-B bisect
-      int g = std::min(gctl.cur, gen - (int)out.size());
+      int g = g_bound;
       // D2-S2a row budget + D2 阶段 3 occupancy γ (round-top snapshot of the
       // rendezvous membership; may return 0 = batched AR round).
       g = occ.pick(g, vseg_active_fn ? vseg_active_fn() : 1, (int)kVSnapRows);
@@ -10107,7 +10178,6 @@ struct GpuModel {
           CK(hipMemcpyAsync(d_ring + (size_t)(p % 9) * 10240,
                             ckring + (size_t)(p % 9) * 10240, 10240 * 4,
                             hipMemcpyDeviceToDevice, g_str));
-        chist.resize(chist_sz + d + 1);
         pos = q + d + 2;
         ple_ringpos = pos % 9;
         CK(hipMemcpyAsync(d_pos, &pos, 4, hipMemcpyHostToDevice, g_str));
@@ -10118,6 +10188,8 @@ struct GpuModel {
         restore_dR_row(d, vsnap_row0_);
         cur = v[d];
       }
+      chist.resize(chist_sz);
+      chist.insert(chist.end(), vt.begin(), vt.begin() + d + 1);
       auto t4 = std::chrono::steady_clock::now();
       // Rebuild MTP KV over committed positions q+1..q+d with trunk taps
       // (d_Rb rows of the state-advancing pass) and committed tokens.
@@ -10145,8 +10217,8 @@ struct GpuModel {
       fprintf(stderr,
               "\nspec: %d tokens in %.2f s = %.1f tok/s | rounds=%d commit/round=%.2f "
               "rollbacks=%d\n",
-              (int)out.size(), sec, out.size() / sec, rounds,
-              (double)out.size() / rounds, rollbacks);
+              (int)out.size(), sec, sec > 0 ? out.size() / sec : 0.0, rounds,
+              rounds ? (double)out.size() / rounds : 0.0, rollbacks);
       fprintf(stderr, "spec depth acc:");
       for (int j = 0; j < 8 && depth_tot[j]; j++)
         fprintf(stderr, " %d:%.3f", j + 1, (double)depth_hits[j] / depth_tot[j]);
@@ -10240,6 +10312,16 @@ struct GpuModel {
     };
     while ((int)out.size() < gen && pos < maxctx) {
       yield_point();  // round top: only persistent slot state is live
+      if (spec_round_fn) {
+        const int remaining = gen - (int)out.size();
+        const int ng_bound = std::max(0, std::min({maxg, remaining - 1,
+                                                   maxctx - pos - 1}));
+        const int mtp_bound = std::max(0, std::min({gctl.cur, remaining - 1,
+                                                    maxctx - pos - 1}));
+        spec_round_point(remaining, (int64_t)pos - 1,
+                         (int64_t)pos + std::max(ng_bound, mtp_bound) + 1,
+                         vseg_round_enter_fn != nullptr, dr_on);
+      }
       if (chist.size() != (size_t)pos)
         throw std::runtime_error(
             "chain: token history and trunk position disagree");
@@ -10426,8 +10508,8 @@ struct GpuModel {
         // ---- (same machinery as spec_loop). This worker is counted by the
         // ---- loop-scope VrLoop; the rendezvous happens at the verify below.
         int q = pos - 1;
-        int g = std::min({gctl.cur, gen - (int)out.size(), maxctx - pos - 1});
-        if (g < 1) break;  // context edge: no room for even one draft
+        int g = std::max(0, std::min({gctl.cur, gen - (int)out.size() - 1,
+                                      maxctx - pos - 1}));
         // Shared row budget + occupancy γ, as spec_loop (may return 0: the
         // round still drafts one step to keep the MTP KV, verifies cur only).
         g = occ.pick(g, vseg_active_fn ? vseg_active_fn() : 1, (int)kVSnapRows);
@@ -10536,7 +10618,7 @@ struct GpuModel {
           cur = v[d];
         }
         // Committed-token history: rebuild explicitly so it is right whether
-        // or not ple_on made the verify append (spec_loop relies on ple_on).
+        // or not ple_on made the verify append.
         chist.resize(chist_sz);
         chist.insert(chist.end(), vt.begin(), vt.begin() + d + 1);
         // MTP self-repair over committed positions q+1..q+d (as spec_loop).
@@ -10613,11 +10695,20 @@ struct GpuModel {
       return std::chrono::duration<double, std::milli>(b - a).count();
     };
     auto T0 = std::chrono::steady_clock::now();
-    while ((int)out.size() < gen) {
+    while ((int)out.size() < gen && pos < maxctx) {
       yield_point();  // round top: mtp_pos == pos-1, d_R == h_{pos-1}
+      if (pos < 1 || pos >= maxctx)
+        throw std::runtime_error("spec: invalid round-top context position");
+      const int remaining = gen - (int)out.size();
+      const int g_bound = std::max(0, std::min({
+          spec_conf() > 0 ? kSpecConfMax : gctl.cur, remaining - 1,
+          maxctx - pos - 1}));
+      if (spec_round_fn) {
+        spec_round_point(remaining, (int64_t)pos - 1,
+                         (int64_t)pos + g_bound + 1, false, false);
+      }
       int q = pos - 1;
-      int g = std::min(spec_conf() > 0 ? kSpecConfMax : gctl.cur,
-                       gen - (int)out.size());
+      int g = g_bound;
       size_t chist_sz = chist.size();
       mtp_ckpt_save();
       Sampler draft_sampler = sampler.fork_stream(
@@ -10631,6 +10722,13 @@ struct GpuModel {
       const bool smg = sms_gpu_active(sampler) && sms_round_shared(sampler);
       std::vector<typename Sampler::SDist> q_sd(smg ? g : 0);
       std::vector<char> q_sparse(g, 0);
+      if (g == 0) {
+        // Maintain the causal MTP row and its ring checkpoint, but do not
+        // draw a proposal: the only draw is from the target verify row.
+        mtp_step(d_R, cur, nullptr, false);
+        CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4,
+                          hipMemcpyDeviceToDevice, g_str));
+      }
       for (int j = 0; j < g; j++) {
         bool dense = true;
         if (smg) {
@@ -10759,7 +10857,7 @@ struct GpuModel {
         depth_tot[j]++;
         if (j < a) depth_hits[j]++;
       }
-      gctl.update(g, a);
+      if (g > 0) gctl.update(g, a);
       rounds++;
       live_spec_rounds = rounds;
       live_spec_proposed += g;
@@ -10811,7 +10909,6 @@ struct GpuModel {
           CK(hipMemcpyAsync(d_ring + (size_t)(p % 9) * 10240,
                             ckring + (size_t)(p % 9) * 10240, 10240 * 4,
                             hipMemcpyDeviceToDevice, g_str));
-        chist.resize(chist_sz + d + 1);
         pos = q + d + 2;
         ple_ringpos = pos % 9;
         CK(hipMemcpyAsync(d_pos, &pos, 4, hipMemcpyHostToDevice, g_str));
@@ -10820,6 +10917,8 @@ struct GpuModel {
         restore_dR_row(d);
         cur = stopped_token >= 0 ? stopped_token : next;
       }
+      chist.resize(chist_sz);
+      chist.insert(chist.end(), vt.begin(), vt.begin() + d + 1);
       auto t4 = std::chrono::steady_clock::now();
       CK(hipMemcpyAsync(d_miraw, d_mring_ckpt, 512 * 4,
                         hipMemcpyDeviceToDevice, g_str));
@@ -10962,6 +11061,17 @@ struct GpuModel {
       rp_t = rp_top;
       yield_point();  // round top: only persistent slot state is live
       rp_lap(RP_YIELD);
+      if (spec_round_fn) {
+        const int remaining = gen - (int)out.size();
+        const int ng_bound = std::max(0, std::min({maxg, remaining - 1,
+                                                   maxctx - pos - 1}));
+        const int mtp_bound = mtp_ok ? std::max(0, std::min({
+            spec_conf() > 0 ? kSpecConfMax : gctl.cur, remaining - 1,
+            maxctx - pos - 1})) : 0;
+        spec_round_point(remaining, (int64_t)pos - (mtp_ok ? 1 : 0),
+                         (int64_t)pos + std::max(ng_bound, mtp_bound) + 1,
+                         vr_on, dr_on);
+      }
       if (chist.size() != (size_t)pos)
         throw std::runtime_error(
             "chain-sample: token history and trunk position disagree");
@@ -11231,15 +11341,15 @@ struct GpuModel {
         // ---- MTP round (ngram table missed): spec_loop_sample's round ----
         rp_lap(RP_TOP);
         int q = pos - 1;
-        int g = std::min({spec_conf() > 0 ? kSpecConfMax : gctl.cur,
-                          gen - (int)out.size(), maxctx - pos - 1});
-        if (g < 1) break;  // context edge: no room for even one draft
+        int g = std::max(0, std::min({spec_conf() > 0 ? kSpecConfMax : gctl.cur,
+                                      gen - (int)out.size() - 1,
+                                      maxctx - pos - 1}));
         // Row budget + occupancy γ. A sampled round's γ shapes its RNG draws:
         // for a client-seeded request OccGamma sees a deterministic B (nslots)
         // so the output does not depend on peers (the old live-member clamp
         // here let C7/C8 peers change it: 48/8 - 1 = 5 < adaptive γ max 7);
-        // unseeded requests use the live B. γ = 0 still drafts one step (MTP
-        // KV at q; the draft stream is forked per position) and verifies cur.
+        // unseeded requests use the live B. γ = 0 maintains the MTP row at q
+        // without drawing a proposal, and verifies cur.
         g = occ.pick(g, vr_on ? (vseg_active_fn ? vseg_active_fn() : 1) : 0,
                      (int)kVSnapRows);
         const int gd = std::max(1, g);
@@ -11312,11 +11422,17 @@ struct GpuModel {
                 tok = drafts[j];
                 return more;
               };
-          dr_done = dr_pool_fn(*this, DrSeg{bound_, gd, cur, drafts.data(), &step});
+          dr_done = dr_pool_fn(*this, DrSeg{bound_, gd, cur, drafts.data(),
+                                           g > 0 ? &step : nullptr});
           // peers ran while we waited: restore our lists for the verify below
           if (dr_done && smg) sms_round_shared(sampler);
         }
-        if (!dr_done)
+        if (!dr_done && g == 0) {
+          // Like pure MTP sampling, advance the causal row without a draw.
+          mtp_step(d_R, cur, nullptr, false);
+          CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4,
+                            hipMemcpyDeviceToDevice, g_str));
+        } else if (!dr_done)
         for (int j = 0; j < gd; j++) {
           if (smg)
             mtp_step(j ? d_mR : d_R, j ? drafts[j - 1] : cur, nullptr, false);
@@ -12259,6 +12375,25 @@ struct GpuModel {
   // Pages the slot's live sequence maps (bound slot: the members).
   int slot_pages(int s) const {
     return s == bound_ ? kv_seq.mapped : slots_[(size_t)s].kv_seq.mapped;
+  }
+  // Predict the physical pages released by trimming exactly this sequence.
+  // Each mapped occurrence owns one reference, including repeated IDs.
+  static int kv_reclaimable_pages(const KvPagePool& pool, const KvSeqTable& seq) {
+    std::vector<int> pages(seq.tab.begin(), seq.tab.begin() + seq.mapped);
+    std::sort(pages.begin(), pages.end());
+    int released = 0;
+    for (size_t i = 0; i < pages.size();) {
+      size_t j = i + 1;
+      while (j < pages.size() && pages[j] == pages[i]) ++j;
+      if ((size_t)pool.ref[(size_t)pages[i]] == j - i) ++released;
+      i = j;
+    }
+    return released;
+  }
+  // Caller holds the GPU turn; s must be a valid slot. This is a snapshot,
+  // not a reservation, and excludes any later checkpoint eviction.
+  int slot_reclaimable_pages(int s) const {
+    return kv_paged ? kv_reclaimable_pages(kv_pool, slot_kv_seq(s)) : 0;
   }
   // Drop slot s's sequence (returns its pages to the pool) while `back`
   // stays the slot the caller runs on.

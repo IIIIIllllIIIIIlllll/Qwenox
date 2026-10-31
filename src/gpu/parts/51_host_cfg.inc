@@ -209,6 +209,15 @@ static std::mutex g_pool_mtx;
 static std::vector<HBuf> g_pool;
 static size_t g_pool_bytes = 0;
 static const size_t g_pool_max = 512ull << 20;
+static HBuf buf_exact(size_t n) {
+  HBuf b;
+  b.cap = os_dio_round(n ? n : 1);
+  b.p.reset(new (std::nothrow) char[b.cap + OS_DIO_ALIGN]);
+  if (!b.p) return b;
+  b.a = (char*)(((uintptr_t)b.p.get() + OS_DIO_ALIGN - 1) & ~(uintptr_t)(OS_DIO_ALIGN - 1));
+  b.n = n;
+  return b;
+}
 static HBuf buf_get(size_t n) {
   {
     std::lock_guard<std::mutex> lk(g_pool_mtx);
@@ -245,6 +254,9 @@ static void buf_put(HBuf&& b) {
 static std::string g_dir;
 static uint64_t g_cap = 0, g_qcap = 0;
 static bool g_on = false;
+// CkHdr's reserved field identifies a private trunk checkpoint. The existing
+// mR_b body segment carries d_R even though mtp is zero.
+static constexpr int32_t REQ_PAD = 0x52514b31;
 static std::string ch_name(uint64_t k) {
   char b[32];
   snprintf(b, sizeof b, "c_%016llx.kvc", (unsigned long long)k);
@@ -319,7 +331,8 @@ static void direct_unsupported(const char* op) {
 // tmp_<name>, fdatasync, rename: a crash never publishes a torn file.
 // `p` is an HBuf's data (aligned, padded capacity).
 static bool write_file(const std::string& name, const char* p, size_t n) {
-  const std::string tmp = path_of("tmp_" + name);
+  const std::filesystem::path rel(name);
+  const std::string tmp = path_of((rel.parent_path() / ("tmp_" + rel.filename().string())).string());
   bool ok = false, done = false;
   if (g_direct.load()) {
     const int rc = os_write_direct(tmp.c_str(), p, n);
@@ -381,10 +394,15 @@ struct CkEnt {
   uint64_t seed = 0, base = 0, id = 0, bytes = 0;
   int n = 0, nc = 0, nl = 0;
   bool mtp = false, pub = false;
+  bool failed = false, delete_file = false, require_mtp = false;
+  bool required = false;              // private, never a prefix-cache match
+  std::string req_prefix;             // unique session/snapshot file namespace
+  std::vector<int> req_pages;         // private page writer states, under g_mtx
+  CkHdr hdr{};                         // restore geometry, including loaded checkpoints
   std::vector<uint64_t> chunks, mtps;  // mtps[i] == 0: not referenced
   std::vector<int> tail;               // tokens [256*nc, n)
   int64_t t = 0;                       // LRU time (file_time clock)
-  int busy = 0;                        // restores in progress: not evictable
+  int busy = 0;                        // restores and explicit pins: not evictable
   int hits = 0;                        // successful restores (kvsnap_hits.txt)
   bool hot = false;                    // hot segment (two-segment eviction)
 };
@@ -392,7 +410,12 @@ static std::mutex g_mtx;
 static std::condition_variable g_cv;
 static std::unordered_map<uint64_t, Blk> g_ch, g_mt;
 static std::vector<std::shared_ptr<CkEnt>> g_ck;
-static uint64_t g_total = 0;  // bytes of published files
+static uint64_t g_total = 0;  // ordinary published cache files
+static std::string req_page_name(const CkEnt& e, int i, bool mtp = false) {
+  char b[24];
+  snprintf(b, sizeof b, "_%08x.%s", (unsigned)i, mtp ? "kvm" : "kvc");
+  return e.req_prefix + b;
+}
 
 // ---- janitor: file deletes and LRU mtime bumps, off the lock ------------------
 // Each is a round trip on a share (2-8 ms), and evicting one checkpoint can
@@ -427,6 +450,11 @@ static void hits_dirty_locked() {
 }
 // The index holds this name (published or pending): its file is wanted.
 static bool live_locked(const std::string& n) {
+  for (const auto& e : g_ck) {
+    if (!e->required || n.compare(0, e->req_prefix.size(), e->req_prefix)) continue;
+    if (n == e->name || (n.size() > e->req_prefix.size() &&
+                         n[e->req_prefix.size()] == '_')) return true;
+  }
   if (n.size() == 22 && n[1] == '_' && (n[0] == 'c' || n[0] == 'm')) {
     const uint64_t k = strtoull(n.substr(2, 16).c_str(), nullptr, 16);
     return (n[0] == 'c' ? g_ch : g_mt).count(k) > 0;
@@ -441,20 +469,33 @@ static void unref_locked(std::unordered_map<uint64_t, Blk>& mp, uint64_t key, bo
   auto it = mp.find(key);
   if (it == mp.end() || --it->second.refs > 0) return;
   if (it->second.st == ST_PEND) return;  // the writer deletes it on publish
-  if (it->second.st == ST_PUB) {
-    del_locked(mtp ? mt_name(key) : ch_name(key));
-    g_total -= it->second.bytes;
-  }
+  // A failed rewrite can leave an older file at this content-addressed name.
+  del_locked(mtp ? mt_name(key) : ch_name(key));
+  if (it->second.bytes) g_total -= it->second.bytes;  // published, then marked bad
   mp.erase(it);
 }
+// Invalid entries remain indexed, with their files and references intact, while
+// any restore or explicit pin is using them. New matches must not select them.
 static void drop_ck_locked(std::shared_ptr<CkEnt> e, bool del_file) {
   auto it = std::find(g_ck.begin(), g_ck.end(), e);
   if (it == g_ck.end()) return;
+  e->failed = true;
+  e->delete_file = e->delete_file || del_file;
+  g_cv.notify_all();
+  if (e->busy) return;
   g_ck.erase(it);
-  if (e->pub) {
-    g_total -= e->bytes;
-    if (del_file) del_locked(e->name);
+  if (e->required) {
+    // Writers already holding an item also schedule a delete after they finish.
+    del_locked(e->name);
+    for (int i = 0; i < e->nc; i++) {
+      del_locked(req_page_name(*e, i));
+      if (e->mtp) del_locked(req_page_name(*e, i, true));
+    }
+    return;
   }
+  if (e->pub) g_total -= e->bytes;
+  // A pending replacement can still have the previous file at this name.
+  if (e->delete_file) del_locked(e->name);
   // its line must leave kvsnap_hits.txt: the name may be saved again later
   if (e->hits > 0) hits_dirty_locked();
   for (uint64_t k : e->chunks) unref_locked(g_ch, k, false);
@@ -506,6 +547,10 @@ static void evict_locked(const CkEnt* keep) {
     drop_ck_locked(v, true);
   }
 }
+static void unbusy_locked(const std::shared_ptr<CkEnt>& e) {
+  if (--e->busy == 0 && e->failed) drop_ck_locked(e, false);
+}
+
 static void touch_locked(const std::shared_ptr<CkEnt>& e) {
   e->t = now_t();
   g_jq.push_back({e->name, J_TOUCH});  // the file mtime carries it across restarts
@@ -614,17 +659,52 @@ static void janitor() {
 }
 
 // ---- background writers ------------------------------------------------------
-// g_writers detached threads take captured images in FIFO order: a commit
-// enqueues its pages, then its MTP sections, then its checkpoints. Pages are
-// written in parallel; a writer taking a checkpoint first waits until no page
-// it names is still pending (those were taken earlier, so they are being
-// written), then requires them all published: a checkpoint never names a
-// page that is not on disk.
+// Dependency state under g_mtx. Ordinary checkpoints may lose speculation on
+// an MTP failure, as before, but must not publish while an MTP write is pending.
+// Required checkpoints need every MTP section as well as every trunk page.
+static int deps_locked(const CkEnt& e, bool strict) {
+  if (e.failed || (strict && (e.chunks.size() != (size_t)e.nc ||
+                             e.mtps.size() != (size_t)e.nc))) return ST_FAIL;
+  if (e.required) {
+    if (e.req_pages.size() != (size_t)e.nc * (e.mtp ? 2 : 1)) return ST_FAIL;
+    int st = ST_PUB;
+    for (int page : e.req_pages) {
+      if (page == ST_FAIL) return ST_FAIL;
+      if (page != ST_PUB) st = ST_PEND;
+    }
+    return st;
+  }
+  int st = ST_PUB;
+  for (uint64_t k : e.chunks) {
+    auto f = g_ch.find(k);
+    if (f == g_ch.end() || f->second.st == ST_FAIL) return ST_FAIL;
+    if (f->second.st == ST_PEND) st = ST_PEND;
+  }
+  for (uint64_t k : e.mtps) {
+    if (!k) {
+      if (strict && e.mtp) return ST_FAIL;
+      continue;
+    }
+    auto f = g_mt.find(k);
+    if (f == g_mt.end() || f->second.st == ST_FAIL) {
+      if (strict && e.mtp) return ST_FAIL;
+    } else if (f->second.st == ST_PEND) {
+      st = ST_PEND;
+    }
+  }
+  return st;
+}
+
+// Writers never occupy a worker waiting for a checkpoint's dependencies: a
+// dependency can have been registered by another commit but not enqueued yet.
+// Select a ready item instead, even if it is behind that checkpoint.
 struct Item {
   int kind = 0;  // 0 trunk page, 1 MTP section, 2 checkpoint
   uint64_t key = 0;
   HBuf buf;
   std::shared_ptr<CkEnt> ck;
+  int req_page = -1;       // private page index; ck also owns its lifetime
+  uint64_t charge = 0;     // zero: ordinary logical length
   double cap_s = 0;
   int new_ch = 0, new_mt = 0;
   uint64_t new_b = 0;
@@ -632,66 +712,73 @@ struct Item {
 static std::deque<Item> g_q;
 static uint64_t g_q_bytes = 0;  // queued + being written
 static int g_wbusy = 0;         // writers holding an item
+static uint64_t item_charge(const Item& it) { return it.charge ? it.charge : it.buf.n; }
 // Wall time of page/MTP-section writes since the last checkpoint log: from
 // the first write start to the last write end (writers overlap).
 static bool g_pw_on = false;
 static std::chrono::steady_clock::time_point g_pw_t0, g_pw_t1;
+static bool runnable_locked(const Item& it) {
+  return it.kind != 2 || deps_locked(*it.ck, it.ck->require_mtp) != ST_PEND;
+}
 
 static void writer() {
   for (;;) {
     Item it;
+    bool go = true;
     {
       std::unique_lock<std::mutex> lk(g_mtx);
-      g_cv.wait(lk, [] { return !g_q.empty(); });
-      it = std::move(g_q.front());
-      g_q.pop_front();
+      g_cv.wait(lk, [] {
+        return std::find_if(g_q.begin(), g_q.end(), runnable_locked) != g_q.end();
+      });
+      auto pos = std::find_if(g_q.begin(), g_q.end(), runnable_locked);
+      it = std::move(*pos);
+      g_q.erase(pos);
       g_wbusy++;
+      if (it.kind == 2) go = deps_locked(*it.ck, it.ck->require_mtp) == ST_PUB;
+      else if (it.ck && it.ck->required) go = !it.ck->failed;
     }
     const size_t len = it.buf.n;
+    const uint64_t charge = item_charge(it);
     char* p = it.buf.data();
-    std::string name;
-    bool go = true;
-    if (it.kind == 2) {
-      std::unique_lock<std::mutex> lk(g_mtx);
-      g_cv.wait_for(lk, std::chrono::seconds(60), [&] {
-        for (uint64_t k : it.ck->chunks) {
-          auto f = g_ch.find(k);
-          if (f != g_ch.end() && f->second.st == ST_PEND) return false;
-        }
-        return true;
-      });
-      for (uint64_t k : it.ck->chunks) {
-        auto f = g_ch.find(k);
-        if (f == g_ch.end() || f->second.st != ST_PUB) go = false;
-      }
-      name = it.ck->name;
-    } else {
-      name = it.kind ? mt_name(it.key) : ch_name(it.key);
-    }
+    const bool req = it.ck && it.ck->required;
+    std::string name = it.kind == 2 ? it.ck->name : req ? req_page_name(*it.ck, it.req_page % it.ck->nc, it.kind == 1) :
+                       it.kind ? mt_name(it.key) : ch_name(it.key);
     {  // an earlier copy of this name is being deleted: publish after it
       std::unique_lock<std::mutex> lk(g_mtx);
       g_cv.wait(lk, [&] { return g_jcur != name; });
+      if (req && it.ck->failed) go = false;
     }
     const size_t hb = it.kind == 2 ? sizeof(CkHdr) : sizeof(ChHdr);
-    const uint64_t sum = sum64(p + hb, len - hb);
-    memcpy(p + (it.kind == 2 ? offsetof(CkHdr, sum) : offsetof(ChHdr, sum)), &sum, 8);
+    if (go) {
+      const uint64_t sum = sum64(p + hb, len - hb);
+      memcpy(p + (it.kind == 2 ? offsetof(CkHdr, sum) : offsetof(ChHdr, sum)), &sum, 8);
+    }
     const auto w0 = std::chrono::steady_clock::now();
-    if (it.kind < 2) {
+    if (it.kind < 2 && !req) {
       std::lock_guard<std::mutex> lk(g_mtx);
       if (!g_pw_on) g_pw_on = true, g_pw_t0 = w0;
     }
-    const bool ok = go && write_file(name, p, len);
+    bool ok = go && write_file(name, p, len);
     const auto w1 = std::chrono::steady_clock::now();
     const double ws = std::chrono::duration<double>(w1 - w0).count();
+    // Keep the charge until the private allocation really has been freed.
+    if (req) it.buf = HBuf{};
     {
       std::lock_guard<std::mutex> lk(g_mtx);
-      g_q_bytes -= len;
-      if (it.kind < 2) {
+      g_q_bytes -= charge;
+      if (req && it.kind < 2) {
+        if (it.ck->failed) {
+          del_locked(name);  // including a write which raced cancellation
+        } else {
+          it.ck->req_pages[(size_t)it.req_page] = ok ? ST_PUB : ST_FAIL;
+          if (!ok) logf_locked("kvsnap: required page write failed: %s\n", name.c_str());
+        }
+      } else if (it.kind < 2) {
         if (w1 > g_pw_t1) g_pw_t1 = w1;
         auto& mp = it.kind ? g_mt : g_ch;
         auto f = mp.find(it.key);
         if (f == mp.end() || f->second.refs == 0) {
-          if (ok) del_locked(name);  // every referencing checkpoint is gone
+          del_locked(name);  // no references; remove this or any older copy
           if (f != mp.end()) mp.erase(f);
         } else if (ok) {
           f->second.st = ST_PUB;
@@ -703,24 +790,23 @@ static void writer() {
         }
       } else {
         const auto& e = it.ck;
+        // A concurrent restore can invalidate a dependency during the write.
+        if (deps_locked(*e, e->require_mtp) != ST_PUB) ok = false;
         if (!ok) {
           logf_locked("kvsnap: save of %d tokens failed (%s, non-fatal)\n", e->n,
-                      go ? "write error" : "a page write failed");
-          drop_ck_locked(e, false);
+                      go ? "write error or invalid dependency" : "a dependency failed");
+          drop_ck_locked(e, true);
+          if (req) del_locked(name);  // the entry may already have been removed
+        } else if (req) {
+          e->pub = true;
+          e->bytes = len;
+          e->t = now_t();
         } else {
-          // same state saved before without MTP state: this file replaced it
-          // (it inherits the restore count and segment)
-          for (auto& o : g_ck)
-            if (o != e && o->name == e->name) {
-              e->hits = o->hits;
-              e->hot = o->hot;
-              drop_ck_locked(o, false);
-              break;
-            }
           e->pub = true;
           e->bytes = len;
           e->t = now_t();
           g_total += len;
+          if (e->hits > 0) hits_dirty_locked();
           // "pages write": wall time of the page files written since the last
           // checkpoint log (this commit's new pages, unless commits overlap)
           const double pw =
@@ -748,8 +834,15 @@ static void writer() {
 static double enqueue(Item&& it) {
   const auto t0 = std::chrono::steady_clock::now();
   std::unique_lock<std::mutex> lk(g_mtx);
-  // bounded: the GPU thread waits for the disk rather than hoard host memory
-  g_cv.wait(lk, [&] { return g_q_bytes == 0 || g_q_bytes + it.buf.n <= g_qcap; });
+  // Bounded except for one dependency needed to unblock a queue containing
+  // only checkpoints. Otherwise a producer could wait for space held by a
+  // checkpoint whose page it has not been able to enqueue yet.
+  g_cv.wait(lk, [&] {
+    const bool fits = g_q_bytes <= g_qcap && it.buf.n <= g_qcap - g_q_bytes;
+    return fits || g_q_bytes == 0 ||
+           (it.kind < 2 && !g_wbusy &&
+            std::find_if(g_q.begin(), g_q.end(), runnable_locked) == g_q.end());
+  });
   g_q_bytes += it.buf.n;
   g_q.push_back(std::move(it));
   lk.unlock();
@@ -779,10 +872,11 @@ struct Turn {
 static std::string sync_line() {
   std::unique_lock<std::mutex> lk(g_mtx);
   g_cv.wait(lk, [] {
-    return g_q.empty() && !g_wbusy && !g_turns && g_jq.empty() && !g_jbusy;
+    return g_q.empty() && !g_wbusy && !g_q_bytes && !g_turns &&
+           g_jq.empty() && !g_jbusy;
   });
   size_t nck = 0;
-  for (auto& e : g_ck) nck += e->pub;
+  for (auto& e : g_ck) nck += e->pub && !e->required;
   char b[128];
   snprintf(b, sizeof b, "K %zu %zu %zu %llu\n", nck, g_ch.size(), g_mt.size(),
            (unsigned long long)g_total);
@@ -796,6 +890,12 @@ struct Pending {
   std::shared_ptr<CkEnt> ck;
   HBuf buf;  // checkpoint file image (the writer fills in the checksum)
   double cap_s = 0;
+};
+
+struct ExactCapture {
+  uint64_t seed;
+  int ringpos;
+  std::string prefix;
 };
 
 // GPU-owner thread. Without `rc`: `toks` must be exactly the live state
@@ -814,7 +914,8 @@ struct Pending {
 // re-pools that block from the raw ring and re-ingests MTP row n-1 at the
 // continuation boundary.
 static void capture_impl(GpuModel& m, const std::vector<int>& toks, bool mtp,
-                         const rckpt::Ck* rc, std::vector<Pending>& out) {
+                         const rckpt::Ck* rc, std::vector<Pending>& out,
+                         const ExactCapture* exact = nullptr) {
   if (!g_on) return;
   crashdiag::note("kvsnap capture %zu tokens (mtp %d, from rckpt %d)", toks.size(), (int)mtp,
                   (int)(rc != nullptr));
@@ -839,7 +940,7 @@ static void capture_impl(GpuModel& m, const std::vector<int>& toks, bool mtp,
   }
   const int nc = (n - 1) / KV_PAGE, nt = n - nc * KV_PAGE;
   auto e = std::make_shared<CkEnt>();
-  e->seed = seed_of(m, toks.data(), (size_t)n);
+  e->seed = exact ? exact->seed : seed_of(m, toks.data(), (size_t)n);
   std::vector<uint64_t> ch = chain(e->seed, toks.data(), nc);
   e->base = ch[(size_t)nc];
   e->id = ck_id(e->seed, toks.data(), (size_t)n);
@@ -853,7 +954,15 @@ static void capture_impl(GpuModel& m, const std::vector<int>& toks, bool mtp,
     for (int i = 0; i < nc; i++)
       e->mtps[(size_t)i] = mtp_key(ch[(size_t)i + 1], toks[(size_t)(i + 1) * KV_PAGE]);
   e->tail.assign(toks.begin() + (size_t)nc * KV_PAGE, toks.end());
-  e->name = ck_name(n, e->id);
+  if (exact) {
+    e->required = true;
+    e->req_prefix = exact->prefix;
+    e->name = e->req_prefix + ".kck";
+    e->require_mtp = mtp;
+    e->req_pages.assign((size_t)nc * (mtp ? 2 : 1), ST_PEND);
+  } else {
+    e->name = ck_name(n, e->id);
+  }
   CkHdr h{};
   memcpy(h.magic, MAG_K, 8);
   h.seed = e->seed;
@@ -863,7 +972,7 @@ static void capture_impl(GpuModel& m, const std::vector<int>& toks, bool mtp,
   h.nc = nc;
   h.nl = e->nl;
   h.kvb = G.kvb;
-  h.ringpos = rc ? rc->ringpos : m.ple_ringpos;
+  h.ringpos = exact ? exact->ringpos : rc ? rc->ringpos : m.ple_ringpos;
   h.mtp = mtp;
   h.mtp_pos = mtp ? (rc ? rc->mtp_pos : m.mtp_pos) : 0;
   h.nik = tail_ik(m, n, nc);
@@ -872,10 +981,12 @@ static void capture_impl(GpuModel& m, const std::vector<int>& toks, bool mtp,
   h.conv_b = G.conv_b;
   h.ring_b = G.ring_b;
   h.iraw_b = G.iraw_b;
-  h.mR_b = mtp ? (uint64_t)g_cfg.branches * g_cfg.d * 4 : 0;
+  h.mR_b = (mtp || exact) ? (uint64_t)g_cfg.branches * g_cfg.d * 4 : 0;
   h.miraw_b = mtp && m.d_miraw ? 4 * 128 * 4 : 0;
+  h.pad = exact ? REQ_PAD : 0;
+  e->hdr = h;
   const size_t len = sizeof h + ck_body_b(h);
-  HBuf b = buf_get(len);
+  HBuf b = exact ? buf_exact(len) : buf_get(len);
   if (!b.p) return;
   char* p = b.data();
   memcpy(p, &h, sizeof h);
@@ -886,7 +997,16 @@ static void capture_impl(GpuModel& m, const std::vector<int>& toks, bool mtp,
   p += (size_t)nc * 8;
   memcpy(p, e->tail.data(), (size_t)nt * 4);
   p += (size_t)nt * 4;
-  CK(hipStreamSynchronize(g_str));  // also completes rckpt's async D2H into rc
+  // Also completes rckpt's async D2H into rc. Preserve the ordinary fatal-HIP
+  // policy, but let a required capture report a synchronization failure.
+  if (exact) {
+    if (hipStreamSynchronize(g_str) != hipSuccess) {
+      fprintf(stderr, "kvsnap: required capture stream synchronization failed\n");
+      return;
+    }
+  } else {
+    CK(hipStreamSynchronize(g_str));
+  }
   bool ok = true;
   // device state (rc == nullptr) or its RAM checkpoint copy
   auto blob = [&](const void* d, const void* host, size_t sz) {
@@ -946,10 +1066,12 @@ static void capture_ram(GpuModel& m, const std::vector<int>& hist, size_t n,
 
 // One page's (or MTP section's) file image, read from the live sequence.
 static bool page_image(GpuModel& m, const Geo& G, bool mtp, int i, uint64_t key,
-                       uint64_t parent, int look, const int* toks, HBuf& b) {
+                       uint64_t parent, int look, const int* toks, HBuf& b,
+                       bool exact = false) {
   const int l0 = mtp ? G.nqsa : 0, nl = mtp ? 1 : G.nqsa;
   const size_t lb = page_layer_b(G.kvb, G.has_ik);
-  b = buf_get(sizeof(ChHdr) + (size_t)nl * lb);
+  const size_t len = sizeof(ChHdr) + (size_t)nl * lb;
+  b = exact ? buf_exact(len) : buf_get(len);
   if (!b.p) return false;
   ChHdr h{};
   memcpy(h.magic, mtp ? MAG_M : MAG_C, 8);
@@ -973,6 +1095,16 @@ static bool page_image(GpuModel& m, const Geo& G, bool mtp, int i, uint64_t key,
   return ok;
 }
 
+static bool same_identity(const CkEnt& a, const CkEnt& b) {
+  return a.seed == b.seed && a.base == b.base && a.id == b.id && a.n == b.n &&
+         a.nc == b.nc && a.chunks == b.chunks && a.tail == b.tail;
+}
+static bool same_header_shape(const CkHdr& x, const CkHdr& y) {
+  return x.nl == y.nl && x.kvb == y.kvb && x.ringpos == y.ringpos && x.mtp == y.mtp &&
+         x.mtp_pos == y.mtp_pos && x.nik == y.nik && x.has_ik == y.has_ik && x.pad == y.pad &&
+         x.s_b == y.s_b && x.conv_b == y.conv_b && x.ring_b == y.ring_b &&
+         x.iraw_b == y.iraw_b && x.mR_b == y.mR_b && x.miraw_b == y.miraw_b;
+}
 // End of turn (GPU-owner thread, `hist` == the live state): register the
 // pending checkpoints, capture the pages/MTP sections none of the cached
 // files hold yet, and hand everything to the writer. Every pending state is
@@ -1015,17 +1147,22 @@ static void commit_seed(GpuModel& m, const std::vector<int>& hist,
     std::lock_guard<std::mutex> lk(g_mtx);
     for (size_t pi = 0; pi < pend.size(); pi++) {
       auto& e = pend[pi].ck;
-      if (e->seed != seed || e->nc > np || ch[(size_t)e->nc] != e->base ||
+      if (e->seed != seed || e->n <= 0 || (size_t)e->n > hist.size() ||
+          e->nc < 0 || e->nc > np || ch[(size_t)e->nc] != e->base ||
           !std::equal(e->tail.begin(), e->tail.end(),
                       hist.begin() + (size_t)e->nc * KV_PAGE))
         continue;  // not a prefix of the final state (should not happen)
       std::shared_ptr<CkEnt> old;
       for (auto& o : g_ck)
-        if (o->name == e->name) old = o;
-      if (old && (old->mtp || !e->mtp)) {  // already cached (or queued)
+        if (o->name == e->name) { old = o; break; }
+      if (old && !same_identity(*old, *e)) continue;  // name collision
+      if (old && !old->failed && (old->mtp || !e->mtp)) {
         if (old->pub) touch_locked(old);
         continue;
       }
+      // Never replace a pending writer, an entry held by a restore/pin, or a
+      // richer MTP entry with a non-MTP one.
+      if (old && (!old->pub || old->busy || (old->mtp && !e->mtp))) continue;
       bool bad = false;  // a failed page write whose references linger
       for (uint64_t k : e->chunks) {
         auto f = g_ch.find(k);
@@ -1043,11 +1180,22 @@ static void commit_seed(GpuModel& m, const std::vector<int>& hist,
         auto f = g_mt.find(k);
         if (f != g_mt.end() && f->second.st == ST_FAIL) {
           k = 0;  // restores then find the section missing: no MTP state
+          // capture already serialized this key; the writer checksums the image later.
+          memcpy(pend[pi].buf.data() + sizeof(CkHdr) +
+                     ((size_t)e->nc + (size_t)i) * sizeof(k),
+                 &k, sizeof(k));
           continue;
         }
         auto r = g_mt.try_emplace(k);
         r.first->second.refs++;
         if (r.second) need_mt[(size_t)i] = 1, owner_mt[(size_t)i] = (int)pi;
+      }
+      if (old) {
+        // Claim new references before dropping the old entry, then hide its
+        // name from match() until the replacement has actually published.
+        e->hits = old->hits;
+        e->hot = old->hot;
+        drop_ck_locked(old, true);
       }
       g_ck.push_back(e);  // pending (pub = false): dedupes the next commit
       keep.push_back(pi);
@@ -1056,9 +1204,18 @@ static void commit_seed(GpuModel& m, const std::vector<int>& hist,
   std::vector<int> nch(pend.size(), 0), nmt(pend.size(), 0);
   std::vector<uint64_t> nb(pend.size(), 0);
   auto fail_blk = [&](std::unordered_map<uint64_t, Blk>& mp, uint64_t k) {
-    std::lock_guard<std::mutex> lk(g_mtx);
-    auto f = mp.find(k);
-    if (f != mp.end()) f->second.st = ST_FAIL;
+    {
+      std::lock_guard<std::mutex> lk(g_mtx);
+      auto f = mp.find(k);
+      if (f != mp.end()) {
+        if (f->second.refs) f->second.st = ST_FAIL;
+        else {
+          del_locked(&mp == &g_mt ? mt_name(k) : ch_name(k));
+          mp.erase(f);
+        }
+      }
+    }
+    g_cv.notify_all();
   };
   CK(hipStreamSynchronize(g_str));
   for (int pass = 0; pass < 2; pass++)
@@ -1144,9 +1301,16 @@ static void note_prefill(size_t n, double ms) {
 }
 // Drop a match() that is not restored (its busy mark).
 static void release(const std::shared_ptr<CkEnt>& e) {
-  std::lock_guard<std::mutex> lk(g_mtx);
-  e->busy--;
+  {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    unbusy_locked(e);
+  }
+  g_cv.notify_all();
 }
+struct RestoreBusy {
+  std::shared_ptr<CkEnt> e;
+  ~RestoreBusy() { if (e) release(e); }
+};
 // Restore `e` rather than a RAM checkpoint of `ram_n` tokens? A RAM
 // checkpoint that carries the MTP state wins over one here that does not
 // (the turn would decode without speculation).
@@ -1180,23 +1344,27 @@ static bool prefer_over_ram(const CkEnt& e, size_t ram_n, bool ram_mtp, long lon
 // ---- restore -----------------------------------------------------------------
 // Longest published checkpoint whose tokens are a strict prefix of `prompt`
 // (strictly shorter: a full-length match has no logits to resume from).
+// `exact` is reserved for same-request suspension, whose pending `cur` and
+// sampler remain on the caller stack and therefore need no fresh logits.
 // `seed2` (optional): a second seed to search, e.g. g_fp for the text
 // prefix of a vision prompt. The returned entry is marked busy until
 // restore() releases it.
 static std::shared_ptr<CkEnt> match(const std::vector<int>& prompt, uint64_t seed,
-                                    uint64_t seed2 = 0) {
+                                    uint64_t seed2 = 0, bool exact = false) {
   if (!g_on || prompt.size() < 2) return nullptr;
   if (seed2 == seed) seed2 = 0;
-  const int np = (int)((prompt.size() - 1) / KV_PAGE);
+  const int np = (int)(exact ? prompt.size() / KV_PAGE
+                             : (prompt.size() - 1) / KV_PAGE);
   const std::vector<uint64_t> ch = chain(seed, prompt.data(), np);
   const std::vector<uint64_t> ch2 =
       seed2 ? chain(seed2, prompt.data(), np) : std::vector<uint64_t>();
   std::lock_guard<std::mutex> lk(g_mtx);
   std::shared_ptr<CkEnt> best;
   for (auto& e : g_ck) {
-    if (!e->pub || (e->seed != seed && (!seed2 || e->seed != seed2))) continue;
+    if (e->required || !e->pub || e->failed ||
+        (e->seed != seed && (!seed2 || e->seed != seed2))) continue;
     const std::vector<uint64_t>& c = e->seed == seed ? ch : ch2;
-    if ((size_t)e->n >= prompt.size() ||
+    if ((exact ? (size_t)e->n != prompt.size() : (size_t)e->n >= prompt.size()) ||
         (best && e->n <= best->n) || e->nc > np || c[(size_t)e->nc] != e->base ||
         !std::equal(e->tail.begin(), e->tail.end(),
                     prompt.begin() + (size_t)e->nc * KV_PAGE))
@@ -1260,7 +1428,8 @@ enum { RS_OK, RS_CKPT, RS_PAGE, RS_OTHER };
 // Pages stream in on a prefetch thread (read + checksum) while the previous
 // one is copied to the device. *bad_page: the trunk page that failed.
 static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& prompt,
-                        bool* mtp_out, uint64_t* bad_page, int* npages, RsTime& tm) {
+                        bool* mtp_out, uint64_t* bad_page, uint64_t* bad_mtp,
+                        int* npages, RsTime& tm) {
   const Geo G = geo(m);
   HBuf cb;
   const auto tc = std::chrono::steady_clock::now();
@@ -1273,7 +1442,7 @@ static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& pro
   if (cb.n < sizeof h) return RS_CKPT;
   memcpy(&h, cb.data(), sizeof h);
   if (!ck_sane(h) || cb.n != sizeof h + ck_body_b(h) || h.id != e.id || h.n != e.n ||
-      h.seed != e.seed || h.base != e.base ||
+      h.seed != e.seed || h.base != e.base || !same_header_shape(h, e.hdr) ||
       h.sum != sum64(cb.data() + sizeof h, cb.n - sizeof h))
     return RS_CKPT;
   tm.ck_s = secs_since(tc);
@@ -1283,10 +1452,26 @@ static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& pro
       h.conv_b != G.conv_b || h.ring_b != G.ring_b || h.iraw_b != G.iraw_b ||
       h.nl < G.nqsa || h.nl > G.nqsa + 1 || (h.nl > G.nqsa && !h.mtp))
     return RS_OTHER;
+  if (e.required && (h.pad != REQ_PAD || (bool)h.mtp != e.mtp ||
+                     h.nl != G.nqsa + (e.mtp ? 1 : 0) ||
+                     h.miraw_b != (e.mtp ? 4 * 128 * 4u : 0u) ||
+                     (e.mtp && (m.kv_nl <= G.nqsa || !m.d_miraw || !m.d_mpos ||
+                                h.mtp_pos != n - 1)) ||
+                     h.mR_b != (uint64_t)g_cfg.branches * g_cfg.d * 4 || !m.d_R ||
+                     h.ringpos < 0 || h.ringpos >= 9 || h.nik != tail_ik(m, n, nc) ||
+                     m.mrope_active_ || m.rope_delta_ || !m.mrope_pos_.empty() ||
+                     !m.img_inj.empty())) return RS_OTHER;
   const char* p = cb.data() + sizeof h;
   std::vector<uint64_t> chunks((size_t)nc), mtps((size_t)nc);
   memcpy(chunks.data(), p, (size_t)nc * 8);
   memcpy(mtps.data(), p + (size_t)nc * 8, (size_t)nc * 8);
+  // Only indexed keys are protected by the checkpoint's busy reference.
+  // Startup may have zeroed missing MTP keys without rewriting the file.
+  if (chunks != e.chunks || mtps.size() != e.mtps.size()) return RS_CKPT;
+  for (size_t i = 0; i < mtps.size(); i++) {
+    if ((e.required || e.mtps[i]) && mtps[i] != e.mtps[i]) return RS_CKPT;
+    mtps[i] = e.mtps[i];
+  }
   p += (size_t)nc * 16;
   if (memcmp(p, prompt.data() + (size_t)nc * KV_PAGE, (size_t)nt * 4)) return RS_CKPT;
   p += (size_t)nt * 4;
@@ -1294,7 +1479,8 @@ static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& pro
                   h.mtp_pos == n - 1 &&
                   h.mR_b == (uint64_t)g_cfg.branches * g_cfg.d * 4 &&
                   h.miraw_b == (m.d_miraw ? 4 * 128 * 4u : 0u);
-  if (want_mtp) {
+  if (e.required && e.mtp && !want_mtp) return RS_OTHER;
+  if (want_mtp && !e.required) {
     std::lock_guard<std::mutex> lk(g_mtx);
     for (uint64_t k : mtps) {
       auto f = g_mt.find(k);
@@ -1311,6 +1497,7 @@ static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& pro
     const int i = mt ? j - nc : j;
     const int* toks = prompt.data() + (size_t)i * KV_PAGE;
     return std::async(std::launch::async, read_page,
+                      e.required ? req_page_name(e, i, mt) :
                       mt ? mt_name(mtps[(size_t)i]) : ch_name(chunks[(size_t)i]), mt,
                       mt ? mtps[(size_t)i] : chunks[(size_t)i],
                       mt ? chunks[(size_t)i] : ch[(size_t)i], mt ? 1 : G.nqsa, G.kvb,
@@ -1349,6 +1536,8 @@ static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& pro
         *bad_page = chunks[(size_t)i];
         return RS_PAGE;
       }
+      if (e.required) return RS_PAGE;
+      *bad_mtp = mtps[(size_t)i];
       want_mtp = false;  // the trunk is complete; only speculation is lost
       break;             // (win was drained above)
     }
@@ -1388,7 +1577,7 @@ static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& pro
   blob(m.d_convst, h.conv_b, true);
   blob(m.d_ring, h.ring_b, true);
   blob(m.d_iraw, h.iraw_b, true);
-  blob(m.d_R, h.mR_b, want_mtp);
+  blob(m.d_R, h.mR_b, want_mtp || e.required);
   blob(m.d_miraw, h.miraw_b, want_mtp);
   const int r0 = nc * KV_PAGE, k0 = nc * KV_PAGE_BLOCKS;
   const int nik = std::min(
@@ -1406,7 +1595,11 @@ static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& pro
   if (!ok) return RS_OTHER;
   if (want_mtp) {
     m.mtp_pos = h.mtp_pos;
-    CK(hipMemcpy(m.d_mpos, &m.mtp_pos, 4, hipMemcpyHostToDevice));
+    if (e.required) {
+      if (!h2d(m.d_mpos, &m.mtp_pos, 4)) return RS_OTHER;
+    } else {
+      CK(hipMemcpy(m.d_mpos, &m.mtp_pos, 4, hipMemcpyHostToDevice));
+    }
   }
   // QWENOX_QSA_WMMA_BTV: the transposed prefill V cache is derived state (not
   // saved); rebuild it for [0, n) from the restored row-major V, or sparse
@@ -1422,8 +1615,13 @@ static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& pro
         k_bf16_rows_to_bt<<<grid, 256, 0, g_str>>>(
             m.d_vcb + (size_t)qi * m.kv_layer_rows * 512, m.vct_layer(qi), pr, pr + cnt);
       });
-    CK(hipGetLastError());
-    CK(hipStreamSynchronize(g_str));
+    if (e.required) {
+      if (hipGetLastError() != hipSuccess || hipStreamSynchronize(g_str) != hipSuccess)
+        return RS_OTHER;
+    } else {
+      CK(hipGetLastError());
+      CK(hipStreamSynchronize(g_str));
+    }
   }
   // C1 f16 twins: derived state (not saved); rebuild the complete blocks
   // [0, n/4) from the restored fp32 indexer keys, or f16 scoring in a later
@@ -1431,19 +1629,29 @@ static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& pro
   // re-pooled from the raw ring by the continuation prefill.
   if (m.d_ikh && G.has_ik && n / 4 > 0) {
     const int nb = n / 4;
-    for (int qi = 0; qi < m.kv_nl; qi++)
+    const int twins_nl = e.required ? nl : m.kv_nl;
+    for (int qi = 0; qi < twins_nl; qi++)
       k_ik_twin_build<<<nb, 128, 0, g_str>>>(
           m.d_ik + (size_t)qi * m.ik_layer_blocks * 128,
           m.kv_paged ? m.d_ptab : nullptr,
           m.d_ikh + (size_t)qi * m.ik_layer_blocks * 128, nb);
-    CK(hipGetLastError());
-    CK(hipStreamSynchronize(g_str));
+    if (e.required) {
+      if (hipGetLastError() != hipSuccess || hipStreamSynchronize(g_str) != hipSuccess)
+        return RS_OTHER;
+    } else {
+      CK(hipGetLastError());
+      CK(hipStreamSynchronize(g_str));
+    }
   }
   // host-side and scalar state: pos/ringpos (both mirrors), PLE token history
   m.pos = n;
   m.ple_ringpos = h.ringpos;
-  CK(hipMemcpy(m.d_pos, &m.pos, 4, hipMemcpyHostToDevice));
-  CK(hipMemcpy(m.d_ringpos, &m.ple_ringpos, 4, hipMemcpyHostToDevice));
+  if (e.required) {
+    if (!h2d(m.d_pos, &m.pos, 4) || !h2d(m.d_ringpos, &m.ple_ringpos, 4)) return RS_OTHER;
+  } else {
+    CK(hipMemcpy(m.d_pos, &m.pos, 4, hipMemcpyHostToDevice));
+    CK(hipMemcpy(m.d_ringpos, &m.ple_ringpos, 4, hipMemcpyHostToDevice));
+  }
   m.chist.assign(prompt.begin(), prompt.begin() + n);
   *mtp_out = want_mtp;
   return RS_OK;
@@ -1455,29 +1663,40 @@ static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& pro
 static bool restore(GpuModel& m, const std::shared_ptr<CkEnt>& e,
                     const std::vector<int>& prompt, std::vector<int>& hist,
                     bool* mtp_out) {
+  RestoreBusy busy{e};
   *mtp_out = false;
   crashdiag::note("kvsnap restore %d tokens from %.60s", e->n, e->name.c_str());
   const auto t0 = std::chrono::steady_clock::now();
-  uint64_t bad = 0;
+  uint64_t bad = 0, bad_mt = 0;
   int npages = 0;
   RsTime tm;
-  const int rc = restore_body(m, *e, prompt, mtp_out, &bad, &npages, tm);
+  int rc = restore_body(m, *e, prompt, mtp_out, &bad, &bad_mt, &npages, tm);
   {
     std::lock_guard<std::mutex> lk(g_mtx);
-    e->busy--;
+    if (bad_mt) {
+      auto f = g_mt.find(bad_mt);
+      if (f != g_mt.end()) f->second.st = ST_FAIL;
+    }
+    if (rc == RS_OK && e->failed) rc = RS_CKPT;
     if (rc == RS_OK) {
-      hit_locked(e);
-    } else if (rc == RS_CKPT) {
+      if (!e->required) hit_locked(e);
+    } else if (rc == RS_CKPT || (rc == RS_PAGE && e->required)) {
       drop_ck_locked(e, true);
     } else if (rc == RS_PAGE) {
-      // a damaged page invalidates every checkpoint built on it
+      // Invalidate busy entries too, but retain their files until released.
+      // Pending checkpoints sharing this page must not publish either.
+      auto f = g_ch.find(bad);
+      if (f != g_ch.end()) f->second.st = ST_FAIL;
       std::vector<std::shared_ptr<CkEnt>> v;
       for (auto& o : g_ck)
-        if (o->pub && !o->busy && std::count(o->chunks.begin(), o->chunks.end(), bad))
+        if (!o->required && o->pub && std::count(o->chunks.begin(), o->chunks.end(), bad))
           v.push_back(o);
       for (auto& o : v) drop_ck_locked(o, true);
     }
+    unbusy_locked(e);
+    busy.e.reset();
   }
+  g_cv.notify_all();
   flush_log();
   const double s =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -1488,7 +1707,7 @@ static bool restore(GpuModel& m, const std::shared_ptr<CkEnt>& e,
     return false;
   }
   hist.assign(prompt.begin(), prompt.begin() + e->n);
-  if (tm.bytes >= (64ull << 20) && s > 0) {  // restore throughput (prefer_over_ram)
+  if (!e->required && tm.bytes >= (64ull << 20) && s > 0) {  // prefer_over_ram
     std::lock_guard<std::mutex> lk(g_mtx);
     const double bps = tm.bytes / s;
     g_rs_bps = g_rs_bps > 0 ? 0.7 * g_rs_bps + 0.3 * bps : bps;
@@ -1534,6 +1753,35 @@ static bool ends_with(const std::string& s, const char* suf) {
   const size_t k = strlen(suf);
   return s.size() >= k && !s.compare(s.size() - k, k, suf);
 }
+static bool req_hex(const std::string& s, size_t off, size_t n) {
+  if (off + n > s.size()) return false;
+  for (size_t i = off; i < off + n; i++)
+    if (!((s[i] >= '0' && s[i] <= '9') || (s[i] >= 'a' && s[i] <= 'f'))) return false;
+  return true;
+}
+static bool req_dir_name(const std::string& s) {
+  return s.size() == 27 && !s.compare(0, 11, "kvsnap_req_") && req_hex(s, 11, 16);
+}
+static bool req_file_name(std::string s) {
+  if (!s.rfind("tmp_", 0)) s.erase(0, 4);
+  if (s.size() < 18 || s.compare(0, 2, "s_") || !req_hex(s, 2, 16)) return false;
+  return (s.size() == 22 && s.compare(18, 4, ".kck") == 0) ||
+         (s.size() == 31 && s[18] == '_' && req_hex(s, 19, 8) &&
+          (s.compare(27, 4, ".kvc") == 0 || s.compare(27, 4, ".kvm") == 0));
+}
+// A crashed process cannot have a live request pin. Remove only our recognized
+// private images and temporaries; leave any other files in the directory alone.
+// Like the ordinary index scan, this assumes one engine owns a cache directory.
+static void clean_req_dir(const std::filesystem::path& dir) {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+    std::error_code e2;
+    if (req_file_name(it->path().filename().string()) &&
+        fs::is_regular_file(it->symlink_status(e2))) fs::remove(it->path(), e2);
+  }
+  fs::remove(dir, ec);  // succeeds only if nothing unrecognized remains
+}
 // A name this cache writes (c_*.kvc, m_*.kvm, k_*.kck). Startup cleanup only
 // ever touches these, their tmp_ temporaries and pre-A4 s_* snapshot
 // directories, so a cache dir that is shared with other files is safe.
@@ -1576,6 +1824,7 @@ static std::shared_ptr<CkEnt> load_ck(const std::string& fn) {
   e->nc = h.nc;
   e->nl = h.nl;
   e->mtp = h.mtp != 0;
+  e->hdr = h;
   e->pub = true;
   e->chunks.resize((size_t)h.nc);
   e->mtps.resize((size_t)h.nc);
@@ -1628,7 +1877,9 @@ static void init(GpuModel& m, Cfg& cfg) {
     const fs::directory_entry& de = *it;
     std::error_code e2;
     const std::string fn = de.path().filename().string();
-    if (!fn.rfind("tmp_", 0)) {
+    if (req_dir_name(fn) && fs::is_directory(de.symlink_status(e2))) {
+      clean_req_dir(de.path());
+    } else if (!fn.rfind("tmp_", 0)) {
       if ((own_name(fn.substr(4)) || fn.substr(4) == HITS_FILE) && de.is_regular_file(e2))
         fs::remove(de.path(), e2);
     } else if (!fn.rfind("s_", 0) && de.is_directory(e2) &&
@@ -1691,6 +1942,7 @@ static void init(GpuModel& m, Cfg& cfg) {
     }
     for (uint64_t k : e->chunks) g_ch[k].refs++;
     for (uint64_t& k : e->mtps) {
+      if (!k) continue;  // zero never owns a reference
       auto f = g_mt.find(k);
       if (f == g_mt.end()) k = 0;
       else f->second.refs++;
@@ -2367,6 +2619,38 @@ struct Turnstile {
   std::condition_variable cv;
   uint64_t next = 0, serving = 0;
   std::vector<std::pair<uint64_t, int>> heavy;  // (ticket, remaining) still waiting
+  std::list<uint64_t> abandoned;
+  void advance() {  // under mu
+    serving++;
+    for (;;) {
+      auto it = std::find(abandoned.begin(), abandoned.end(), serving);
+      if (it == abandoned.end()) break;
+      abandoned.erase(it);
+      serving++;
+    }
+  }
+  bool acquire_wait(const std::atomic<bool>& cancel, const std::function<void()>& on_wait) {
+    std::unique_lock<std::mutex> lk(mu);
+    for (;;) {
+      if (cancel) return false;
+      const uint64_t t = next++;
+      const auto notice = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      while (serving != t && !cancel &&
+             (!on_wait || std::chrono::steady_clock::now() < notice))
+        cv.wait_for(lk, std::chrono::milliseconds(50));
+      if (!cancel && serving == t) {
+        if (g_turn_prof) g_turnprof.on_acquire();
+        return true;
+      }
+      if (serving == t) advance();
+      else abandoned.push_back(t);
+      lk.unlock();
+      cv.notify_all();
+      if (cancel) return false;
+      on_wait();
+      lk.lock();
+    }
+  }
   uint64_t acquire(int heavy_rem = 0) {  // returns this grant's ticket (QWENOX_VR_CHECK)
     std::unique_lock<std::mutex> lk(mu);
     const uint64_t t = next++;
@@ -2388,7 +2672,7 @@ struct Turnstile {
   Waiters waiters() {  // owner only: who is queued behind it
     std::lock_guard<std::mutex> lk(mu);
     Waiters w;
-    const int all = (int)(next - serving) - 1;
+    const int all = (int)(next - serving) - 1 - (int)abandoned.size();
     w.heavy = (int)heavy.size();
     w.light = std::max(0, all - w.heavy);
     for (const auto& h : heavy) w.min_heavy_rem = std::min(w.min_heavy_rem, h.second);
@@ -2398,28 +2682,44 @@ struct Turnstile {
     if (g_turn_prof) g_turnprof.on_release(tl_turn_tag);
     {
       std::lock_guard<std::mutex> lk(mu);
-      serving++;
+      advance();
     }
     cv.notify_all();
   }
   bool contended() {  // someone besides the owner is queued
     std::lock_guard<std::mutex> lk(mu);
-    return next - serving > 1;
+    return next - serving > 1 + abandoned.size();
   }
 };
 
+struct SuspendCtl {
+  int state = 0;  // 0 requested, 1 capturing small state, 2 ready, 3 released, 4 failed, 5 retry
+  uint64_t seq = 0, lease = 0;
+  int slot = -1;
+  int resume_pages = 0;  // same target as admission for saved tokens and remaining budget
+};
 struct Slot {
   bool busy = false;
   bool abort = false;  // pool-overflow victim: fail at the next GPU acquire
+  bool suspendable = false;  // request supports suspension at a safe boundary
+  bool spec_suspendable = false;
+  std::shared_ptr<SuspendCtl> suspend;
+  int suspend_budget = 0;
+  long long req = 0;
   // MTP KV continuity: true after a spec-enabled turn (prefill tap capture
   // + spec decode keep the MTP layer's KV in lockstep with the trunk).
   // False after kvsnap/rckpt restores and any plain (non-speculative) turn.
   bool mtp_live = false;
+  // Sampled requests keep their sampler stream on the stack, but a resumed
+  // request restores KV saved by another execution; tiny logit differences
+  // then change rejection-sampling draws. Only greedy requests may release.
+  bool sampled = false;
   // tokens INGESTED by this slot's live state (prompt + every token actually
   // fed to forward). KV reuse: a GEN whose prompt extends hist exactly
   // continues from live state instead of re-prefilling.
   std::vector<int> hist;
-  uint64_t seq = 0;       // admission order of the request it runs
+  uint64_t seq = 0;       // priority of the request it runs
+  uint64_t lease = 0;     // unique to each claim, including readmission
   uint64_t last_use = 0;  // LRU among idle slots
   uint64_t owner = 0;     // connection id of the last request (N=1 affinity)
   int reserved = 0;
@@ -2434,20 +2734,96 @@ static std::mutex g_sm;  // g_slots bookkeeping + admission queue
 static std::condition_variable g_scv;
 static std::vector<Slot> g_slots;
 static std::list<uint64_t> g_wait;  // admission tickets, FIFO
-static uint64_t g_ticket = 0, g_seq = 0, g_use = 0;
+static uint64_t g_ticket = 0, g_seq = 0, g_lease = 0, g_use = 0;
+// Detached requests remain ordered even before they enter the admission queue.
+static std::list<std::shared_ptr<SuspendCtl>> g_detached;
+static bool earlier_detached(uint64_t seq) {  // g_sm held
+  for (const auto& ctl : g_detached) if (ctl->seq < seq) return true;
+  return false;
+}
+static bool slot_reserved_for_earlier(int slot, uint64_t seq) {  // g_sm held
+  for (const auto& ctl : g_detached)
+    if (ctl->slot == slot && ctl->seq < seq) return true;
+  return false;
+}
+// Busy readmissions are already charged by kv_admission_available. A detached
+// request whose slot was reused by another sequence still needs its full target.
+static int64_t detached_commitment(uint64_t seq) {  // g_sm held
+  int64_t pages = 0;
+  for (const auto& ctl : g_detached) {
+    if (ctl->seq >= seq) continue;
+    const Slot& sl = g_slots[(size_t)ctl->slot];
+    if (sl.busy && !sl.abort && sl.seq == ctl->seq) continue;
+    pages += ctl->resume_pages;
+  }
+  return pages;
+}
+struct DetachedRegistration {
+  std::shared_ptr<SuspendCtl> ctl;
+  ~DetachedRegistration() {
+    std::lock_guard<std::mutex> lk(g_sm);
+    g_detached.remove(ctl);
+    g_scv.notify_all();
+  }
+};
 static std::atomic<uint64_t> g_conn_id{0};
 static thread_local int tl_slot = -1;  // slot of the GPU-owning worker
+static thread_local uint64_t tl_lease = 0;
+static thread_local const std::atomic<bool>* tl_cancel = nullptr;
+static thread_local std::function<void(bool)> tl_progress;
+static thread_local bool tl_detached = false;  // suspended: no slot or GPU lease
+static thread_local bool tl_suspend_rebuilding = false;  // no recursive suspension
+static thread_local bool tl_spec_suspend = false;
+static thread_local bool tl_spec_chain = false;
+static thread_local bool tl_spec_membership_suspended = false;
+static thread_local uint64_t* tl_spec_lease = nullptr;
 static int g_reserve_decode = 4096;
+
+struct SpecSuspendScope {
+  int slot = -1;
+  uint64_t seq = 0, lease = 0;
+  uint64_t* previous_lease = nullptr;
+  bool previous = false, previous_chain = false;
+  SpecSuspendScope(bool enabled, int budget, bool chain = false) {
+    if (!enabled || tl_slot < 0 || tl_detached) return;
+    std::lock_guard<std::mutex> lk(g_sm);
+    slot = tl_slot;
+    Slot& sl = g_slots[(size_t)slot];
+    seq = sl.seq;
+    lease = sl.lease;
+    previous_lease = tl_spec_lease;
+    tl_spec_lease = &lease;
+    previous = tl_spec_suspend;
+    previous_chain = tl_spec_chain;
+    tl_spec_suspend = true;
+    tl_spec_chain = chain;
+    sl.suspendable = true;
+    sl.spec_suspendable = true;
+    sl.suspend_budget = budget;
+  }
+  ~SpecSuspendScope() {
+    if (slot < 0) return;
+    tl_spec_suspend = previous;
+    tl_spec_chain = previous_chain;
+    tl_spec_lease = previous_lease;
+    std::lock_guard<std::mutex> lk(g_sm);
+    Slot& sl = g_slots[(size_t)slot];
+    if (!tl_detached && tl_slot == slot && sl.busy && sl.seq == seq && sl.lease == lease) {
+      sl.suspendable = false;
+      sl.spec_suspendable = false;
+    }
+  }
+};
 
 // Idle slot for a prompt: the longest hist that is a strict prefix (live
 // continuation), else an empty slot, else the least recently used one whose
 // connection is gone (owner 0), else the least recently used one.
-static int pick_slot(const std::vector<int>& ids) {
+static int pick_slot(const std::vector<int>& ids, uint64_t seq) {
   int best = -1, empty = -1, lru = -1, orphan = -1;
   size_t bestn = 0;
   for (int i = 0; i < (int)g_slots.size(); i++) {
     const Slot& s = g_slots[(size_t)i];
-    if (s.busy) continue;
+    if (s.busy || slot_reserved_for_earlier(i, seq)) continue;
     const size_t n = s.hist.size();
     if (n == 0) {
       if (empty < 0) empty = i;
@@ -2512,32 +2888,67 @@ static size_t log_prefix_miss(long long req, const std::vector<int>& ids, int ch
   return bl;
 }
 
-// Wait (FIFO) for an idle slot and claim it; -1 if cancelled while queued,
-// -2 if the shared KV pool cannot fit the request alongside the reservations
-// of the requests already running.
+// Wait for an idle slot and sufficient shared KV capacity; -1 if cancelled,
+// -2 if the request cannot fit even in an otherwise empty pool.
 static int slot_admit(GpuModel& m, const std::vector<int>& ids, int max_tokens,
-                      const std::atomic<bool>& cancel, long long req) {
+                      const std::atomic<bool>& cancel, long long req,
+                      const std::function<void()>& on_wait = {}, int only_slot = -1,
+                      uint64_t resume_seq = 0) {
   std::unique_lock<std::mutex> lk(g_sm);
   const uint64_t t = g_ticket++;
+  const uint64_t seq = resume_seq ? resume_seq : ++g_seq;
   g_wait.push_back(t);
+  struct AdmissionCleanup {
+    std::unique_lock<std::mutex>& lk;
+    uint64_t ticket;
+    bool turn = false;
+    ~AdmissionCleanup() {
+      if (!lk.owns_lock()) lk.lock();
+      g_wait.remove(ticket);
+      g_scv.notify_all();
+      lk.unlock();
+      if (turn) g_turn.release();
+    }
+  } cleanup{lk, t};
+  auto next_wait_notice = std::chrono::steady_clock::now();
+  auto available = [&] {
+    if (only_slot >= 0)
+      return !g_slots[(size_t)only_slot].busy && !slot_reserved_for_earlier(only_slot, seq)
+                 ? only_slot : -1;
+    return pick_slot(ids, seq);
+  };
   for (;;) {
     if (cancel) {
       g_wait.remove(t);
       g_scv.notify_all();
       return -1;
     }
-    if (g_wait.front() == t && pick_slot(ids) >= 0) {
+    if (g_wait.front() == t && available() < 0 && g_wait.size() > 1) {
+      g_wait.splice(g_wait.end(), g_wait, g_wait.begin());
+      // All tickets may be unavailable. Do not notify here: rotating waiters
+      // would otherwise wake each other indefinitely. The timed wait below
+      // lets the next ticket run without creating a notification spin.
+    }
+    if (g_wait.front() == t && available() >= 0) {
       lk.unlock();
-      g_turn.acquire();
+      if (on_wait && std::chrono::steady_clock::now() >= next_wait_notice) {
+        on_wait();
+        next_wait_notice = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      }
+      const bool acquired = g_turn.acquire_wait(cancel, on_wait);
       lk.lock();
-      if (cancel) {
-        g_wait.pop_front();
-        g_scv.notify_all();
+      if (!acquired) return -1;
+      cleanup.turn = true;
+      if (cancel) return -1;
+      // The queue can rotate while this ticket waits for the GPU turn.
+      if (g_wait.empty() || g_wait.front() != t) {
         lk.unlock();
         g_turn.release();
-        return -1;
+        cleanup.turn = false;
+        lk.lock();
+        continue;
       }
-      const int s = pick_slot(ids);
+      const int s = available();
       if (s >= 0) {
         if (m.nslots > 1 && m.kv_paged) {
           const Slot& sl = g_slots[(size_t)s];
@@ -2545,7 +2956,7 @@ static int slot_admit(GpuModel& m, const std::vector<int>& ids, int max_tokens,
           while (lcp < sl.hist.size() && lcp < ids.size() &&
                  sl.hist[lcp] == ids[lcp])
             lcp++;
-          const bool cont = !sl.hist.empty() && lcp == sl.hist.size() &&
+          const bool cont = only_slot < 0 && !sl.hist.empty() && lcp == sl.hist.size() &&
                             lcp < ids.size();
           const int target = kv_admission_target(ids.size(), max_tokens,
                                                   g_reserve_decode, m.maxctx,
@@ -2556,46 +2967,539 @@ static int slot_admit(GpuModel& m, const std::vector<int>& ids, int max_tokens,
                              m.slot_pages((int)index), g_slots[index].reserved};
           const int need = kv_admission_need(target, states[(size_t)s].mapped, cont);
           const int64_t supply = kv_admission_available(m.kv_pool_pages, states,
-                                                        (size_t)s);
+                                                        (size_t)s) -
+                                 detached_commitment(seq);
           if (need > supply) {
-            fprintf(stderr,
-                    "%s req %lld rejected at admission: needs %d pages "
-                    "(%zu prompt tokens + %d reserved decode), only %lld of %d pool "
-                    "pages available to it\n",
-                    log_ts(), req, need, ids.size(),
-                    std::max(0, std::min(max_tokens, g_reserve_decode)),
-                    (long long)supply, m.kv_pool_pages);
-            g_wait.pop_front();
-            g_scv.notify_all();
+            if (target > m.kv_pool_pages) {
+              return -2;
+            }
+            if (g_wait.size() > 1) {
+              // As with an unavailable slot, rely on the timed wait rather
+              // than making capacity-blocked tickets wake each other.
+              g_wait.splice(g_wait.end(), g_wait, g_wait.begin());
+            }
             lk.unlock();
             g_turn.release();
-            return -2;
+            cleanup.turn = false;
+            lk.lock();
+            if (on_wait && std::chrono::steady_clock::now() >= next_wait_notice) {
+              lk.unlock();
+              on_wait();
+              next_wait_notice = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+              lk.lock();
+            }
+            g_scv.wait_for(lk, std::chrono::milliseconds(50));
+            continue;
           }
           g_slots[(size_t)s].reserved = target;
         }
-        g_slots[(size_t)s].fork_lcp = log_prefix_miss(req, ids, s);
-        g_wait.pop_front();
+        g_slots[(size_t)s].fork_lcp = only_slot >= 0 ? 0 : log_prefix_miss(req, ids, s);
+        g_wait.remove(t);
         Slot& sl = g_slots[(size_t)s];
         sl.busy = true;
         sl.abort = false;
-        sl.seq = ++g_seq;
+        sl.suspendable = false;
+        sl.spec_suspendable = false;
+        sl.sampled = false;  // set by the request after admission
+        sl.suspend.reset();
+        sl.suspend_budget = 0;
+        sl.req = req;
+        sl.seq = seq;
+        sl.lease = ++g_lease;
+        tl_lease = sl.lease;
+        cleanup.turn = false;  // the caller owns the turn
         g_scv.notify_all();
         return s;
       }
       lk.unlock();
       g_turn.release();
+      cleanup.turn = false;
+      lk.lock();
+    }
+    if (on_wait && std::chrono::steady_clock::now() >= next_wait_notice) {
+      lk.unlock();
+      on_wait();
+      next_wait_notice = std::chrono::steady_clock::now() + std::chrono::seconds(5);
       lk.lock();
     }
     g_scv.wait_for(lk, std::chrono::milliseconds(50));
   }
 }
 
-static void slot_leave(int s) {
+// Select between already-matched checkpoints while the GPU turn is held.
+// The RAM index remains valid only until the next rckpt mutation. The SSD
+// match remains busy for its caller to restore or release, even if RAM wins.
+static int choose_recall_checkpoint(int ci, std::shared_ptr<kvsnap::CkEnt>& ssd,
+                                    bool require_mtp, long long req) {
+  if (ci >= 0 && require_mtp && !rckpt::has_mtp(ci)) ci = -1;
+  if (ssd && require_mtp && !ssd->mtp) {
+    kvsnap::release(ssd);
+    ssd.reset();
+  }
+  if (ci >= 0 && ssd &&
+      kvsnap::prefer_over_ram(*ssd, rckpt::length(ci), rckpt::has_mtp(ci), req))
+    ci = -1;
+  return ci;
+}
+
+// Called with the GPU turn and g_sm held, after validating the slot. The
+// prediction is local to this reset; shared pages can make it zero even when
+// dropping this slot is necessary to make later reclamation possible.
+static void pressure_slot_reset(GpuModel& m, int slot, int back, const char* reason) {
+  const int mapped = m.slot_pages(slot);
+  int reclaimable = -1;
+  try { reclaimable = m.slot_reclaimable_pages(slot); }
+  catch (...) {}  // telemetry must not prevent reclamation
+  const int before = m.kv_pool.nfree();
+  m.slot_reset(slot, back);
+  const int after = m.kv_pool.nfree();
+  fprintf(stderr, "%s [kvpage] %s slot=%d mapped=%d reclaimable=%d free_before=%d free_after=%d\n",
+          log_ts(), reason, slot, mapped, reclaimable, before, after);
+}
+
+struct SuspendCancelled {};
+struct SuspendFailed : std::runtime_error { using std::runtime_error::runtime_error; };
+static void slot_leave(int s, uint64_t lease = 0);
+
+// Called with the GPU turn held, at a plain decode or MTP round boundary.
+// The caller retains round-local state; reacquiring the same slot preserves
+// its Slot/hist references. MTP/chain callers enter only at round tops.
+enum class SuspendMode { PlainDecode, Mtp };
+// Supplied by the replay integration in this translation unit. Called with the
+// GPU turn and the original slot's new lease held, after reset_state(). On
+// success it must reconstruct all model state for saved, including chist,
+// pos and (for Mtp) mtp_pos == pos - 1. It must honor cancel and return false
+// on failure; partial state is discarded by the caller's request cleanup.
+static bool suspend_rebuild(GpuModel& m, const std::vector<int>& saved,
+                            SuspendMode mode, const std::atomic<bool>& cancel,
+                            long long req, kvsnap::RestoreBusy& ssd) {
+  const bool mtp = mode == SuspendMode::Mtp;
+  if (cancel || !tl_suspend_rebuilding || tl_detached || tl_slot < 0 ||
+      m.bound_ != tl_slot || saved.empty() || saved.size() > (size_t)m.maxctx ||
+      m.pos != 0 || !m.chist.empty() || m.pf_end || m.mtp_tap_capture ||
+      m.spec_snap || m.ngram_verify_active || m.cut_abs >= 0 || m.cut_r_ ||
+      m.df2.cap_mode || m.ws_lent_ || g_borrow_light.load(std::memory_order_acquire) ||
+      (mtp && (!m.d_R || !m.d_mpos || !m.d_miraw || !m.d_mtap))) return false;
   {
     std::lock_guard<std::mutex> lk(g_sm);
-    g_slots[(size_t)s].busy = false;
-    g_slots[(size_t)s].reserved = 0;
-    g_slots[(size_t)s].last_use = ++g_use;
+    const Slot& sl = g_slots[(size_t)tl_slot];
+    if (!sl.busy || sl.abort || sl.lease != tl_lease) return false;
+  }
+
+  // A rebuild must not release the turn: prefill's heavy gate can requeue
+  // even with progress disabled, and starvation can initiate another park.
+  // Keep eviction available, but fail closed if eviction cannot supply KV.
+  struct ReplayScope {
+    GpuModel& m;
+    decltype(m.abort_flag) abort;
+    decltype(m.borrow_query_fn) query;
+    decltype(m.borrow_skip_fn) skip;
+    decltype(m.heavy_gate_fn) gate;
+    decltype(m.kv_starve_fn) starve;
+    decltype(m.mtp_tap_capture) tap;
+    decltype(m.prog_total) total;
+    decltype(m.prog_base) base;
+    decltype(m.prog_last_est) last_est;
+    decltype(m.prog_req) req;
+    decltype(m.prog_t0) t0;
+    decltype(m.prog_last) last;
+    ReplayScope(GpuModel& model, const std::atomic<bool>& c)
+        : m(model), abort(m.abort_flag), query(m.borrow_query_fn), skip(m.borrow_skip_fn),
+          gate(m.heavy_gate_fn), starve(m.kv_starve_fn), tap(m.mtp_tap_capture),
+          total(m.prog_total), base(m.prog_base), last_est(m.prog_last_est),
+          req(m.prog_req), t0(m.prog_t0), last(m.prog_last) {
+      m.abort_flag = const_cast<std::atomic<bool>*>(&c);
+      m.borrow_query_fn = nullptr;
+      m.borrow_skip_fn = nullptr;
+      m.heavy_gate_fn = nullptr;
+      m.kv_starve_fn = [](GpuModel&) -> bool {
+        throw KvOverflow("KV pool exhausted during suspend rebuild");
+      };
+      m.prog_total = 0;
+    }
+    ~ReplayScope() {
+      m.abort_flag = abort;
+      m.borrow_query_fn = query;
+      m.borrow_skip_fn = skip;
+      m.heavy_gate_fn = gate;
+      m.kv_starve_fn = starve;
+      m.mtp_tap_capture = tap;
+      m.prog_total = total;
+      m.prog_base = base;
+      m.prog_last_est = last_est;
+      m.prog_req = req;
+      m.prog_t0 = t0;
+      m.prog_last = last;
+    }
+  } scope(m, cancel);
+
+  // A pressure boundary is eligible only when an ordinary published SSD
+  // checkpoint covers the complete ingested history. The pending token and
+  // sampler stay on the request stack, so restore needs no prefill or fresh
+  // logits. Never turn an arbitrary decode/spec history into a fresh prefill
+  // and call it a safe resume.
+  if (!ssd.e || (size_t)ssd.e->n != saved.size() || (mtp && !ssd.e->mtp)) {
+    fprintf(stderr, "%s req %lld: KV-pressure full recall boundary unavailable\n", log_ts(), req);
+    return false;
+  }
+  std::vector<int> prefix;
+  bool ck_mtp = false;
+  auto ck = std::move(ssd.e);  // restore consumes the busy reference
+  const bool restored = kvsnap::restore(m, ck, saved, prefix, &ck_mtp);
+  if (cancel) return false;
+  if (!restored || (mtp && !ck_mtp)) return false;
+  const size_t base = prefix.size();
+  fprintf(stderr, "%s req %lld: KV-pressure recall tier=SSD prefix=%zu boundary=full\n",
+          log_ts(), req, base);
+  if (base != saved.size() || m.pos != (int)base ||
+      !std::equal(prefix.begin(), prefix.end(), saved.begin()) ||
+      m.chist.size() != base || !std::equal(prefix.begin(), prefix.end(), m.chist.begin()) ||
+      (mtp && m.mtp_pos != (int)base - 1)) return false;
+  return !cancel && m.bound_ == tl_slot && m.pos == (int)saved.size() &&
+         m.chist.size() == saved.size() &&
+         std::equal(saved.begin(), saved.end(), m.chist.begin()) &&
+         (!mtp || m.mtp_pos == m.pos - 1);
+}
+static void suspend_handle(GpuModel& m, SuspendMode mode = SuspendMode::PlainDecode,
+                           bool chain = false, bool self = false) {
+  const int s = tl_slot;
+  std::shared_ptr<SuspendCtl> ctl;
+  std::vector<int> saved, saved_hist;
+  kvsnap::RestoreBusy recall;  // published SSD prefix, busy until resume/cancel
+  bool saved_mtp_live = false;
+  std::unique_ptr<decltype(m.ngram)> saved_ngram;
+  decltype(m.ng_gate) saved_gate{};
+  int saved_cs = 0;
+  bool saved_cs_fixed = false, saved_legacy = false;
+  const int saved_last_rounds = m.last_spec_rounds, saved_last_commit = m.last_spec_commit;
+  const int saved_last_rollbacks = m.last_spec_rollbacks, saved_last_proposed = m.last_spec_proposed;
+  const int saved_live_rounds = m.live_spec_rounds, saved_live_commits = m.live_spec_commits;
+  const int saved_live_proposed = m.live_spec_proposed;
+  const auto saved_prog_total = m.prog_total;
+  const auto saved_prog_base = m.prog_base;
+  const auto saved_prog_last_est = m.prog_last_est, saved_prog_req = m.prog_req;
+  const auto saved_prog_t0 = m.prog_t0, saved_prog_last = m.prog_last;
+  // Only a full ordinary checkpoint is a safe no-recompute boundary.
+  if (tl_suspend_rebuilding || s < 0) return;
+  uint64_t owner = 0;
+  long long req = 0;
+  int budget = 0;
+  {
+    std::lock_guard<std::mutex> lk(g_sm);
+    Slot& sl = g_slots[(size_t)s];
+    ctl = sl.suspend;
+    if (!ctl || ctl->state != 0 || !sl.busy || sl.abort || sl.seq != ctl->seq ||
+        sl.lease != ctl->lease || ctl->slot != s || tl_lease != sl.lease ||
+        !sl.suspendable || (mode == SuspendMode::Mtp) != sl.spec_suspendable ||
+        sl.sampled || !tl_cancel || m.bound_ != s) return;
+    saved_hist = sl.hist;
+    saved_mtp_live = sl.mtp_live;
+    if (mode == SuspendMode::PlainDecode) saved = saved_hist;
+    owner = sl.owner;
+    req = sl.req;
+    budget = sl.suspend_budget;
+    ctl->state = 1;
+  }
+  DetachedRegistration registration{ctl};
+  const std::atomic<bool>& cancel = *tl_cancel;
+  auto next_notice = std::chrono::steady_clock::now();
+  auto wait_notice = [&] {
+    if (tl_progress && std::chrono::steady_clock::now() >= next_notice) {
+      tl_progress(false);
+      next_notice = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    }
+  };
+  bool captured = false;
+  try {
+    if (mode == SuspendMode::Mtp && !cancel) {
+      saved.reserve(m.chist.size());
+      for (const auto token : m.chist) {
+        if (token < INT_MIN || token > INT_MAX) {
+          saved.clear();
+          break;
+        }
+        saved.push_back(static_cast<int>(token));
+      }
+      // The table owns its storage. Copy only while holding the GPU turn;
+      // peers may mutate the bound model immediately after it is released.
+      if (chain && !saved.empty()) {
+        saved_ngram.reset(new decltype(m.ngram)(m.ngram));
+        saved_gate = m.ng_gate;
+        saved_cs = m.ng_cs;
+        saved_cs_fixed = m.ng_cs_fixed;
+        saved_legacy = m.ng_legacy;
+      }
+    }
+    captured = !cancel && !saved.empty() && m.pos > 0 && m.pos <= m.maxctx &&
+        saved.size() == (size_t)m.pos && !m.mrope_active_ && !m.rope_delta_ &&
+        m.mrope_pos_.empty() && m.img_inj.empty() && !has_image_tok(saved.data(), saved.size()) &&
+        !m.pf_end && !m.spec_snap && !m.ngram_verify_active && !m.mtp_tap_capture &&
+        m.cut_abs < 0 && !m.cut_r_ &&
+        (!m.ple_on || (m.chist.size() == saved.size() &&
+                       std::equal(saved.begin(), saved.end(), m.chist.begin()))) &&
+        (mode != SuspendMode::Mtp ||
+         (m.kv_nl > g_cfg.layers / 4 && m.mtp_pos == m.pos - 1 && m.d_miraw && m.d_mpos)) &&
+        (!m.kv_paged || m.kv_seq.mapped >= (m.pos + KV_PAGE - 1) / KV_PAGE);
+    // Do not release pages while the stream still uses them. Graph decode's
+    // device position is authoritative even when the host mirror looks valid.
+    if (captured) {
+      captured = hipStreamSynchronize(g_str) == hipSuccess;
+      if (captured && m.graphs_ok) {
+        int device_pos = -1;
+        captured = m.d_pos && hipMemcpy(&device_pos, m.d_pos, sizeof device_pos,
+                                       hipMemcpyDeviceToHost) == hipSuccess &&
+                   device_pos == m.pos;
+      }
+    }
+  } catch (...) {
+    {
+      std::lock_guard<std::mutex> lk(g_sm);
+      ctl->state = 4;
+    }
+    g_scv.notify_all();
+    if (mode == SuspendMode::Mtp) return;
+    throw;
+  }
+  if (!captured) {
+    {
+      std::lock_guard<std::mutex> lk(g_sm);
+      ctl->state = 4;
+    }
+    g_scv.notify_all();
+    return;
+  }
+  // Only an already-published ordinary SSD checkpoint covering the complete
+  // ingested history is a no-recompute recall boundary. Keep its normal busy
+  // reference while detached; this does not retain GPU pages. Otherwise leave
+  // the live request intact.
+  try {
+    recall.e = kvsnap::match(saved, kvsnap::g_fp, 0, true);
+    const int prefix = recall.e ? recall.e->n : 0;
+    const bool eligible = recall.e && (size_t)prefix == saved.size() &&
+                          (mode != SuspendMode::Mtp || recall.e->mtp);
+    fprintf(stderr, "%s req %lld: KV-pressure recall candidate saved=%zu SSD_prefix=%d "
+            "SSD_mtp=%d boundary=%d\n", log_ts(), req, saved.size(), prefix,
+            recall.e ? (int)recall.e->mtp : 0, (int)eligible);
+    if (!eligible) {
+      {
+        std::lock_guard<std::mutex> lk(g_sm);
+        ctl->state = 4;
+      }
+      g_scv.notify_all();
+      return;
+    }
+  } catch (...) {
+    {
+      std::lock_guard<std::mutex> lk(g_sm);
+      ctl->state = 4;
+    }
+    g_scv.notify_all();
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lk(g_sm);
+    ctl->resume_pages = kv_admission_target(saved.size(), budget, g_reserve_decode,
+                                             m.maxctx, KV_PAGE);
+  }
+  fprintf(stderr, "%s req %lld: captured small state (%zu tokens) for KV-pressure suspend\n",
+          log_ts(), req, saved.size());
+  g_turn.release();
+  auto reacquire_original = [&] {
+    g_turn.acquire();
+    {
+      std::lock_guard<std::mutex> lk(g_sm);
+      const Slot& sl = g_slots[(size_t)s];
+      if (!sl.busy || sl.seq != ctl->seq || sl.lease != ctl->lease)
+        throw SuspendFailed("KV-pressure suspension lost its slot lease");
+    }
+    m.bind(s);
+  };
+  if (self) {
+    reacquire_original();
+    std::unique_lock<std::mutex> lk(g_sm);
+    Slot& sl = g_slots[(size_t)s];
+    bool earlier = earlier_detached(ctl->seq);
+    for (const Slot& peer : g_slots)
+      if (peer.busy && peer.seq < ctl->seq) earlier = true;
+    const bool valid = !cancel && ctl->state == 1 && sl.busy && !sl.abort &&
+        sl.seq == ctl->seq && sl.lease == ctl->lease && sl.suspend == ctl &&
+        !g_borrow_light.load(std::memory_order_acquire) && !m.ws_lent_;
+    if (!valid || !earlier) {
+      // Releasing the live slot is unnecessary if the blocker departed. The
+      // live slot remains untouched; only this fully validated case may retry.
+      ctl->state = valid && !earlier ? 5 : 4;
+      if (sl.suspend == ctl) sl.suspend.reset();
+      lk.unlock();
+      g_scv.notify_all();
+      if (cancel) throw ReqCancelled("cancelled during KV-pressure suspension");
+      return;
+    }
+    try { g_detached.push_back(ctl); }
+    catch (...) {
+      ctl->state = 4;
+      if (sl.lease == ctl->lease && sl.suspend == ctl) sl.suspend.reset();
+      lk.unlock();
+      g_scv.notify_all();
+      throw;
+    }
+    pressure_slot_reset(m, s, s, "suspend self");
+    sl.hist.clear();
+    sl.mtp_live = false;
+    sl.suspendable = false;
+    sl.spec_suspendable = false;
+    sl.busy = false;
+    sl.reserved = 0;
+    sl.suspend.reset();
+    ctl->state = 3;
+    lk.unlock();
+    g_scv.notify_all();
+    g_turn.release();
+  } else {
+    std::unique_lock<std::mutex> lk(g_sm);
+    if (ctl->state == 1) ctl->state = 2;
+    g_scv.notify_all();
+    while (ctl->state == 2 && !cancel)
+      g_scv.wait_for(lk, std::chrono::milliseconds(50));
+    // Withdraw under g_sm before reacquiring the turn: the coordinator must
+    // recheck state under the same lock before it can release this slot's KV.
+    if (ctl->state == 2 && cancel) {
+      ctl->state = 4;
+      g_scv.notify_all();
+    }
+    if (ctl->state != 3) {
+      lk.unlock();
+      reacquire_original();
+      if (cancel) throw ReqCancelled("cancelled during KV-pressure suspension");
+      return;
+    }
+  }
+  tl_detached = true;
+  tl_slot = -1;
+  fprintf(stderr, "%s req %lld: KV released; waiting to resume\n", log_ts(), req);
+  if (self) {
+    std::unique_lock<std::mutex> lk(g_sm);
+    for (;;) {
+      if (cancel) throw SuspendCancelled{};
+      bool earlier = earlier_detached(ctl->seq);
+      for (const Slot& peer : g_slots)
+        if (peer.busy && peer.seq < ctl->seq) earlier = true;
+      if (!earlier) break;
+      lk.unlock();
+      wait_notice();
+      lk.lock();
+      g_scv.wait_for(lk, std::chrono::milliseconds(50));
+    }
+  }
+  for (;;) {
+    const int admitted = slot_admit(m, saved, budget, cancel, req, wait_notice, s, ctl->seq);
+    if (admitted != s) {
+      if (admitted == -1 || cancel) throw SuspendCancelled{};
+      throw SuspendFailed("KV-pressure resume cannot fit the saved state");
+    }
+    tl_detached = false;
+    tl_slot = s;
+    m.bind(s);
+    m.reset_state();  // remove whichever request reused the idle slot
+    {
+      std::lock_guard<std::mutex> lk(g_sm);
+      g_slots[(size_t)s].hist.clear();
+      g_slots[(size_t)s].mtp_live = false;
+    }
+    const int needed = (int)((saved.size() + KV_PAGE - 1) / KV_PAGE);
+    while (m.kv_pool.nfree() < needed && rckpt::evict_one(m)) {}
+    while (m.kv_pool.nfree() < needed) {
+      std::lock_guard<std::mutex> lk(g_sm);
+      int idle = -1;
+      for (int i = 0; i < (int)g_slots.size(); i++)
+        if (i != s && !g_slots[(size_t)i].busy && m.slot_pages(i) > 0 &&
+            (idle < 0 || g_slots[(size_t)i].last_use < g_slots[(size_t)idle].last_use))
+          idle = i;
+      if (idle < 0) break;
+      pressure_slot_reset(m, idle, s, "recall idle");
+      g_slots[(size_t)idle].hist.clear();
+      g_slots[(size_t)idle].mtp_live = false;
+    }
+    if (m.kv_pool.nfree() >= needed) break;
+    slot_leave(s, tl_lease);
+    g_turn.release();
+    tl_detached = true;
+    tl_slot = -1;
+    wait_notice();
+    std::unique_lock<std::mutex> lk(g_sm);
+    g_scv.wait_for(lk, std::chrono::milliseconds(50));
+  }
+  fprintf(stderr, "%s req %lld: rebuilding after KV-pressure release (%zu tokens)\n",
+          log_ts(), req, saved.size());
+  struct RebuildScope {
+    RebuildScope() { tl_suspend_rebuilding = true; }
+    ~RebuildScope() { tl_suspend_rebuilding = false; }
+  };
+  bool rebuilt;
+  try {
+    RebuildScope scope;
+    rebuilt = !cancel && suspend_rebuild(m, saved, mode, cancel, req, recall);
+  } catch (...) {
+    if (m.bound_ != s) m.bind(s);
+    throw;
+  }
+  const bool wrong_slot = m.bound_ != s;
+  if (wrong_slot) m.bind(s);  // request cleanup must reset the readmitted slot
+  if (cancel) throw ReqCancelled("cancelled during KV-pressure rebuild");
+  if (!rebuilt || wrong_slot || m.pos != (int)saved.size() ||
+      (mode == SuspendMode::Mtp && m.mtp_pos != m.pos - 1) ||
+      ((m.ple_on || mode == SuspendMode::Mtp) &&
+       (m.chist.size() != saved.size() ||
+        !std::equal(saved.begin(), saved.end(), m.chist.begin()))))
+    throw SuspendFailed("KV-pressure rebuild failed or violated state invariants");
+  if (mode == SuspendMode::Mtp) {
+    m.last_spec_rounds = saved_last_rounds;
+    m.last_spec_commit = saved_last_commit;
+    m.last_spec_rollbacks = saved_last_rollbacks;
+    m.last_spec_proposed = saved_last_proposed;
+    m.live_spec_rounds = saved_live_rounds;
+    m.live_spec_commits = saved_live_commits;
+    m.live_spec_proposed = saved_live_proposed;
+    m.prog_total = saved_prog_total;
+    m.prog_base = saved_prog_base;
+    m.prog_last_est = saved_prog_last_est;
+    m.prog_req = saved_prog_req;
+    m.prog_t0 = saved_prog_t0;
+    m.prog_last = saved_prog_last;
+  }
+  if (chain) {
+    m.ngram = std::move(*saved_ngram);
+    m.ng_gate = saved_gate;
+    m.ng_cs = saved_cs;
+    m.ng_cs_fixed = saved_cs_fixed;
+    m.ng_legacy = saved_legacy;
+  }
+  {
+    std::lock_guard<std::mutex> lk(g_sm);
+    Slot& sl = g_slots[(size_t)s];
+    if (!sl.busy || sl.abort || sl.seq != ctl->seq || sl.lease != tl_lease)
+      throw SuspendFailed("KV-pressure rebuild lost its slot lease");
+    if (tl_spec_lease) *tl_spec_lease = sl.lease;
+    sl.hist = std::move(saved_hist);
+    sl.owner = owner;
+    sl.mtp_live = saved_mtp_live;
+    sl.suspendable = true;
+    sl.spec_suspendable = mode == SuspendMode::Mtp;
+  }
+  fprintf(stderr, "%s req %lld: rebuild complete; resumed after KV-pressure release\n", log_ts(), req);
+}
+
+static void slot_leave(int s, uint64_t lease) {
+  {
+    std::lock_guard<std::mutex> lk(g_sm);
+    Slot& sl = g_slots[(size_t)s];
+    if (lease && (!sl.busy || sl.lease != lease)) return;
+    if (sl.suspend && sl.suspend->state < 3) sl.suspend->state = 4;
+    sl.suspend.reset();
+    sl.suspendable = false;
+    sl.spec_suspendable = false;
+    sl.busy = false;
+    sl.reserved = 0;
+    sl.last_use = ++g_use;
   }
   g_scv.notify_all();
 }
@@ -2673,6 +3577,7 @@ static void yield_hook(GpuModel& m) {
     g_turn.acquire(rem);
     m.bind(tl_slot);
   }
+  if (rem <= 0 && !tl_spec_suspend) suspend_handle(m);
   bool ab;
   {
     std::lock_guard<std::mutex> lk(g_sm);
@@ -2739,6 +3644,7 @@ struct VrReq {
   const std::function<void(int)>* post = nullptr;  // see GpuModel::vseg_pool_fn
   bool done = false;
   bool dropped = false;        // abort/guard refusal -> worker serial rerun
+  std::exception_ptr error = nullptr;
   // QWENOX_VR_CHECK / QWENOX_VR_RESTORE (10-13): this segment's row window in
   // the shared post-verify scratch (-1 = not recorded), its hash at the
   // executor's release, and the executor's turn ticket.
@@ -2784,8 +3690,9 @@ static void vseg_round_exit() {
   g_vr.cv.notify_all();  // the round may now be complete without us
 }
 struct VrActive {
-  VrActive() { vseg_round_enter(); }
-  ~VrActive() { vseg_round_exit(); }
+  bool on;
+  explicit VrActive(bool on) : on(on) { if (on) vseg_round_enter(); }
+  ~VrActive() { if (on) vseg_round_exit(); }
 };
 
 static int vseg_active() {
@@ -2810,6 +3717,8 @@ static void vr_execute(GpuModel& m) {
   std::vector<GpuModel::VSeg> segs;
   std::vector<VrReq*> run;  // run[i] owns segs[i]
   int rows = 0;
+  // Report a batch failure to every participant only after they reacquire.
+  try {
   for (VrReq* r : mine) {
     {
       std::lock_guard<std::mutex> lk(g_sm);
@@ -2868,6 +3777,10 @@ static void vr_execute(GpuModel& m) {
         }
       }
     }
+  }
+  } catch (...) {
+    const std::exception_ptr error = std::current_exception();
+    for (VrReq* r : mine) r->error = error;
   }
   static const bool vr_dbg = getenv("QWENOX_VR_DBG") != nullptr;
   {
@@ -2932,6 +3845,7 @@ static bool vseg_pool(GpuModel& m, const GpuModel::VSeg& self, int* vout,
   if (am_exec) vr_execute(m);
   const uint64_t back = g_turn.acquire();
   m.bind(tl_slot);
+  if (req.error) std::rethrow_exception(req.error);
   if (!req.dropped && req.win_row0 >= 0) {
     const int P = (int)self.toks->size();
     // grants that ran between the executor's turn and ours (peers + others)
@@ -2982,6 +3896,7 @@ struct DrReq {
   const std::function<bool(int, const float*, int&)>* step = nullptr;  // C7 sampled
   bool done = false;
   bool dropped = false;        // abort/guard refusal -> worker serial rerun
+  std::exception_ptr error = nullptr;
 };
 struct DraftPool {
   std::mutex mu;
@@ -3030,6 +3945,7 @@ static void dr_execute(GpuModel& m) {
     mine.swap(g_dr.pend);
   }
   std::vector<GpuModel::DrSeg> segs;
+  try {
   for (DrReq* r : mine) {
     {
       std::lock_guard<std::mutex> lk(g_sm);
@@ -3042,6 +3958,10 @@ static void dr_execute(GpuModel& m) {
   if (!segs.empty() && !m.mtp_draft_batch(segs.data(), (int)segs.size())) {
     g_dr.fallbacks++;
     for (DrReq* r : mine) r->dropped = true;
+  }
+  } catch (...) {
+    const std::exception_ptr error = std::current_exception();
+    for (DrReq* r : mine) r->error = error;
   }
   static const bool vr_dbg = getenv("QWENOX_VR_DBG") != nullptr;
   {
@@ -3105,15 +4025,20 @@ static bool dr_pool(GpuModel& m, const GpuModel::DrSeg& self) {
   if (am_exec) dr_execute(m);
   g_turn.acquire();
   m.bind(tl_slot);
+  if (req.error) std::rethrow_exception(req.error);
   borrow_abort_check();
   return !req.dropped;
 }
 
 // GpuModel::kv_starve_fn (pool dry after rckpt eviction), GPU owner only.
-static bool starve(GpuModel& m) {
+static bool starve(GpuModel& m);
+static bool starve_round(GpuModel& m, std::vector<uint64_t>* attempted);
+static bool starve(GpuModel& m) { return starve_round(m, nullptr); }
+
+static bool starve_round(GpuModel& m, std::vector<uint64_t>* attempted) {
   const int cur = tl_slot;
   if (cur < 0) return false;
-  std::lock_guard<std::mutex> lk(g_sm);
+  std::unique_lock<std::mutex> lk(g_sm);
   const int n = (int)g_slots.size();
   int v = -1;
   for (int i = 0; i < n; i++) {
@@ -3125,7 +4050,7 @@ static bool starve(GpuModel& m) {
   if (v >= 0) {
     fprintf(stderr, "%s [kvpage] pool dry: dropped idle slot %d (%zu tokens, %d pages)\n",
             log_ts(), v, g_slots[(size_t)v].hist.size(), m.slot_pages(v));
-    m.slot_reset(v, cur);
+    pressure_slot_reset(m, v, m.bound_, "starve idle");
     g_slots[(size_t)v].hist.clear();
     g_slots[(size_t)v].mtp_live = false;
     return true;
@@ -3133,18 +4058,260 @@ static bool starve(GpuModel& m) {
   const uint64_t mine = g_slots[(size_t)cur].seq;
   for (int i = 0; i < n; i++) {
     const Slot& s = g_slots[(size_t)i];
-    if (i != cur && s.busy && !s.abort && s.seq > mine && m.slot_pages(i) > 0 &&
-        (v < 0 || s.seq > g_slots[(size_t)v].seq))
+    if (i != cur && s.busy && !s.abort && s.seq > mine &&
+        (!s.suspend || (attempted && tl_spec_membership_suspended &&
+                        s.suspend->state >= 0 && s.suspend->state <= 2 &&
+                        s.suspend->slot == i && s.suspend->seq == s.seq &&
+                        s.suspend->lease == s.lease)) &&
+        s.suspendable && !s.sampled &&
+        (!attempted || std::find(attempted->begin(), attempted->end(), s.seq) == attempted->end()) &&
+        m.slot_pages(i) > 0 && (v < 0 || s.seq > g_slots[(size_t)v].seq))
       v = i;
   }
   if (v >= 0) {
-    fprintf(stderr, "%s [kvpage] pool dry: aborting the later request on slot %d "
-            "(%d pages) for slot %d\n", log_ts(), v, m.slot_pages(v), cur);
-    m.slot_reset(v, cur);
-    g_slots[(size_t)v].abort = true;
-    return true;
+    const uint64_t victim_seq = g_slots[(size_t)v].seq;
+    if (auto existing = g_slots[(size_t)v].suspend) {
+      // Only the membership-free round top may yield to an existing control.
+      // Its owner/coordinator, not this waiter, decides whether to release KV.
+      if (!attempted || !tl_spec_membership_suspended || !tl_cancel ||
+          g_borrow_light.load(std::memory_order_acquire) || m.ws_lent_)
+        throw KvOverflow("KV pool exhausted while suspension is pending");
+      const uint64_t own_seq = g_slots[(size_t)cur].seq;
+      const uint64_t own_lease = g_slots[(size_t)cur].lease;
+      const uint64_t victim_lease = g_slots[(size_t)v].lease;
+      attempted->push_back(victim_seq);
+      lk.unlock();
+      g_turn.release();
+      lk.lock();
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+      auto notice = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      auto unchanged = [&] {
+        const Slot& victim = g_slots[(size_t)v];
+        return victim.busy && victim.seq == victim_seq && victim.lease == victim_lease &&
+               victim.suspend == existing && existing->state <= 2;
+      };
+      std::exception_ptr notice_error;
+      while (unchanged() && !*tl_cancel && std::chrono::steady_clock::now() < deadline) {
+        if (tl_progress && std::chrono::steady_clock::now() >= notice) {
+          lk.unlock();
+          try { tl_progress(false); } catch (...) { notice_error = std::current_exception(); }
+          notice = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+          lk.lock();
+          if (notice_error) break;
+        } else {
+          g_scv.wait_for(lk, std::chrono::milliseconds(50));
+        }
+      }
+      lk.unlock();
+      g_turn.acquire();
+      lk.lock();
+      const Slot& own = g_slots[(size_t)cur];
+      if (tl_detached || tl_slot != cur || !own.busy || own.abort ||
+          own.seq != own_seq || own.lease != own_lease)
+        throw KvOverflow("spec slot changed while waiting for KV capacity");
+      m.bind(cur);
+      if (*tl_cancel) throw ReqCancelled("cancelled while waiting for KV capacity");
+      if (notice_error) std::rethrow_exception(notice_error);
+      // Re-evaluate capacity and candidates even on timeout or failed control.
+      // The attempted sequence prevents waiting for this request again.
+      return true;
+    }
+    if (g_slots[(size_t)cur].suspendable && g_slots[(size_t)v].suspendable &&
+        !g_borrow_light.load(std::memory_order_acquire) && !m.ws_lent_ &&
+        !g_slots[(size_t)v].suspend && tl_cancel && tl_progress) {
+      auto ctl = std::make_shared<SuspendCtl>();
+      if (attempted) attempted->push_back(victim_seq);
+      ctl->seq = victim_seq;
+      ctl->lease = g_slots[(size_t)v].lease;
+      ctl->slot = v;
+      g_slots[(size_t)v].suspend = ctl;
+      lk.unlock();
+      g_turn.release();
+      g_scv.notify_all();
+      lk.lock();
+      auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+      auto notice = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      while (ctl->state < 2 && !*tl_cancel && std::chrono::steady_clock::now() < deadline) {
+        if (std::chrono::steady_clock::now() >= notice) {
+          lk.unlock();
+          tl_progress(false);
+          notice = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+          lk.lock();
+        } else {
+          g_scv.wait_for(lk, std::chrono::milliseconds(50));
+        }
+      }
+      if (ctl->state < 2) ctl->state = 4;
+      g_scv.notify_all();
+      lk.unlock();
+      g_turn.acquire();
+      m.bind(cur);
+      lk.lock();
+      Slot& victim = g_slots[(size_t)v];
+      const bool same = victim.busy && victim.seq == victim_seq &&
+                        victim.lease == ctl->lease && victim.suspend == ctl;
+      const bool self_aborted = g_slots[(size_t)cur].abort;
+      if (same && ctl->state == 2 && !self_aborted && !*tl_cancel) {
+        try { g_detached.push_back(ctl); }
+        catch (...) {
+          ctl->state = 4;
+          victim.suspend.reset();
+          g_scv.notify_all();
+          throw;
+        }
+        pressure_slot_reset(m, v, cur, "suspend victim");
+        victim.hist.clear();
+        victim.mtp_live = false;
+        victim.suspendable = false;
+        victim.spec_suspendable = false;
+        victim.busy = false;
+        victim.reserved = 0;
+        victim.suspend.reset();
+        ctl->state = 3;
+        lk.unlock();
+        g_scv.notify_all();
+        return true;
+      }
+      ctl->state = 4;
+      if (same) victim.suspend.reset();
+      g_scv.notify_all();
+      if (self_aborted) throw KvOverflow("aborted: KV pool needed by an earlier request");
+      if (*tl_cancel) throw ReqCancelled("cancelled while waiting for KV capacity");
+      // A failed round-top capture leaves the live KV intact. Try another
+      // request; ordinary batch starvation remains fail-closed.
+      if (!same || attempted) return true;
+    }
   }
   throw KvOverflow("KV pool exhausted: concurrent contexts exceed the shared pool");
+}
+
+// Round-top only: no draft/verify submission from this request is outstanding.
+static void spec_round_hook(GpuModel& m, int remaining, int64_t begin, int64_t end,
+                            GpuModel::SpecMembership& membership) {
+  if (!tl_spec_suspend || tl_suspend_rebuilding) return;
+  if (begin < 0 || end < begin || end > m.maxctx || remaining < 0)
+    throw KvOverflow("invalid speculative KV range");
+  const int slot = tl_slot;
+  if (slot < 0 || tl_detached || !tl_cancel) throw ReqCancelled("spec request detached");
+  uint64_t seq;
+  {
+    std::lock_guard<std::mutex> lk(g_sm);
+    Slot& sl = g_slots[(size_t)slot];
+    if (!sl.busy || m.bound_ != slot) throw KvOverflow("spec slot changed");
+    seq = sl.seq;
+    sl.suspend_budget = remaining;
+    if (sl.abort) throw KvOverflow("spec request aborted");
+  }
+  if (*tl_cancel) throw ReqCancelled("spec request cancelled");
+  membership.suspend();
+  struct SafeMembershipWait {
+    SafeMembershipWait() { tl_spec_membership_suspended = true; }
+    ~SafeMembershipWait() { tl_spec_membership_suspended = false; }
+  } safe_wait;
+  // A requested victim may detach only at this round top and only when a full
+  // ordinary checkpoint exists. Membership stays suspended across rebuild.
+  suspend_handle(m, SuspendMode::Mtp, tl_spec_chain);
+  const bool borrowed = g_borrow_light.load(std::memory_order_acquire) || m.ws_lent_;
+  auto check = [&] {
+    if (*tl_cancel) throw ReqCancelled("spec request cancelled");
+    std::lock_guard<std::mutex> lk(g_sm);
+    if (tl_detached || tl_slot != slot || m.bound_ != slot ||
+        !g_slots[(size_t)slot].busy || g_slots[(size_t)slot].seq != seq ||
+        g_slots[(size_t)slot].abort)
+      throw KvOverflow("spec slot changed or aborted");
+  };
+  check();
+  // A reset can drop references without freeing shared physical pages, and a
+  // victim can change while the turn is released. Re-evaluate after either,
+  // but cap attempts even if other requests continuously recycle slots.
+  const size_t max_reclaims = std::max<size_t>(8, g_slots.size() * 4);
+  size_t reclaims = 0;
+  std::vector<uint64_t> attempted;
+  while (!m.kv_prepare_nowait((int)begin, (int)end)) {
+    if (borrowed || g_borrow_light.load(std::memory_order_acquire) || m.ws_lent_)
+      throw KvOverflow("spec KV unavailable during borrow");
+    if (rckpt::evict_one(m)) {
+      check();
+      continue;
+    }
+    if (reclaims++ >= max_reclaims)
+      throw KvOverflow("spec KV reclaim retry limit reached");
+    // A later request cannot victimise an earlier one. At this safe round top
+    // it may either serve a control a peer already installed for it, or
+    // suspend itself behind an earlier request. Both paths release only when a
+    // complete ordinary MTP-live SSD checkpoint exists; otherwise live KV
+    // stays put and capacity is retried within the reclaim budget.
+    bool starved = false;
+    try {
+      if (!starve_round(m, &attempted)) starved = true;
+    } catch (const KvOverflow&) {
+      starved = true;
+    }
+    if (!starved) {
+      check();
+      continue;
+    }
+    std::shared_ptr<SuspendCtl> pending, own;
+    bool earlier = false;
+    {
+      std::lock_guard<std::mutex> lk(g_sm);
+      Slot& sl = g_slots[(size_t)slot];
+      if (sl.suspend && sl.suspend->state >= 0 && sl.suspend->state <= 2) {
+        pending = sl.suspend;
+      } else if (!sl.suspend && sl.suspendable && sl.spec_suspendable && !sl.sampled) {
+        earlier = earlier_detached(sl.seq);
+        for (const Slot& peer : g_slots)
+          if (peer.busy && peer.seq < sl.seq) earlier = true;
+        if (earlier) {
+          own = std::make_shared<SuspendCtl>();
+          own->seq = sl.seq;
+          own->lease = sl.lease;
+          own->slot = slot;
+          sl.suspend = own;
+        }
+      }
+    }
+    if (!pending && !own) {
+      // No victim request and no earlier peer: idle reclamation may succeed
+      // on the next attempt after a peer finished. Bounded by max_reclaims.
+      check();
+      continue;
+    }
+    if (pending) {
+      // A peer selected this request after this round's first check; act as
+      // its victim and let that coordinator decide the release.
+      try {
+        suspend_handle(m, SuspendMode::Mtp, tl_spec_chain);
+      } catch (const SuspendCancelled&) {
+        throw;
+      }
+      if (pending->state == 3) {
+        check();
+        continue;
+      }
+      throw KvOverflow("spec KV pool exhausted: peer suspension did not complete");
+    }
+    int state = 4;
+    try {
+      suspend_handle(m, SuspendMode::Mtp, tl_spec_chain, true);
+    } catch (...) {
+      std::lock_guard<std::mutex> lk(g_sm);
+      if (g_slots[(size_t)slot].suspend == own) g_slots[(size_t)slot].suspend.reset();
+      throw;
+    }
+    {
+      std::lock_guard<std::mutex> lk(g_sm);
+      Slot& sl = g_slots[(size_t)slot];
+      state = own->state;
+      // 5: the blocker departed, so the live slot was never released.
+      if (state == 5 && sl.suspend == own) sl.suspend.reset();
+    }
+    if (state != 3 && state != 5)
+      throw KvOverflow("spec KV pool exhausted: self suspension did not release KV");
+    check();
+  }
+  check();
+  membership.resume();
 }
 
 struct Conn {
@@ -3219,10 +4386,12 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       return;
     }
   }
-  const int s = slot_admit(m, g.ids, g.max_tokens, cancel, (long long)g.req);
+  const int s = slot_admit(m, g.ids, g.max_tokens, cancel, (long long)g.req, [&] {
+    if (!c.send("W " + std::to_string(g.req) + " wait\n")) c.cancel = true;
+  });
   if (s == -2) {
     fprintf(stderr, "%s serve: req %lld failed: KV pool cannot fit it "
-            "alongside the running request(s)\n", log_ts(), (long long)g.req);
+            "even when empty\n", log_ts(), (long long)g.req);
     finish(err_line());
     return;
   }
@@ -3232,16 +4401,32 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     return;
   }
   tl_slot = s;
+  tl_cancel = &cancel;
+  tl_detached = false;
+  tl_progress = [&](bool resume) {
+    try {
+      if (!c.send("W " + std::to_string(g.req) + (resume ? " resume\n" : " wait\n")))
+        c.cancel = true;
+    } catch (...) {
+      c.cancel = true;
+    }
+  };
   m.bind(s);
   m.pf_end = 0;  // not ingesting a prompt yet (a thrown earlier request may have left it)
-  // Leaving: the slot turns idle while this worker still owns the GPU, so a
-  // starving peer never sees a finished request as busy.
+  // A detached worker owns neither the old slot nor a turn; the slot may
+  // already belong to another request while it waits for readmission.
   struct Lease {
     int s;
     ~Lease() {
       tl_slot = -1;
-      slot_leave(s);
-      g_turn.release();
+      if (!tl_detached) {
+        slot_leave(s, tl_lease);
+        g_turn.release();
+      }
+      tl_lease = 0;
+      tl_cancel = nullptr;
+      tl_progress = {};
+      tl_detached = false;
     }
   } lease{s};
   Slot& sl = g_slots[(size_t)s];
@@ -3256,6 +4441,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       mtp_live = false;
     }
     sl.owner = c.id;
+    sl.sampled = g.sample;
   }
   if (victim) {  // reset by a pool overflow while queued for the GPU
     fprintf(stderr, "%s serve: req %lld aborted: KV pool needed by an earlier "
@@ -3326,13 +4512,13 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     // it beats prefilling the difference (kvsnap::prefer_over_ram).
     const bool is_mrope = !g.mrope_grids.empty();
     const uint64_t req_ih = is_mrope && !cont ? fnv1a_patches(vpatches) : 0;
-    std::shared_ptr<kvsnap::CkEnt> ssd_ck;  // busy until restored or released
+    kvsnap::RestoreBusy ssd_ck;  // busy until restored or released
     if (!cont && !kvs.dir.empty())
       // M-RoPE requests: placeholder ids are pixel-agnostic, so the vision
       // tower, grids and patch-bytes hash are folded into the page-key seed;
       // a different image is simply a cache miss. + the text prefix of a
       // vision prompt (g_fp).
-      ssd_ck = kvsnap::match(g.ids, kvsnap::seed_for(is_mrope, req_ih, g.mrope_grids),
+      ssd_ck.e = kvsnap::match(g.ids, kvsnap::seed_for(is_mrope, req_ih, g.mrope_grids),
                              kvsnap::g_fp);
     if (!cont && rckpt::enabled()) {
       // RAM checkpoint tier (llama.cpp-style PARTIAL_ONLY): only GDN
@@ -3345,10 +4531,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       auto r0 = std::chrono::steady_clock::now();
       int ci = rckpt::match(g.ids, m.chist, is_mrope,
                             is_mrope ? &g.mrope_grids : nullptr, req_ih);
-      if (ci >= 0 && ssd_ck &&
-          kvsnap::prefer_over_ram(*ssd_ck, rckpt::length(ci), rckpt::has_mtp(ci),
-                                  (long long)g.req))
-        ci = -1;
+      ci = choose_recall_checkpoint(ci, ssd_ck.e, false, (long long)g.req);
       bool ck_mtp = false;
       if (ci >= 0 && rckpt::restore(m, ci, &hist, &ck_mtp)) {
         mcp = hist.size();
@@ -3363,14 +4546,14 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
         crashdiag::note("req %lld rckpt restored %zu tokens", (long long)g.req, mcp);
       }
     }
-    if (ssd_ck && cont) {  // the RAM tier won: drop the SSD match
-      kvsnap::release(ssd_ck);
-      ssd_ck.reset();
+    if (ssd_ck.e && cont) {  // the RAM tier won: drop the SSD match
+      kvsnap::release(ssd_ck.e);
+      ssd_ck.e.reset();
     }
-    if (ssd_ck) {
+    if (ssd_ck.e) {
       // SSD tier. A checkpoint saved with the MTP layer in lockstep restores
       // it too. restore() releases the match.
-      std::shared_ptr<kvsnap::CkEnt> ck = std::move(ssd_ck);
+      std::shared_ptr<kvsnap::CkEnt> ck = std::move(ssd_ck.e);
       bool ck_mtp = false;
       if (kvsnap::restore(m, ck, g.ids, hist, &ck_mtp)) {  // hist := its tokens
         mcp = hist.size();
@@ -3777,6 +4960,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
         m.mtp_ingest_b(m.d_R, bt, 1, (int)hist.size() - 1);
       }
       cur = m.forward(pause_tok);
+      if (!m.ple_on) m.chist.push_back(pause_tok);
       hist.push_back(pause_tok);
       if (g.sample) {
         m.get_logits(lbuf);
@@ -3826,11 +5010,17 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       if (!dead && !eos.count(cur)) {
         for (;;) {
           pause_tok = -1;
-          if (g.sample)
-            m.spec_loop_chain_sample(cur, g.max_tokens - 1, spec_gamma, smp,
-                                     chain_mtp, emit_ng_smp, g.seeded);
-          else if (chain) m.spec_loop_chain(cur, g.max_tokens - 1, spec_gamma, emit_ng);
-          else m.spec_loop_ngram(cur, g.max_tokens - 1, m.ngram.n_max, emit_ng);
+          {
+            SpecSuspendScope scope(chain && m.nslots > 1 && m.kv_paged &&
+                                   g.mrope_grids.empty() &&
+                                   !has_image_tok(g.ids.data(), g.ids.size()),
+                                   g.max_tokens - ngen, true);
+            if (g.sample)
+              m.spec_loop_chain_sample(cur, g.max_tokens - ngen, spec_gamma, smp,
+                                       chain_mtp, emit_ng_smp, g.seeded);
+            else if (chain) m.spec_loop_chain(cur, g.max_tokens - ngen, spec_gamma, emit_ng);
+            else m.spec_loop_ngram(cur, g.max_tokens - 1, m.ngram.n_max, emit_ng);
+          }
           spec_r += m.last_spec_rounds;
           spec_c += m.last_spec_commit;
           spec_p += m.last_spec_proposed;
@@ -3889,6 +5079,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
         hist.assign(m.chist.begin(), m.chist.end());
       }
     } else if (use_spec) {
+      if (!m.ple_on) m.chist.assign(g.ids.begin(), g.ids.end());
       // Stream each token as the spec loop commits it. eos/cancel/length
       // return false, rolling the round back so trunk and MTP stop at the
       // last token actually sent to the client.
@@ -3909,7 +5100,11 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
               dl_tick();
               return !cancel;
             };
-            m.spec_loop_sample(cur, g.max_tokens - 1, spec_gamma, smp, emit);
+            SpecSuspendScope scope(m.nslots > 1 && m.kv_paged &&
+                                   g.mrope_grids.empty() &&
+                                   !has_image_tok(g.ids.data(), g.ids.size()),
+                                   g.max_tokens - ngen);
+            m.spec_loop_sample(cur, g.max_tokens - ngen, spec_gamma, smp, emit);
           } else {
             auto emit = [&](int tok) -> bool {
               if (ngen >= g.max_tokens) return false;
@@ -3923,12 +5118,17 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
               return !cancel;
             };
             {
-              VrActive vr_act;  // rendezvous membership; every exit counts
+              SpecSuspendScope scope(m.nslots > 1 && m.kv_paged &&
+                                     g.mrope_grids.empty() &&
+                                     !has_image_tok(g.ids.data(), g.ids.size()),
+                                     g.max_tokens - ngen);
+              VrActive vr_act(m.vseg_round_enter_fn && m.vseg_round_exit_fn);
               // D2-S3c: draft rendezvous membership, same scope and exit
               // discipline. dr_worker_ok is the submit predicate too, so the
               // count never includes a worker that cannot submit.
-              DrActive dr_act(m.dr_worker_ok());
-              m.spec_loop(cur, g.max_tokens - 1, spec_gamma, emit);
+              DrActive dr_act(m.dr_round_enter_fn && m.dr_round_exit_fn && m.dr_worker_ok());
+              const GpuModel::SpecExternalMembership membership{vr_act.on, dr_act.on};
+              m.spec_loop(cur, g.max_tokens - ngen, spec_gamma, emit, &membership);
             }
           }
           spec_r += m.last_spec_rounds;
@@ -3947,7 +5147,13 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     } else {
       mtp_live = false;  // plain decode leaves the MTP layer stale
     }
-    if (!use_spec && !use_ngram && !use_chain && !use_df2)
+    if (!use_spec && !use_ngram && !use_chain && !use_df2) {
+      {
+        std::lock_guard<std::mutex> lk(g_sm);
+        sl.suspendable = m.nslots > 1 && m.kv_paged &&
+                         g.mrope_grids.empty() && !has_image_tok(g.ids.data(), g.ids.size());
+        sl.suspend_budget = g.max_tokens;
+      }
       for (int i = 0; i < g.max_tokens; i++) {
         if (eos.count(cur)) {
           reason = "done";
@@ -3973,8 +5179,13 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
         }
         dl_tick();
         if (cancel) break;
+        {
+          std::lock_guard<std::mutex> lk(g_sm);
+          sl.suspend_budget = std::max(0, g.max_tokens - i - 1);
+        }
         m.yield_point();
       }
+    }
     if (dead) {  // client gone: no D line, no end-of-turn snapshot
       perfsnap::write_idle();
       c.in_flight = false;
@@ -4073,6 +5284,9 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       if (hist.size() >= kvs.min_tokens) kvsnap::capture(m, hist, mtp_live, pend);
       kvsnap::commit(m, hist, pend);
     }
+  } catch (const SuspendCancelled&) {
+    snprintf(db, sizeof db, "D %lld cancel 0 0 0.0 0.0\n", (long long)g.req);
+    finish(db);  // detached: the former slot may belong to another request
   } catch (const ReqCancelled& e) {
     // 客户端在 prompt 预填期间断连/取消：decode 取消的同款收尾，D cancel 行。
     // 已写入的分段 KV 属槽位持久状态，直接 reset 回收（同 KvOverflow 注释的语义）。
@@ -4092,6 +5306,12 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     perfsnap::write_idle();
     viz::finish(s);
   } catch (const std::exception& e) {
+    if (tl_detached) {
+      fprintf(stderr, "%s serve: req %lld failed while detached: %s\n",
+              log_ts(), (long long)g.req, e.what());
+      finish(err_line());
+      return;
+    }
     // prefill/decode failure, or KvOverflow (pool exhausted by concurrent
     // requests: this one is the later): the partial state is unknown, so
     // drop it (returning the slot's pages to the pool) and fail the request
@@ -4384,6 +5604,7 @@ static int run(GpuModel& m, const std::string& host, int port) {
   if (m.nslots > 1) {
     m.kv_starve_fn = &starve;
     m.yield_fn = &yield_hook;
+    m.spec_round_fn = &spec_round_hook;
     m.borrow_query_fn = &borrow_query;
     m.borrow_fn = &borrow_turn;
     m.borrow_skip_fn = &borrow_skip;

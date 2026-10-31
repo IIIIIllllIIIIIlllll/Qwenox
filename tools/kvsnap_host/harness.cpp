@@ -82,7 +82,20 @@ static const int MAXCTX = 4096;
 struct GpuModel {
   // geometry: nqsa = 1 QSA layer + 1 MTP layer, BF16 KV, indexer keys on
   bool qsa_kv_fp32 = false, qsa_wmma_btv = false, kv_paged = false, ple_on = true;
-  bool mrope_active_ = false;
+  bool mrope_active_ = false, graphs_ok = false;
+  bool spec_snap = false, ngram_verify_active = false, mtp_tap_capture = false;
+  int rope_delta_ = 0, pf_end = 0, cut_abs = -1, cut_r_ = 0;
+  std::vector<std::array<int, 3>> mrope_pos_;
+  std::vector<std::array<int, 2>> img_inj;
+  struct {
+    int mapped = 0;
+    std::vector<int> tab;
+  } kv_seq;
+  struct {
+    int npages = 0;
+    std::vector<uint16_t> ref;
+    int nfree() const { return npages; }
+  } kv_pool;
   uint64_t img_hash_ = 0;
   std::vector<std::array<int, 3>> mrope_grids_;
   int kv_nl = 2, kv_layer_rows = MAXCTX, index_blocks = MAXCTX / 4,
@@ -265,7 +278,8 @@ static bool disk_ok(const std::string& dir, std::string* info) {
   unsigned long long by = 0;
   for (auto& de : std::filesystem::directory_iterator(dir)) {
     const std::string fn = de.path().filename().string();
-    if (fn == kvsnap::HITS_FILE) continue;  // restore counts, not a cache file
+    if (fn == kvsnap::HITS_FILE || kvsnap::req_dir_name(fn)) continue;
+    if (!de.is_regular_file()) { other++; continue; }
     by += de.file_size();
     if (fn[0] == 'k') ck++;
     else if (fn[0] == 'c') pg++;
@@ -371,6 +385,10 @@ int main(int argc, char** argv) {
   std::string info;
   if (mode == "save") {
     kvsnap::init(m, cfg);
+    bool no_private_dir = true;
+    for (const auto& de : std::filesystem::directory_iterator(dir))
+      if (kvsnap::req_dir_name(de.path().filename().string())) no_private_dir = false;
+    check(no_private_dir, "初始化不创建私有目录");
     save(m, A), save(m, B);
     check(disk_ok(dir, &info), "保存 A、B 后索引 == 磁盘", info);
     bool mt = false;
@@ -432,7 +450,20 @@ int main(int argc, char** argv) {
         std::filesystem::copy_file(de.path(), dir + "/" + kvsnap::ch_name(0x123));
         break;
       }
+    const std::string old = dir + "/kvsnap_req_0000000000000001";
+    const std::string empty_old = dir + "/kvsnap_req_0000000000000002";
+    std::filesystem::create_directory(old);
+    std::filesystem::create_directory(empty_old);
+    { std::ofstream(old + "/s_0000000000000001.kck") << "old"; }
+    { std::ofstream(old + "/tmp_s_0000000000000001_00000000.kvm") << "old"; }
+    { std::ofstream(old + "/notes.txt") << "keep"; }
+    { std::ofstream(empty_old + "/s_0000000000000001_00000000.kvc") << "old"; }
     kvsnap::init(m, cfg);
+    check(!std::filesystem::exists(old + "/s_0000000000000001.kck") &&
+              !std::filesystem::exists(old + "/tmp_s_0000000000000001_00000000.kvm") &&
+              std::filesystem::exists(old + "/notes.txt") &&
+              !std::filesystem::exists(empty_old + "/s_0000000000000001_00000000.kvc"),
+          "旧私有目录仅清理已识别文件，保留其他文件");
     const CkInfo ib = ckinfo(B);
     check(ib.hits == 1 && !ib.hot, "重启后从 kvsnap_hits.txt 读回命中数（B 1 次）",
           "hits " + std::to_string(ib.hits));

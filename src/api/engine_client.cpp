@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <sstream>
@@ -49,6 +50,12 @@ ssize_t platform_recv(sock_t fd, void* p, size_t n) { return ::recv(fd, p, n, 0)
 double now_s() {
     using clock = std::chrono::steady_clock;
     return std::chrono::duration<double>(clock::now().time_since_epoch()).count();
+}
+
+template <typename T>
+bool parse_number(const std::string& text, T* value) {
+    std::istringstream input(text);
+    return static_cast<bool>(input >> *value) && input.eof();
 }
 
 // %.9g: the protocol's float form. Never rounds 0.9999999 up to 1, which
@@ -380,11 +387,14 @@ GenResult EngineClient::generate(const GenParams& p, const TokenFn& on_token,
             return out;
     }
 
-    // --- read T lines until the D terminator ------------------------------
+    // --- read T and W lines until the D terminator ------------------------
     bool saw_any = false;
     bool cancelled = false;
     bool heartbeat = static_cast<bool>(on_wait);
     double next_heartbeat = now_s() + 1.0;
+    // Only a matching, valid T or W refreshes this deadline. W before the
+    // first token does not switch to the between-token timeout.
+    double read_deadline = now_s() + first_timeout_;
     // Grace for the engine's D-ack after a cancel: a healthy engine answers
     // within seconds (its next yield point). If none arrives the connection
     // is wedged (e.g. a desynced stream swallowed the GEN): give up and
@@ -392,8 +402,7 @@ GenResult EngineClient::generate(const GenParams& p, const TokenFn& on_token,
     double cancel_deadline = 0.0;
     // Check heartbeats on a clock, even when buffered T lines keep arriving,
     // and bound idle reads by that clock without changing the overall deadline.
-    auto read_with_wait = [&](std::string* line, double timeout_s) {
-        const double deadline = now_s() + timeout_s;
+    auto read_with_wait = [&](std::string* line) {
         for (;;) {
             if (heartbeat && now_s() >= next_heartbeat) {
                 if (!on_wait()) {
@@ -404,7 +413,7 @@ GenResult EngineClient::generate(const GenParams& p, const TokenFn& on_token,
                 }
                 next_heartbeat = now_s() + 1.0;
             }
-            double left = deadline - now_s();
+            double left = read_deadline - now_s();
             if (cancel_deadline > 0.0)
                 left = std::min(left, cancel_deadline - now_s());
             if (left <= 0.0) {
@@ -414,12 +423,12 @@ GenResult EngineClient::generate(const GenParams& p, const TokenFn& on_token,
             const double slice = heartbeat ? std::min(left, next_heartbeat - now_s()) : left;
             if (slice <= 0.0) continue;
             if (read_line(line, slice)) return true;
-            if (!read_timed_out_ || !heartbeat || now_s() >= deadline) return false;
+            if (!read_timed_out_ || !heartbeat || now_s() >= read_deadline) return false;
         }
     };
     for (;;) {
         std::string l;
-        if (!read_with_wait(&l, saw_any ? next_timeout_ : first_timeout_)) {
+        if (!read_with_wait(&l)) {
             out.timed_out = read_timed_out_;
             if (out.timed_out && !cancelled) cancel(p.req);
             close();
@@ -430,12 +439,25 @@ GenResult EngineClient::generate(const GenParams& p, const TokenFn& on_token,
         std::string kind;
         ss >> kind;
         if (kind == "T") {
+            std::string req_text, tok_text, lp_text, extra;
             long long req = 0;
             int tok = 0;
-            if (!(ss >> req >> tok)) continue;
-            if (req != p.req) continue;
+            if (!(ss >> req_text >> tok_text) || !parse_number(req_text, &req) ||
+                req != p.req || !parse_number(tok_text, &tok)) continue;
             float lp = 0.0f;
-            bool has_lp = (bool)(ss >> lp);
+            bool has_lp = static_cast<bool>(ss >> lp_text);
+            if (has_lp) {
+                if (ss >> extra) continue;
+                if (!parse_number(lp_text, &lp)) {
+                    // The engine can emit -inf. Preserve the old stream parser's
+                    // fallback to zero when it cannot represent a numeric value.
+                    char* end = nullptr;
+                    std::strtof(lp_text.c_str(), &end);
+                    if (end != lp_text.c_str() + lp_text.size()) continue;
+                    has_lp = false;
+                    lp = 0.0f;
+                }
+            }
             saw_any = true;
             out.tokens.push_back(tok);
             out.logprobs.push_back(has_lp ? lp : 0.0f);
@@ -445,6 +467,14 @@ GenResult EngineClient::generate(const GenParams& p, const TokenFn& on_token,
                 cancel(p.req);  // engine acknowledges with its own D line
                 cancel_deadline = now_s() + 10.0;
             }
+            read_deadline = now_s() + next_timeout_;
+        } else if (kind == "W") {
+            std::string req_text, phase, extra;
+            long long req = 0;
+            if (!(ss >> req_text >> phase) || (ss >> extra) ||
+                !parse_number(req_text, &req) || req != p.req ||
+                (phase != "wait" && phase != "resume")) continue;
+            read_deadline = now_s() + (saw_any ? next_timeout_ : first_timeout_);
         } else if (kind == "D") {
             long long req = 0;
             if (!(ss >> req) || req != p.req) continue;

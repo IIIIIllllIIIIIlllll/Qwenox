@@ -1774,7 +1774,7 @@ int main() {
     float* dws;
     TCK(hipMalloc(&dids, P * 16 * 4));
     TCK(hipMalloc(&dws, P * 16 * 4));
-    k_router_topk<<<P, 512>>>(dlg, dids, dws, N, K);
+    k_router_topk<<<P, 512>>>(dlg, dids, dws, N, K, VizTap{});
     std::vector<int> ids(P * 16);
     std::vector<float> ws(P * 16);
     TCK(hipMemcpy(ids.data(), dids, P * 16 * 4, hipMemcpyDeviceToHost));
@@ -4041,6 +4041,49 @@ int main() {
       expect(e.empty(), "a3 pin of an empty prefix");
     }
     printf("%-28s %s\n", "kvpool_pin_cow", ok ? "PASS" : "FAIL");
+    fails += !ok;
+    // Prediction must match the actual free-list delta without changing state.
+    ok = true;
+    {
+      KvPagePool pool;
+      pool.init(8, 1);
+      KvSeqTable seq, peer;
+      seq.init(8, pool.guard());
+      peer.init(8, pool.guard());
+      auto check_prediction = [&](int expected, const char* what) {
+        const auto refs = pool.ref;
+        const auto free = pool.free_;
+        const auto tab = seq.tab;
+        const int mapped = seq.mapped;
+        const int got = GpuModel::kv_reclaimable_pages(pool, seq);
+        expect(got == expected && refs == pool.ref && free == pool.free_ &&
+                   tab == seq.tab && mapped == seq.mapped, what);
+      };
+      check_prediction(0, "reclaim empty");
+      expect(seq.reserve(pool, 3 * KV_PAGE), "reclaim reserve");
+      check_prediction(3, "reclaim private");
+      // Page 0 shared with another sequence, page 1 pinned independently.
+      peer.adopt(pool, {seq.tab[0]});
+      const auto pin = seq.pin(pool, 2 * KV_PAGE);
+      check_prediction(1, "reclaim shared and pinned");
+      KvSeqTable::unpin(pool, pin);
+      check_prediction(2, "reclaim shared after unpin");
+      // Map page 2 twice, each occurrence owning its own reference.
+      const int duplicate = seq.tab[2];
+      pool.addref(duplicate);
+      seq.tab[(size_t)seq.mapped++] = duplicate;
+      check_prediction(2, "reclaim duplicate private");
+      pool.addref(duplicate);
+      check_prediction(1, "reclaim duplicate with external reference");
+      const int before = pool.nfree();
+      const int predicted = GpuModel::kv_reclaimable_pages(pool, seq);
+      seq.trim(pool, 0);
+      expect(pool.nfree() - before == predicted, "reclaim matches trim");
+      pool.unref(duplicate);
+      peer.trim(pool, 0);
+      expect(pool.nfree() == 8, "reclaim conservation");
+    }
+    printf("%-28s %s\n", "kvpool_reclaim_predict", ok ? "PASS" : "FAIL");
     fails += !ok;
   }
 
