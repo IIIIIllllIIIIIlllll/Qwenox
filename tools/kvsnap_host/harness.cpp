@@ -31,10 +31,35 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <sys/syscall.h>
+
+static thread_local bool g_fail_next_new = false;
+static std::atomic<bool> g_alloc_on_sync{false};
+void* operator new(std::size_t n) {
+  if (g_fail_next_new) {
+    g_fail_next_new = false;
+    throw std::bad_alloc();
+  }
+  if (void* p = std::malloc(n)) return p;
+  throw std::bad_alloc();
+}
+void* operator new[](std::size_t n) {
+  if (g_fail_next_new) {
+    g_fail_next_new = false;
+    throw std::bad_alloc();
+  }
+  if (void* p = std::malloc(n)) return p;
+  throw std::bad_alloc();
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
 
 #include "platform_gen.inc"  // POSIX os_* file shims of 00_platform.inc
 static const char* log_ts() { return "[t]"; }
@@ -57,7 +82,9 @@ static bool g_native_dense = false;
 }
 enum hipError_t { hipSuccess = 0 };
 enum hipMemcpyKind { hipMemcpyHostToDevice, hipMemcpyDeviceToHost };
-static hipError_t hipMemcpy(void* d, const void* s, size_t n, hipMemcpyKind) {
+static std::atomic<bool> g_hip_throw{false};
+static hipError_t hipMemcpy(void* d, const void* s, size_t n, hipMemcpyKind kind) {
+  if (kind == hipMemcpyHostToDevice && g_hip_throw.exchange(false)) throw std::bad_alloc();
   memcpy(d, s, n);
   return hipSuccess;
 }
@@ -205,12 +232,13 @@ static bool same_as(GpuModel& m, const std::vector<int>& t) {
   }
   return ok && m.S == g.S && m.conv == g.conv && m.ring == g.ring && m.iraw == g.iraw;
 }
-static void save(GpuModel& m, const std::vector<int>& t) {
+static void save_variant(GpuModel& m, const std::vector<int>& t, bool mtp) {
   prefill(m, t);
   std::vector<kvsnap::Pending> pend;
-  kvsnap::capture(m, t, true, pend);
+  kvsnap::capture(m, t, mtp, pend);
   kvsnap::commit(m, t, pend);
 }
+static void save(GpuModel& m, const std::vector<int>& t) { save_variant(m, t, true); }
 // Restore the longest cached prefix of t + 1 token; returns tokens restored.
 static int restore(GpuModel& m, const std::vector<int>& t, bool* mtp = nullptr) {
   std::vector<int> q = t;
@@ -226,6 +254,30 @@ static int restore(GpuModel& m, const std::vector<int>& t, bool* mtp = nullptr) 
   if (!kvsnap::restore(m, e, q, hist, &mt)) return -1;
   if (mtp) *mtp = mt;
   return (int)hist.size();
+}
+
+static std::atomic<bool> g_sync_slow{false};
+static std::atomic<int> g_sync_cur{0}, g_sync_max{0}, g_sync_gate{0};
+extern "C" int fdatasync(int fd) {
+  char link[64], path[256];
+  snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
+  const ssize_t n = readlink(link, path, sizeof path - 1);
+  if (n > 0) path[n] = 0;
+  const bool checkpoint = n > 0 && strstr(path, "/tmp_k_") != nullptr;
+  if (checkpoint && (g_sync_slow.load() || g_sync_gate.load() == 1)) {
+    const int cur = ++g_sync_cur;
+    int old = g_sync_max.load();
+    while (old < cur && !g_sync_max.compare_exchange_weak(old, cur)) {
+    }
+    if (g_sync_gate.load() == 1) {
+      while (g_sync_gate.load() == 1) usleep(100);
+    } else {
+      usleep(5000);
+    }
+    --g_sync_cur;
+  }
+  if (checkpoint && g_alloc_on_sync.exchange(false)) g_fail_next_new = true;
+  return (int)syscall(SYS_fdatasync, fd);
 }
 
 // Slow deletes (3 ms, like a share): widens the window in which a queued or
@@ -351,6 +403,140 @@ static void test_two_segment(GpuModel& m, const std::string& dir) {
         "hits " + std::to_string(id.hits) + " hot " + std::to_string(id.hot));
 }
 
+static bool published_consistent(GpuModel& m, const std::string& dir,
+                                 const std::vector<int>& t, std::string& info) {
+  const std::string name = ckname(t);
+  int count = 0, nl = 0;
+  bool pub = false, mtp = false;
+  uint64_t bytes = 0;
+  {
+    std::lock_guard<std::mutex> lk(kvsnap::g_mtx);
+    for (const auto& e : kvsnap::g_ck)
+      if (e->name == name) {
+        count++;
+        pub = e->pub;
+        mtp = e->mtp;
+        nl = e->nl;
+        bytes = e->bytes;
+      }
+  }
+  kvsnap::CkHdr h{};
+  const std::string path = dir + "/" + name;
+  std::ifstream f(path, std::ios::binary);
+  f.read((char*)&h, sizeof h);
+  std::error_code ec;
+  const uint64_t fsz = std::filesystem::file_size(path, ec);
+  bool ok = count == 1 && pub && f.good() && !ec && !!h.mtp == mtp && h.nl == nl && fsz == bytes;
+  if (!ok) {
+    info = name + " index/disk mismatch";
+    return false;
+  }
+  bool restored_mtp = false;
+  const int r = restore(m, t, &restored_mtp);
+  ok = r == (int)t.size() && restored_mtp == mtp && (!mtp || same_as(m, t));
+  char b[192];
+  snprintf(b, sizeof b, "%s: index mtp=%d, disk mtp=%d, restore=%d", name.c_str(), (int)mtp,
+           (int)!!h.mtp, r);
+  info = b;
+  return ok;
+}
+
+static void test_publish_and_exceptions(GpuModel& m, const std::string& dir) {
+  bool races_ok = true;
+  for (int i = 0; i < 8; i++) {
+    const auto t = toks(320 + i, 60 + i);
+    g_sync_cur = g_sync_max = 0;
+    g_sync_slow = true;
+    g_sync_gate = 1;
+    save_variant(m, t, false);
+    save_variant(m, t, true);
+    g_sync_gate = 2;
+    kvsnap::sync_line();
+    g_sync_gate = 0;
+    g_sync_slow = false;
+    std::string info, disk_info;
+    const bool serialized = g_sync_max.load() <= 1;
+    const bool consistent = published_consistent(m, dir, t, info);
+    const bool disk = disk_ok(dir, &disk_info);
+    if (!serialized || !consistent || !disk)
+      printf("    upgrade %d: serialized=%d consistent=%d disk=%d %s %s\n", i, (int)serialized,
+             (int)consistent, (int)disk, info.c_str(), disk_info.c_str());
+    races_ok = races_ok && serialized && consistent && disk;
+  }
+  check(races_ok, "同名无 MTP/有 MTP 并发发布：写入串行且索引、磁盘、恢复一致");
+
+  kvsnap::sync_line();
+  {
+    std::lock_guard<std::mutex> lk(kvsnap::g_pool_mtx);
+    kvsnap::g_pool.clear();
+    kvsnap::g_pool.shrink_to_fit();
+    kvsnap::g_pool_bytes = 0;
+  }
+  kvsnap::HBuf hb = kvsnap::buf_get(4096);
+  g_fail_next_new = true;
+  kvsnap::buf_put(std::move(hb));
+  bool pool_failed_cleanly = !g_fail_next_new;
+  {
+    std::lock_guard<std::mutex> lk(kvsnap::g_pool_mtx);
+    pool_failed_cleanly = pool_failed_cleanly && kvsnap::g_pool.empty() && kvsnap::g_pool_bytes == 0;
+  }
+  kvsnap::buf_put(std::move(hb));
+  hb = kvsnap::buf_get(1);
+  check(pool_failed_cleanly && hb.p && kvsnap::g_pool_bytes == 0,
+        "缓冲池分配异常：不入池、记账不破，下一次 put/get 正常");
+
+  const auto bad = toks(777, 700), good = toks(888, 701);
+  g_alloc_on_sync = true;
+  save(m, bad);
+  kvsnap::sync_line();
+  const bool injected = !g_alloc_on_sync.load();
+  g_alloc_on_sync = false;
+  bool bad_left = false;
+  uint64_t qb = 0;
+  int wb = 0;
+  {
+    std::lock_guard<std::mutex> lk(kvsnap::g_mtx);
+    qb = kvsnap::g_q_bytes;
+    wb = kvsnap::g_wbusy;
+    for (const auto& e : kvsnap::g_ck) bad_left = bad_left || e->name == ckname(bad);
+  }
+  std::string info;
+  check(injected && qb == 0 && wb == 0 && !bad_left && !exists(dir, ckname(bad)) &&
+            disk_ok(dir, &info),
+        "writer 分配异常：当前保存失败、队列无残留、临时文件已清理", info);
+  save(m, good);
+  kvsnap::sync_line();
+  const int good_r = restore(m, good);
+  check(good_r == (int)good.size() && same_as(m, good) && disk_ok(dir, &info),
+        "writer 异常后继续处理后续保存并逐字节恢复", info);
+
+  std::vector<int> q = good;
+  q.push_back(7);
+  auto e = kvsnap::match(q, kvsnap::g_fp);
+  if (!e) {
+    check(false, "restore 分配异常：找不到刚保存的检查点");
+    return;
+  }
+  bool threw = false;
+  std::vector<int> hist;
+  bool mt = false;
+  g_hip_throw = true;
+  try {
+    kvsnap::restore(m, e, q, hist, &mt);
+  } catch (const std::bad_alloc&) {
+    threw = true;
+  }
+  int busy = -1;
+  {
+    std::lock_guard<std::mutex> lk(kvsnap::g_mtx);
+    busy = e->busy;
+  }
+  check(e && threw && busy == 0, "restore 分配异常：busy 引用恰好释放一次");
+  const int rr = restore(m, good);
+  check(rr == (int)good.size() && same_as(m, good) && e->busy == 0,
+        "restore 异常后同一检查点仍可正常恢复");
+}
+
 int main(int argc, char** argv) {
   // serve-only entry points (tier choice, pause checkpoints): not exercised here
   (void)&kvsnap::capture_ram;
@@ -365,6 +551,7 @@ int main(int argc, char** argv) {
   cfg.dir = dir;
   cfg.min_tokens = 1;
   cfg.cap_bytes = 1ull << 40;
+  cfg.direct = false;  // fdatasync interposition: deterministic publication/fault tests
   cfg.writers = 4;  // network-style parallel writers: the racy configuration
   const auto A = toks(1300, 1), B = toks(1700, 2, std::vector<int>(A.begin(), A.begin() + 600)),
              C = toks(1500, 3);
@@ -415,6 +602,7 @@ int main(int argc, char** argv) {
     save(m, A), save(m, B), save(m, C);
     check(disk_ok(dir, &info) && exists(dir, ckA), "再存 A、B、C：索引 == 磁盘", info);
     test_two_segment(m, dir);
+    test_publish_and_exceptions(m, dir);
     // B: one restore above, kept across the restart (kvsnap_hits.txt)
     FILE* f = fopen((dir + ".index").c_str(), "w");
     fputs(kvsnap::sync_line().c_str(), f);

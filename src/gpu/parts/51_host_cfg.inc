@@ -233,12 +233,17 @@ static HBuf buf_get(size_t n) {
   b.n = n;
   return b;
 }
-static void buf_put(HBuf&& b) {
+static void buf_put(HBuf&& b) noexcept {
   if (!b.p) return;
-  std::lock_guard<std::mutex> lk(g_pool_mtx);
-  if (g_pool_bytes + b.cap > g_pool_max) return;  // freed on scope exit
-  g_pool_bytes += b.cap;
-  g_pool.push_back(std::move(b));
+  const size_t cap = b.cap;
+  try {
+    std::lock_guard<std::mutex> lk(g_pool_mtx);
+    if (g_pool_bytes > g_pool_max || cap > g_pool_max - g_pool_bytes) return;
+    g_pool.push_back(std::move(b));
+    g_pool_bytes += cap;
+  } catch (...) {
+    // The local HBuf still frees the storage when pooling is unavailable.
+  }
 }
 
 // ---- files -------------------------------------------------------------------
@@ -269,13 +274,18 @@ static int64_t now_t() {
 // paused Windows console behind the launcher's pipe), and blocking while
 // holding g_mtx froze the GPU thread at its next match/enqueue/Turn.
 static thread_local std::string tl_log;
-__attribute__((format(printf, 1, 2))) static void logf_locked(const char* fmt, ...) {
+__attribute__((format(printf, 1, 2))) static void logf_locked(const char* fmt, ...) noexcept {
   char b[512];
   va_list ap;
   va_start(ap, fmt);
   const int k = vsnprintf(b, sizeof b, fmt, ap);
   va_end(ap);
-  if (k > 0) tl_log.append(b, std::min((size_t)k, sizeof b - 1));
+  if (k > 0)
+    try {
+      tl_log.append(b, std::min((size_t)k, sizeof b - 1));
+    } catch (...) {
+      // Logging must not strand an index update under memory pressure.
+    }
 }
 static void flush_log() {  // call with g_mtx NOT held
   if (tl_log.empty()) return;
@@ -320,6 +330,13 @@ static void direct_unsupported(const char* op) {
 // `p` is an HBuf's data (aligned, padded capacity).
 static bool write_file(const std::string& name, const char* p, size_t n) {
   const std::string tmp = path_of("tmp_" + name);
+  struct TmpCleanup {
+    const std::string& path;
+    ~TmpCleanup() {
+      std::error_code ec;
+      std::filesystem::remove(path, ec);
+    }
+  } cleanup{tmp};
   bool ok = false, done = false;
   if (g_direct.load()) {
     const int rc = os_write_direct(tmp.c_str(), p, n);
@@ -338,7 +355,6 @@ static bool write_file(const std::string& name, const char* p, size_t n) {
     std::filesystem::rename(tmp, path_of(name), ec);
     ok = !ec;
   }
-  if (!ok) std::filesystem::remove(tmp, ec);
   return ok;
 }
 // Whole file into a pooled buffer; `want` = exact expected size (0 = any,
@@ -415,15 +431,23 @@ static std::string g_jcur;    // name being deleted right now
 static bool g_jbusy = false;  // the janitor holds an operation
 static bool g_hits_q = false; // a J_HITS is queued
 static const char* const HITS_FILE = "kvsnap_hits.txt";
-static void del_locked(const std::string& name) {
-  g_jq.push_back({name, J_DEL});
-  g_cv.notify_all();
+static void del_locked(const std::string& name) noexcept {
+  try {
+    g_jq.push_back({name, J_DEL});
+    g_cv.notify_all();
+  } catch (...) {
+    // Index settlement stays non-throwing under memory pressure. An orphaned
+    // file is harmless and is removed by the next startup scan.
+  }
 }
-static void hits_dirty_locked() {
+static void hits_dirty_locked() noexcept {
   if (g_hits_q) return;
-  g_hits_q = true;
-  g_jq.push_back({std::string(), J_HITS});
-  g_cv.notify_all();
+  try {
+    g_jq.push_back({std::string(), J_HITS});
+    g_hits_q = true;
+    g_cv.notify_all();
+  } catch (...) {
+  }
 }
 // The index holds this name (published or pending): its file is wanted.
 static bool live_locked(const std::string& n) {
@@ -437,17 +461,22 @@ static bool live_locked(const std::string& n) {
   return false;
 }
 
-static void unref_locked(std::unordered_map<uint64_t, Blk>& mp, uint64_t key, bool mtp) {
+static void unref_locked(std::unordered_map<uint64_t, Blk>& mp, uint64_t key,
+                         bool mtp) noexcept {
   auto it = mp.find(key);
   if (it == mp.end() || --it->second.refs > 0) return;
   if (it->second.st == ST_PEND) return;  // the writer deletes it on publish
   if (it->second.st == ST_PUB) {
-    del_locked(mtp ? mt_name(key) : ch_name(key));
+    try {
+      del_locked(mtp ? mt_name(key) : ch_name(key));
+    } catch (...) {
+      // The name allocation failed; the next startup removes the orphan.
+    }
     g_total -= it->second.bytes;
   }
   mp.erase(it);
 }
-static void drop_ck_locked(std::shared_ptr<CkEnt> e, bool del_file) {
+static void drop_ck_locked(std::shared_ptr<CkEnt> e, bool del_file) noexcept {
   auto it = std::find(g_ck.begin(), g_ck.end(), e);
   if (it == g_ck.end()) return;
   g_ck.erase(it);
@@ -473,7 +502,7 @@ static void drop_ck_locked(std::shared_ptr<CkEnt> e, bool del_file) {
 // every checkpoint hot. g_hot_hits == 0: plain LRU.
 static int g_hot_hits = 2;
 static double g_hot_frac = 0.5;
-static void demote_locked() {
+static void demote_locked() noexcept {
   uint64_t hot_b = 0;
   for (auto& e : g_ck)
     if (e->pub && e->hot) hot_b += e->bytes;
@@ -491,7 +520,7 @@ static void demote_locked() {
     hits_dirty_locked();
   }
 }
-static void evict_locked(const CkEnt* keep) {
+static void evict_locked(const CkEnt* keep) noexcept {
   demote_locked();
   while (g_total > g_cap) {
     std::shared_ptr<CkEnt> v;  // probation before hot, LRU within a segment
@@ -506,13 +535,17 @@ static void evict_locked(const CkEnt* keep) {
     drop_ck_locked(v, true);
   }
 }
-static void touch_locked(const std::shared_ptr<CkEnt>& e) {
+static void touch_locked(const std::shared_ptr<CkEnt>& e) noexcept {
   e->t = now_t();
-  g_jq.push_back({e->name, J_TOUCH});  // the file mtime carries it across restarts
-  g_cv.notify_all();
+  try {
+    g_jq.push_back({e->name, J_TOUCH});  // the file mtime carries it across restarts
+    g_cv.notify_all();
+  } catch (...) {
+    // The in-memory LRU is still updated; missing an mtime bump is non-fatal.
+  }
 }
 // A successful restore of `e`.
-static void hit_locked(const std::shared_ptr<CkEnt>& e) {
+static void hit_locked(const std::shared_ptr<CkEnt>& e) noexcept {
   touch_locked(e);
   e->hits++;
   if (g_hot_hits > 0 && !e->hot && e->hits >= g_hot_hits) {
@@ -556,59 +589,82 @@ static std::unordered_map<std::string, int> read_hits() {
   return mp;
 }
 
-static void janitor() {
-  int nd = 0;  // deletes of the current burst (logged when the queue drains)
-  double ds = 0;
-  for (;;) {
-    JOp op;
-    std::string hits;  // J_HITS: the file text, snapshotted under the lock
-    {
-      std::unique_lock<std::mutex> lk(g_mtx);
-      g_cv.wait(lk, [] { return !g_jq.empty(); });
-      op = std::move(g_jq.front());
-      g_jq.pop_front();
-      if (op.op == J_HITS) {
-        g_hits_q = false;
-        hits = hits_text_locked();
-      } else if ((op.op == J_DEL) == live_locked(op.name)) {  // re-created / already gone
-        lk.unlock();
-        g_cv.notify_all();
-        continue;
-      }
-      g_jbusy = true;
-      if (op.op == J_DEL) g_jcur = op.name;
-    }
-    const auto t0 = std::chrono::steady_clock::now();
-    std::error_code ec;
-    if (op.op == J_DEL)
-      std::filesystem::remove(path_of(op.name), ec);
-    else if (op.op == J_TOUCH)
-      std::filesystem::last_write_time(path_of(op.name),
-                                       std::filesystem::file_time_type::clock::now(), ec);
-    else
-      write_hits(hits);
-    bool drained;
-    {
+struct JActive {
+  bool active = false;
+  void arm() noexcept { active = true; }
+  bool finish() noexcept {
+    bool drained = false;
+    if (!active) return drained;
+    try {
       std::lock_guard<std::mutex> lk(g_mtx);
       g_jbusy = false;
       g_jcur.clear();
       drained = g_jq.empty();
+      active = false;
+    } catch (...) {
     }
     g_cv.notify_all();
-    if (op.op != J_DEL) continue;
-    nd++;
-    ds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    // Windows: a sharing violation (antivirus scan, indexer, an open handle)
-    // leaves the file on disk although the index already dropped its bytes
-    if (ec)
-      fprintf(stderr, "kvsnap: cannot delete %s (error %d); the file stays on disk\n",
-              op.name.c_str(), ec.value());
-    if (drained) {
-      if (nd >= 16 || ds >= 0.5)
-        fprintf(stderr, "%s kvsnap: deleted %d files in %.2fs (background)\n", log_ts(), nd,
-                ds);
-      nd = 0;
-      ds = 0;
+    return drained;
+  }
+  ~JActive() { finish(); }
+};
+
+static void janitor() {
+  int nd = 0;  // deletes of the current burst (logged when the queue drains)
+  double ds = 0;
+  for (;;) {
+    JActive active;
+    try {
+      JOp op;
+      std::string hits;  // J_HITS: the file text, snapshotted under the lock
+      {
+        std::unique_lock<std::mutex> lk(g_mtx);
+        g_cv.wait(lk, [] { return !g_jq.empty(); });
+        op = std::move(g_jq.front());
+        g_jq.pop_front();
+        if (op.op == J_HITS) {
+          g_hits_q = false;
+          hits = hits_text_locked();
+        } else if ((op.op == J_DEL) == live_locked(op.name)) {  // re-created / already gone
+          lk.unlock();
+          g_cv.notify_all();
+          continue;
+        }
+        g_jbusy = true;
+        active.arm();
+        if (op.op == J_DEL) g_jcur = op.name;
+      }
+      const auto t0 = std::chrono::steady_clock::now();
+      std::error_code ec;
+      if (op.op == J_DEL)
+        std::filesystem::remove(path_of(op.name), ec);
+      else if (op.op == J_TOUCH)
+        std::filesystem::last_write_time(path_of(op.name),
+                                         std::filesystem::file_time_type::clock::now(), ec);
+      else
+        write_hits(hits);
+      const bool drained = active.finish();
+      if (op.op != J_DEL) continue;
+      nd++;
+      ds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+      // Windows: a sharing violation (antivirus scan, indexer, an open handle)
+      // leaves the file on disk although the index already dropped its bytes
+      if (ec)
+        fprintf(stderr, "kvsnap: cannot delete %s (error %d); the file stays on disk\n",
+                op.name.c_str(), ec.value());
+      if (drained) {
+        if (nd >= 16 || ds >= 0.5)
+          fprintf(stderr, "%s kvsnap: deleted %d files in %.2fs (background)\n", log_ts(), nd,
+                  ds);
+        nd = 0;
+        ds = 0;
+      }
+    } catch (const std::exception& e) {
+      active.finish();
+      fprintf(stderr, "kvsnap: janitor operation skipped after exception: %s\n", e.what());
+    } catch (...) {
+      active.finish();
+      fprintf(stderr, "kvsnap: janitor operation skipped after unknown exception\n");
     }
   }
 }
@@ -637,6 +693,91 @@ static int g_wbusy = 0;         // writers holding an item
 static bool g_pw_on = false;
 static std::chrono::steady_clock::time_point g_pw_t0, g_pw_t1;
 
+// Publishing the same name must be ordered through both the file replacement and
+// its index settlement. Hash collisions only reduce parallelism across files.
+static std::mutex g_file_mu[64];
+static std::unique_lock<std::mutex> file_lock(const std::string& name) {
+  return std::unique_lock<std::mutex>(g_file_mu[std::hash<std::string>{}(name) & 63]);
+}
+struct WAccount {
+  size_t len;
+  bool active = true;
+  void finish() noexcept {
+    if (!active) return;
+    try {
+      std::lock_guard<std::mutex> lk(g_mtx);
+      g_q_bytes -= len;
+      g_wbusy--;
+      active = false;
+    } catch (...) {
+    }
+    g_cv.notify_all();
+  }
+  ~WAccount() { finish(); }
+};
+
+// Called at most once per item. The caller holds the file lock for `name`.
+static void finish_item(Item& it, size_t len, const std::string& name, bool go, bool ok,
+                        std::chrono::steady_clock::time_point w0,
+                        std::chrono::steady_clock::time_point w1) {
+  const double ws = std::chrono::duration<double>(w1 - w0).count();
+  std::lock_guard<std::mutex> lk(g_mtx);
+  if (it.kind < 2) {
+    if (w1 > g_pw_t1) g_pw_t1 = w1;
+    auto& mp = it.kind ? g_mt : g_ch;
+    auto f = mp.find(it.key);
+    if (f == mp.end() || f->second.refs == 0) {
+      if (ok) del_locked(name);  // every referencing checkpoint is gone
+      if (f != mp.end()) mp.erase(f);
+    } else if (ok) {
+      f->second.st = ST_PUB;
+      f->second.bytes = len;
+      g_total += len;
+    } else {
+      f->second.st = ST_FAIL;  // erased with its last reference
+      logf_locked("kvsnap: write of %s failed (non-fatal)\n", name.c_str());
+    }
+    return;
+  }
+  const auto& e = it.ck;
+  if (!ok) {
+    logf_locked("kvsnap: save of %d tokens failed (%s, non-fatal)\n", e->n,
+                go ? "write error" : "a page write failed");
+    drop_ck_locked(e, false);
+    return;
+  }
+  // Same state saved before without MTP state: this file replaced it (it
+  // inherits the restore count and segment). The file lock keeps this index
+  // replacement in the same order as the rename on disk.
+  for (auto& o : g_ck)
+    if (o != e && o->pub && o->name == e->name) {
+      e->hits = o->hits;
+      e->hot = o->hot;
+      drop_ck_locked(o, false);
+      break;
+    }
+  e->pub = true;
+  e->bytes = len;
+  e->t = now_t();
+  g_total += len;
+  // "pages write": wall time of the page files written since the last
+  // checkpoint log (this commit's new pages, unless commits overlap)
+  const double pw = g_pw_on ? std::chrono::duration<double>(g_pw_t1 - g_pw_t0).count() : 0.0;
+  logf_locked("%s kvsnap: saved %d tokens -> %s (ckpt %.1f MB + %d new pages%s "
+              "%.1f MB; capture %.2fs, %s IO pages write %.2fs, write %.2fs%s; "
+              "total %.2f GB)\n",
+              log_ts(), e->n, e->name.c_str(), len / 1048576.0, it.new_ch,
+              it.new_mt ? " + mtp" : "", it.new_b / 1048576.0, it.cap_s,
+              g_direct.load() ? "direct" : "buffered", pw > 0 ? pw : 0.0, ws,
+              e->mtp ? ", mtp" : "", g_total / 1073741824.0);
+  try {
+    crashdiag::note("kvsnap saved %d tokens (%.1f MB)", e->n, len / 1048576.0);
+  } catch (...) {
+  }
+  g_pw_on = false;
+  evict_locked(e.get());
+}
+
 static void writer() {
   for (;;) {
     Item it;
@@ -648,98 +789,67 @@ static void writer() {
       g_wbusy++;
     }
     const size_t len = it.buf.n;
+    WAccount account{len};
     char* p = it.buf.data();
     std::string name;
-    bool go = true;
-    if (it.kind == 2) {
-      std::unique_lock<std::mutex> lk(g_mtx);
-      g_cv.wait_for(lk, std::chrono::seconds(60), [&] {
+    std::unique_lock<std::mutex> file_lk;
+    bool go = true, ok = false, settle_started = false;
+    std::chrono::steady_clock::time_point w0, w1;
+    auto recover = [&](const char* error) {
+      fprintf(stderr, "kvsnap: writer item failed after %s; continuing\n",
+              error ? error : "unknown exception");
+      if (settle_started) return;
+      try {
+        if (!file_lk.owns_lock())
+          file_lk = file_lock(name.empty() && it.kind == 2 ? it.ck->name : name);
+        settle_started = true;
+        finish_item(it, len, name, go, ok, w0, w1);
+      } catch (...) {
+        // The accounting guard still releases this item and wakes KVSYNC.
+      }
+    };
+    try {
+      if (it.kind == 2) {
+        std::unique_lock<std::mutex> lk(g_mtx);
+        g_cv.wait_for(lk, std::chrono::seconds(60), [&] {
+          for (uint64_t k : it.ck->chunks) {
+            auto f = g_ch.find(k);
+            if (f != g_ch.end() && f->second.st == ST_PEND) return false;
+          }
+          return true;
+        });
         for (uint64_t k : it.ck->chunks) {
           auto f = g_ch.find(k);
-          if (f != g_ch.end() && f->second.st == ST_PEND) return false;
+          if (f == g_ch.end() || f->second.st != ST_PUB) go = false;
         }
-        return true;
-      });
-      for (uint64_t k : it.ck->chunks) {
-        auto f = g_ch.find(k);
-        if (f == g_ch.end() || f->second.st != ST_PUB) go = false;
-      }
-      name = it.ck->name;
-    } else {
-      name = it.kind ? mt_name(it.key) : ch_name(it.key);
-    }
-    {  // an earlier copy of this name is being deleted: publish after it
-      std::unique_lock<std::mutex> lk(g_mtx);
-      g_cv.wait(lk, [&] { return g_jcur != name; });
-    }
-    const size_t hb = it.kind == 2 ? sizeof(CkHdr) : sizeof(ChHdr);
-    const uint64_t sum = sum64(p + hb, len - hb);
-    memcpy(p + (it.kind == 2 ? offsetof(CkHdr, sum) : offsetof(ChHdr, sum)), &sum, 8);
-    const auto w0 = std::chrono::steady_clock::now();
-    if (it.kind < 2) {
-      std::lock_guard<std::mutex> lk(g_mtx);
-      if (!g_pw_on) g_pw_on = true, g_pw_t0 = w0;
-    }
-    const bool ok = go && write_file(name, p, len);
-    const auto w1 = std::chrono::steady_clock::now();
-    const double ws = std::chrono::duration<double>(w1 - w0).count();
-    {
-      std::lock_guard<std::mutex> lk(g_mtx);
-      g_q_bytes -= len;
-      if (it.kind < 2) {
-        if (w1 > g_pw_t1) g_pw_t1 = w1;
-        auto& mp = it.kind ? g_mt : g_ch;
-        auto f = mp.find(it.key);
-        if (f == mp.end() || f->second.refs == 0) {
-          if (ok) del_locked(name);  // every referencing checkpoint is gone
-          if (f != mp.end()) mp.erase(f);
-        } else if (ok) {
-          f->second.st = ST_PUB;
-          f->second.bytes = len;
-          g_total += len;
-        } else {
-          f->second.st = ST_FAIL;  // erased with its last reference
-          logf_locked("kvsnap: write of %s failed (non-fatal)\n", name.c_str());
-        }
+        name = it.ck->name;
       } else {
-        const auto& e = it.ck;
-        if (!ok) {
-          logf_locked("kvsnap: save of %d tokens failed (%s, non-fatal)\n", e->n,
-                      go ? "write error" : "a page write failed");
-          drop_ck_locked(e, false);
-        } else {
-          // same state saved before without MTP state: this file replaced it
-          // (it inherits the restore count and segment)
-          for (auto& o : g_ck)
-            if (o != e && o->name == e->name) {
-              e->hits = o->hits;
-              e->hot = o->hot;
-              drop_ck_locked(o, false);
-              break;
-            }
-          e->pub = true;
-          e->bytes = len;
-          e->t = now_t();
-          g_total += len;
-          // "pages write": wall time of the page files written since the last
-          // checkpoint log (this commit's new pages, unless commits overlap)
-          const double pw =
-              g_pw_on ? std::chrono::duration<double>(g_pw_t1 - g_pw_t0).count() : 0.0;
-          logf_locked("%s kvsnap: saved %d tokens -> %s (ckpt %.1f MB + %d new pages%s "
-                      "%.1f MB; capture %.2fs, %s IO pages write %.2fs, write %.2fs%s; "
-                      "total %.2f GB)\n",
-                      log_ts(), e->n, e->name.c_str(), len / 1048576.0, it.new_ch,
-                      it.new_mt ? " + mtp" : "", it.new_b / 1048576.0, it.cap_s,
-                      g_direct.load() ? "direct" : "buffered", pw > 0 ? pw : 0.0, ws,
-                      e->mtp ? ", mtp" : "", g_total / 1073741824.0);
-          crashdiag::note("kvsnap saved %d tokens (%.1f MB)", e->n, len / 1048576.0);
-          g_pw_on = false;
-          evict_locked(e.get());
-        }
+        name = it.kind ? mt_name(it.key) : ch_name(it.key);
       }
-      g_wbusy--;
+      {  // an earlier copy of this name is being deleted: publish after it
+        std::unique_lock<std::mutex> lk(g_mtx);
+        g_cv.wait(lk, [&] { return g_jcur != name; });
+      }
+      const size_t hb = it.kind == 2 ? sizeof(CkHdr) : sizeof(ChHdr);
+      const uint64_t sum = sum64(p + hb, len - hb);
+      memcpy(p + (it.kind == 2 ? offsetof(CkHdr, sum) : offsetof(ChHdr, sum)), &sum, 8);
+      w0 = std::chrono::steady_clock::now();
+      if (it.kind < 2) {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        if (!g_pw_on) g_pw_on = true, g_pw_t0 = w0;
+      }
+      file_lk = file_lock(name);
+      ok = go && write_file(name, p, len);
+      w1 = std::chrono::steady_clock::now();
+      settle_started = true;
+      finish_item(it, len, name, go, ok, w0, w1);
+    } catch (const std::exception& e) {
+      recover(e.what());
+    } catch (...) {
+      recover(nullptr);
     }
-    g_cv.notify_all();
+    account.finish();
+    if (file_lk.owns_lock()) file_lk.unlock();
     flush_log();  // g_mtx released: a blocked stderr no longer stalls the GPU thread
     buf_put(std::move(it.buf));
   }
@@ -1143,10 +1253,30 @@ static void note_prefill(size_t n, double ms) {
   g_pf_tps = g_pf_tps > 0 ? 0.7 * g_pf_tps + 0.3 * tps : tps;
 }
 // Drop a match() that is not restored (its busy mark).
-static void release(const std::shared_ptr<CkEnt>& e) {
-  std::lock_guard<std::mutex> lk(g_mtx);
-  e->busy--;
+static void release(const std::shared_ptr<CkEnt>& e) noexcept {
+  if (!e) return;
+  try {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    e->busy--;
+  } catch (...) {
+  }
+  g_cv.notify_all();
 }
+struct BusyGuard {
+  std::shared_ptr<CkEnt> e;
+  bool active = false;
+  BusyGuard() = default;
+  explicit BusyGuard(std::shared_ptr<CkEnt> e_) : e(std::move(e_)), active(e != nullptr) {}
+  BusyGuard(const BusyGuard&) = delete;
+  BusyGuard& operator=(const BusyGuard&) = delete;
+  void drop() noexcept {
+    if (!active) return;
+    active = false;
+    release(e);
+  }
+  void disarm() noexcept { active = false; }
+  ~BusyGuard() { drop(); }
+};
 // Restore `e` rather than a RAM checkpoint of `ram_n` tokens? A RAM
 // checkpoint that carries the MTP state wins over one here that does not
 // (the turn would decode without speculation).
@@ -1455,6 +1585,7 @@ static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& pro
 static bool restore(GpuModel& m, const std::shared_ptr<CkEnt>& e,
                     const std::vector<int>& prompt, std::vector<int>& hist,
                     bool* mtp_out) {
+  BusyGuard busy{e};
   *mtp_out = false;
   crashdiag::note("kvsnap restore %d tokens from %.60s", e->n, e->name.c_str());
   const auto t0 = std::chrono::steady_clock::now();
@@ -1462,9 +1593,9 @@ static bool restore(GpuModel& m, const std::shared_ptr<CkEnt>& e,
   int npages = 0;
   RsTime tm;
   const int rc = restore_body(m, *e, prompt, mtp_out, &bad, &npages, tm);
+  busy.drop();
   {
     std::lock_guard<std::mutex> lk(g_mtx);
-    e->busy--;
     if (rc == RS_OK) {
       hit_locked(e);
     } else if (rc == RS_CKPT) {
@@ -3334,6 +3465,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       // vision prompt (g_fp).
       ssd_ck = kvsnap::match(g.ids, kvsnap::seed_for(is_mrope, req_ih, g.mrope_grids),
                              kvsnap::g_fp);
+    kvsnap::BusyGuard ssd_busy{ssd_ck};
     if (!cont && rckpt::enabled()) {
       // RAM checkpoint tier (llama.cpp-style PARTIAL_ONLY): only GDN
       // state is stored; validity requires the checkpoint tokens to be a
@@ -3364,7 +3496,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       }
     }
     if (ssd_ck && cont) {  // the RAM tier won: drop the SSD match
-      kvsnap::release(ssd_ck);
+      ssd_busy.drop();
       ssd_ck.reset();
     }
     if (ssd_ck) {
@@ -3372,6 +3504,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       // it too. restore() releases the match.
       std::shared_ptr<kvsnap::CkEnt> ck = std::move(ssd_ck);
       bool ck_mtp = false;
+      ssd_busy.disarm();  // restore() owns the same busy reference from here
       if (kvsnap::restore(m, ck, g.ids, hist, &ck_mtp)) {  // hist := its tokens
         mcp = hist.size();
         cont = true;

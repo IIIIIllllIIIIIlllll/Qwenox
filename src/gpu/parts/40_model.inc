@@ -2608,7 +2608,7 @@ struct GpuModel {
 #ifdef _WIN32
     if (g_ple_win.ok()) {
       uint64_t a64[16];
-      uint8_t stg[16 * 160];
+      uint8_t stg[16 * 320];  // largest PLE row: bf16, 160 values * 2 bytes
       for (int h = 0; h < 16; h++) a64[h] = (uint64_t)(uintptr_t)addrs[h];
       g_ple_win.run(a64, stg, (uint64_t)(uintptr_t)ple_table->data, 16);
       for (int h = 0; h < 16; h++) ple_deq(stg + h * g_ple_rb, dst + h * 160);

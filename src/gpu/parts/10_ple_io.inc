@@ -6,9 +6,9 @@
 // setup failure (fd open/fadvise, table not in the base mapping, ring setup)
 // falls back to the old path at runtime.
 // Windows: IOCP（I/O completion port）批量 overlapped ReadFile，语义与
-// io_uring 路径逐字节一致：同样的 (addrs, staging, table_va) 接口、同样的
-// "失败即 fatal"约定。缓冲句柄（不加 NO_BUFFERING——160B 行不对齐扇区），
-// 热行走缓存、冷行高队列深度下 NVMe 随机读（QD=512）。
+// io_uring 路径逐字节一致：同样的 (addrs, staging, table_va) 接口。提交或读取
+// 失败的行从同一映射表同步补齐；非法完成指针仍按内存安全错误 fatal。
+// 缓冲句柄（不加 NO_BUFFERING——160B 行不对齐扇区），热行走缓存、冷行高队列深度下 NVMe 随机读（QD=512）。
 static uint64_t g_ple_foff = 0;  // file offset of the PLE table in that file
 static bool g_ple_off_ok = false;
 // bytes per PLE row (160 codes): 160 = hgn fp8 (dtype 10), 90 = GGUF IQ4_NL
@@ -107,8 +107,9 @@ struct PleUring {
 
   // Pump n preads of g_ple_rb B each: row i -> staging + i*rb, file offset
   // g_ple_foff + (addrs[i] - table_va). Keeps the ring full; CQE order is
-  // irrelevant (distinct destinations). Any failed or short read is fatal —
-  // no silent mid-batch fallback onto half-written staging.
+  // irrelevant (distinct destinations). A failed or short row read is copied
+  // from the same mapping after its CQE arrives; ring submission errors are
+  // fatal because the accepted submission count is then unknown.
   void run(const uint64_t* addrs, uint8_t* staging, uint64_t table_va,
            size_t n) {
     std::lock_guard<std::mutex> lk(run_mu);
@@ -144,10 +145,17 @@ struct PleUring {
       for (; ch != ct; ch++) {
         const io_uring_cqe* c = &cqes[ch & *cq_mask];
         if (c->res != (int)g_ple_rb) {
-          fprintf(stderr, "ple_uring: read for row %llu failed: res=%d (%s)\n",
-                  (unsigned long long)c->user_data, c->res,
+          const uint64_t row = c->user_data;
+          if (row >= n) {
+            fprintf(stderr, "ple_uring: completion outside active batch (row=%llu)\n",
+                    (unsigned long long)row);
+            abort();
+          }
+          fprintf(stderr, "ple_uring: read for row %llu failed: res=%d (%s); "
+                          "using mapped read\n",
+                  (unsigned long long)row, c->res,
                   c->res < 0 ? strerror(-c->res) : "short read");
-          abort();
+          memcpy(staging + row * g_ple_rb, (const void*)(uintptr_t)addrs[row], g_ple_rb);
         }
         done++;
       }
@@ -192,9 +200,9 @@ static int ple_pump_count() { return g_ple_nrings; }
 
 #else  // _WIN32 ------------------------------------------------------------
 
-// IOCP 批量读：与 PleUring::run 相同语义——n 个 160B 行从文件偏移
-// g_ple_foff + (addrs[i] - table_va) 读入 staging + i*g_ple_rb；任何失败/短读
-// 立即 fatal，不做半途回退。
+// IOCP 批量读：与 PleUring::run 相同语义——n 行从文件偏移
+// g_ple_foff + (addrs[i] - table_va) 读入 staging + i*g_ple_rb；提交失败、
+// 读取失败或短读的行从 addrs[i] 指向的同一映射表同步补齐。
 // 一个实例 = 一个文件句柄 + 一个 IOCP，完成包按 OVERLAPPED 地址回推槽位，
 // 因此同一实例同一时刻只能有一个读批次：run() 加锁串行；issue() 也取得同一把锁，
 // 并持有到 wait_all() 取完全部完成包，覆盖 OVERLAPPED 的整个生命周期。
@@ -255,13 +263,17 @@ struct PleWin {
     return true;
   }
 
+  static void mapped_row(const uint64_t* addrs, uint8_t* staging, size_t row) {
+    memcpy(staging + row * g_ple_rb, (const void*)(uintptr_t)addrs[row], g_ple_rb);
+  }
+
   void run(const uint64_t* addrs, uint8_t* staging, uint64_t table_va,
            size_t n) {
     std::lock_guard<std::mutex> lk(run_mu);
     // decode 每 token 只读 16 行：槽位数按需收缩，避免每 token 分配 512 槽
     const size_t depth = std::min(DEPTH, n);
     std::vector<OVERLAPPED> ovs(depth);
-    std::vector<size_t> rows(depth);  // slot -> row（报错定位）
+    std::vector<size_t> rows(depth);  // slot -> row（报错定位与映射回退）
     // 自由槽位队列：槽位只有在自己的 completion 到达后才能复用
     // （完成顺序任意，不能用 sub%DEPTH 环形推断）。
     std::vector<size_t> free_(depth);
@@ -278,13 +290,19 @@ struct PleWin {
         ov->Offset = (DWORD)(off & 0xffffffffu);
         ov->OffsetHigh = (DWORD)(off >> 32);
         BOOL r = ReadFile(fh, staging + sub * g_ple_rb, g_ple_rb, nullptr, ov);
-        if (!r && GetLastError() != ERROR_IO_PENDING) {
-          fprintf(stderr, "ple_win: ReadFile row %zu failed: %lu\n", sub,
-                  GetLastError());
-          abort();
+        const DWORD error = r ? ERROR_SUCCESS : GetLastError();
+        if (!r && error != ERROR_IO_PENDING) {
+          fprintf(stderr, "ple_win: ReadFile row %zu failed: %lu; using mapped read\n", sub,
+                  (unsigned long)error);
+          mapped_row(addrs, staging, sub);
+          free_[nfree++] = slot;
+          sub++;
+          done++;
+          continue;
         }
         sub++;
       }
+      if (done == n) break;
       DWORD got = 0;
       ULONG_PTR key = 0;
       OVERLAPPED* pov = nullptr;
@@ -293,54 +311,67 @@ struct PleWin {
       const size_t slot = completion_slot(pov, ovs.data(), depth, got, error);
       if (!okr || got != g_ple_rb) {
         fprintf(stderr,
-                "ple_win: read completion failed (row=%zu, got=%lu, err=%lu)\n",
+                "ple_win: read completion failed (row=%zu, got=%lu, err=%lu); "
+                "using mapped read\n",
                 rows[slot], (unsigned long)got, (unsigned long)error);
-        abort();
+        mapped_row(addrs, staging, rows[slot]);
       }
       free_[nfree++] = slot;
       done++;
     }
   }
 
-  // Split form of run() for one small batch (n <= DEPTH): issue() posts every
-  // read now, wait_all() collects the n completions later. Same bytes as
-  // run(). Lets the caller post the reads, enqueue GPU work, then wait, with
+  // Split form of run() for one small batch (n <= DEPTH): issue() posts reads
+  // now, wait_all() collects every submitted completion later. Rows that could
+  // not be submitted are copied from the mapped table immediately. Same bytes
+  // as run(). Lets the caller post the reads, enqueue GPU work, then wait, with
   // no helper thread (10-12: spawning threads per verify cost ~2 ms under
   // serving load). One batch in flight at a time.
   std::vector<OVERLAPPED> b_ovs;
-  size_t b_n = 0;
+  size_t b_sub = 0;
+  const uint64_t* b_addrs = nullptr;
+  uint8_t* b_staging = nullptr;
   void issue(const uint64_t* addrs, uint8_t* staging, uint64_t table_va, size_t n) {
     std::unique_lock<std::mutex> lk(run_mu);
     b_ovs.assign(n, OVERLAPPED{});  // never reallocated while reads are pending
+    b_sub = 0;
+    b_addrs = addrs;
+    b_staging = staging;
     for (size_t i = 0; i < n; i++) {
       OVERLAPPED* ov = &b_ovs[i];
       const uint64_t off = g_ple_foff + (addrs[i] - table_va);
       ov->Offset = (DWORD)(off & 0xffffffffu);
       ov->OffsetHigh = (DWORD)(off >> 32);
       BOOL r = ReadFile(fh, staging + i * g_ple_rb, g_ple_rb, nullptr, ov);
-      if (!r && GetLastError() != ERROR_IO_PENDING) {
-        fprintf(stderr, "ple_win: ReadFile row %zu failed: %lu\n", i, GetLastError());
-        abort();
+      const DWORD error = r ? ERROR_SUCCESS : GetLastError();
+      if (!r && error != ERROR_IO_PENDING) {
+        fprintf(stderr, "ple_win: ReadFile row %zu failed: %lu; using mapped read\n", i,
+                (unsigned long)error);
+        for (size_t j = i; j < n; j++) mapped_row(addrs, staging, j);
+        break;
       }
+      b_sub++;
     }
-    b_n = n;
     batch_lk = std::move(lk);
   }
   void wait_all() {
-    for (size_t done = 0; done < b_n; done++) {
+    for (size_t done = 0; done < b_sub; done++) {
       DWORD got = 0;
       ULONG_PTR key = 0;
       OVERLAPPED* pov = nullptr;
       BOOL okr = GetQueuedCompletionStatus(iocp, &got, &key, &pov, INFINITE);
       const DWORD error = okr ? ERROR_SUCCESS : GetLastError();
-      const size_t slot = completion_slot(pov, b_ovs.data(), b_n, got, error);
+      const size_t slot = completion_slot(pov, b_ovs.data(), b_sub, got, error);
       if (!okr || got != g_ple_rb) {
-        fprintf(stderr, "ple_win: read completion failed (row=%zu, got=%lu, err=%lu)\n",
+        fprintf(stderr, "ple_win: read completion failed (row=%zu, got=%lu, err=%lu); "
+                        "using mapped read\n",
                 slot, (unsigned long)got, (unsigned long)error);
-        abort();
+        mapped_row(b_addrs, b_staging, slot);
       }
     }
-    b_n = 0;
+    b_sub = 0;
+    b_addrs = nullptr;
+    b_staging = nullptr;
     if (batch_lk.owns_lock()) batch_lk.unlock();
   }
 };

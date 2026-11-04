@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Windows CPU-only regression and fault injection for the production PleWin reader.
 
-No ROCm runtime, GPU, or model is required. Each fatal-path test runs in its own
+No ROCm runtime, GPU, or model is required. Each fault-injection test runs in its own
 child process. --source can select an unmodified source file for before/after
 reproduction; --output retains source identity, compile command, and raw results.
 """
@@ -51,16 +51,19 @@ def main():
         (work / "compile.stderr").write_text(compiled.stderr, encoding="utf-8")
         compiled.check_returncode()
         rows = []
-        for mode in ["positive", "run-null", "run-foreign", "run-unaligned",
-                     "split-null", "split-foreign", "split-unaligned", "run-short", "split-short"]:
+        modes = ["positive", "run-null", "run-foreign", "run-unaligned",
+                 "split-null", "split-foreign", "split-unaligned", "run-short", "split-short",
+                 "run-submit-first", "run-submit-mid", "split-submit-first", "split-submit-mid",
+                 "run-completion", "split-completion"]
+        for mode in modes:
             fixture = work / (mode + ".bin")
             start_time = time.perf_counter()
             try:
                 result = subprocess.run([str(binary), mode, str(fixture)], capture_output=True,
                                         text=True, timeout=45)
-                diagnostic = "read completion failed" if "short" in mode else "completion outside active batch"
-                passed = result.returncode == 0 if mode == "positive" else (
-                    result.returncode != 0 and diagnostic in result.stderr)
+                recovery = any(word in mode for word in ("short", "submit", "completion"))
+                passed = result.returncode == 0 if mode == "positive" or recovery else (
+                    result.returncode != 0 and "completion outside active batch" in result.stderr)
                 row = dict(mode=mode, passed=passed, exit_code=result.returncode,
                            stdout=result.stdout, stderr=result.stderr)
             except subprocess.TimeoutExpired:
