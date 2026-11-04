@@ -220,6 +220,24 @@ struct PleWin {
 
   bool ok() const { return iocp != nullptr && g_ple_off_ok; }
 
+  // Do not subtract or dereference an untrusted completion pointer. Check its
+  // address and alignment against the active OVERLAPPED array first.
+  static size_t completion_slot(const OVERLAPPED* pov, const OVERLAPPED* first,
+                                size_t count, DWORD got, DWORD error) {
+    const uintptr_t address = reinterpret_cast<uintptr_t>(pov);
+    const uintptr_t base = reinterpret_cast<uintptr_t>(first);
+    if (pov && address >= base) {
+      const uintptr_t offset = address - base;
+      if (offset % sizeof(OVERLAPPED) == 0 && offset / sizeof(OVERLAPPED) < count)
+        return static_cast<size_t>(offset / sizeof(OVERLAPPED));
+    }
+    fprintf(stderr,
+            "ple_win: completion outside active batch (ov=%p, count=%zu, got=%lu, err=%lu)\n",
+            static_cast<const void*>(pov), count, (unsigned long)got,
+            (unsigned long)error);
+    abort();
+  }
+
   bool setup(const char* filename) {
     close();
     fh = CreateFileA(filename, GENERIC_READ,
@@ -271,12 +289,12 @@ struct PleWin {
       ULONG_PTR key = 0;
       OVERLAPPED* pov = nullptr;
       BOOL okr = GetQueuedCompletionStatus(iocp, &got, &key, &pov, INFINITE);
-      size_t slot = (size_t)(pov - ovs.data());
+      const DWORD error = okr ? ERROR_SUCCESS : GetLastError();
+      const size_t slot = completion_slot(pov, ovs.data(), depth, got, error);
       if (!okr || got != g_ple_rb) {
         fprintf(stderr,
                 "ple_win: read completion failed (row=%zu, got=%lu, err=%lu)\n",
-                pov ? rows[slot] : (size_t)-1, (unsigned long)got,
-                (unsigned long)GetLastError());
+                rows[slot], (unsigned long)got, (unsigned long)error);
         abort();
       }
       free_[nfree++] = slot;
@@ -314,10 +332,11 @@ struct PleWin {
       ULONG_PTR key = 0;
       OVERLAPPED* pov = nullptr;
       BOOL okr = GetQueuedCompletionStatus(iocp, &got, &key, &pov, INFINITE);
+      const DWORD error = okr ? ERROR_SUCCESS : GetLastError();
+      const size_t slot = completion_slot(pov, b_ovs.data(), b_n, got, error);
       if (!okr || got != g_ple_rb) {
-        fprintf(stderr, "ple_win: read completion failed (row=%zd, got=%lu, err=%lu)\n",
-                pov ? (ptrdiff_t)(pov - b_ovs.data()) : (ptrdiff_t)-1, (unsigned long)got,
-                (unsigned long)GetLastError());
+        fprintf(stderr, "ple_win: read completion failed (row=%zu, got=%lu, err=%lu)\n",
+                slot, (unsigned long)got, (unsigned long)error);
         abort();
       }
     }
