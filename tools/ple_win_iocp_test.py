@@ -54,14 +54,14 @@ def main():
         modes = ["positive", "run-null", "run-foreign", "run-unaligned",
                  "split-null", "split-foreign", "split-unaligned", "run-short", "split-short",
                  "run-submit-first", "run-submit-mid", "split-submit-first", "split-submit-mid",
-                 "run-completion", "split-completion"]
+                 "run-completion", "split-completion", "run-timeout", "split-timeout"]
         for mode in modes:
             fixture = work / (mode + ".bin")
             start_time = time.perf_counter()
             try:
                 result = subprocess.run([str(binary), mode, str(fixture)], capture_output=True,
                                         text=True, timeout=45)
-                recovery = any(word in mode for word in ("short", "submit", "completion"))
+                recovery = any(word in mode for word in ("short", "submit", "completion", "timeout"))
                 passed = result.returncode == 0 if mode == "positive" or recovery else (
                     result.returncode != 0 and "completion outside active batch" in result.stderr)
                 row = dict(mode=mode, passed=passed, exit_code=result.returncode,

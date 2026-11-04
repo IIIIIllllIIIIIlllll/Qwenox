@@ -4585,6 +4585,13 @@ static int run(GpuModel& m, const std::string& host, int port) {
   for (;;) {
     sockfd_t cfd = accept(lfd, nullptr, nullptr);
     if (cfd < 0) continue;
+    // A client that stops reading must not wedge a generation worker forever.
+    // QWENOX_SEND_TIMEOUT is in seconds; zero restores the blocking behavior.
+    static const int send_timeout = [] {
+      const char* e = getenv("QWENOX_SEND_TIMEOUT");
+      return std::max(0, e ? atoi(e) : 30);
+    }();
+    if (send_timeout) sock_sndtimeo(cfd, send_timeout);
     setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof one);
     // "client connected" is logged by conn_main once it has seen a verb
     std::thread(conn_main, std::ref(m), cfd, std::cref(kvs)).detach();

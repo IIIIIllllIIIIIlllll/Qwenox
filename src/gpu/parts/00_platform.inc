@@ -119,6 +119,15 @@ static inline void sock_rcvtimeo(sockfd_t fd, int sec) {
   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 #endif
 }
+static inline void sock_sndtimeo(sockfd_t fd, int sec) {
+#ifdef _WIN32
+  DWORD ms = (DWORD)(sec * 1000);
+  setsockopt((SOCKET)fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&ms, sizeof ms);
+#else
+  timeval tv{sec, 0};
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+#endif
+}
 
 using hgn::Checkpoint;
 using hgn::Tensor;

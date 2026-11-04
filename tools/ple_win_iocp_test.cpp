@@ -17,8 +17,9 @@
 #include <vector>
 #include <crtdbg.h>
 
-static std::atomic<int> g_read_calls{0}, g_completion_calls{0};
+static std::atomic<int> g_read_calls{0}, g_completion_calls{0}, g_cancel_calls{0};
 static std::atomic<int> g_fail_read{-1}, g_fail_completion{-1};
+static std::atomic<bool> g_hold_io{false};
 static BOOL WINAPI hook_ReadFile(HANDLE file, LPVOID buffer, DWORD bytes,
                                  LPDWORD read, LPOVERLAPPED ov) {
   const int call = g_read_calls.fetch_add(1);
@@ -31,6 +32,13 @@ static BOOL WINAPI hook_ReadFile(HANDLE file, LPVOID buffer, DWORD bytes,
 static BOOL WINAPI hook_GetQueuedCompletionStatus(HANDLE port, LPDWORD got,
                                                    PULONG_PTR key, LPOVERLAPPED* ov,
                                                    DWORD timeout) {
+  if (g_hold_io.load()) {
+    Sleep(timeout == INFINITE ? 100 : timeout);
+    *ov = nullptr;
+    SetLastError(WAIT_TIMEOUT);
+    g_completion_calls.fetch_add(1);
+    return FALSE;
+  }
   const BOOL ok = ::GetQueuedCompletionStatus(port, got, key, ov, timeout);
   const int call = g_completion_calls.fetch_add(1);
   if (call == g_fail_completion.load() && ok && *ov) {
@@ -39,23 +47,31 @@ static BOOL WINAPI hook_GetQueuedCompletionStatus(HANDLE port, LPDWORD got,
   }
   return ok;
 }
+static BOOL WINAPI hook_CancelIoEx(HANDLE file, LPOVERLAPPED ov) {
+  g_cancel_calls.fetch_add(1);
+  g_hold_io = false;
+  return ::CancelIoEx(file, ov);
+}
 
 static uint64_t g_ple_foff = 4093;
 static DWORD g_ple_rb = 90;
 static bool g_ple_off_ok = true;
 #define ReadFile hook_ReadFile
 #define GetQueuedCompletionStatus hook_GetQueuedCompletionStatus
+#define CancelIoEx hook_CancelIoEx
 #include "ple_win_under_test.inc"
 #undef ReadFile
 #undef GetQueuedCompletionStatus
+#undef CancelIoEx
 
 static constexpr size_t ROWS = 8193, GUARD = 256;
 static std::vector<uint8_t> g_table;
 static uint64_t table_va() { return (uint64_t)(uintptr_t)g_table.data(); }
 static void injection_reset(int read = -1, int completion = -1) {
-  g_read_calls = g_completion_calls = 0;
+  g_read_calls = g_completion_calls = g_cancel_calls = 0;
   g_fail_read = read;
   g_fail_completion = completion;
+  g_hold_io = false;
 }
 static void require(bool ok, const char* message) {
   if (!ok) throw std::runtime_error(message);
@@ -155,6 +171,8 @@ static void recovered(const char* path, const std::string& mode) {
   const bool short_file = mode.find("short") != std::string::npos;
   const bool submit = mode.find("submit") != std::string::npos;
   const bool completion = mode.find("completion") != std::string::npos;
+  const bool timeout_mode = mode.find("timeout") != std::string::npos;
+  if (timeout_mode) SetEnvironmentVariableA("QWENOX_PLE_IO_TIMEOUT_MS", "100");
   fixture(path, short_file);
   PleWin reader;
   require(reader.setup(path) && reader.ok(), "recovery setup");
@@ -162,8 +180,12 @@ static void recovered(const char* path, const std::string& mode) {
   if (short_file) batch.addrs[0] = table_va();
   const int read = submit ? (mode.find("first") != std::string::npos ? 0 : 3) : -1;
   injection_reset(read, completion ? 0 : -1);
+  if (timeout_mode) g_hold_io = true;
   batch.run(reader, split);
   if (short_file) require(g_completion_calls.load() == 1, "short read bypassed IOCP completion");
+  if (timeout_mode)
+    require(g_cancel_calls.load() > 0 && g_completion_calls.load() >= 2,
+            "timeout did not cancel and drain IOCP");
   injection_reset();
   Batch(16, 99).run(reader, split);
   printf("PASS: recovered %s\n", mode.c_str());
@@ -181,7 +203,8 @@ int main(int argc, char** argv) {
     }
     if (mode.find("short") != std::string::npos ||
         mode.find("submit") != std::string::npos ||
-        mode.find("completion") != std::string::npos) {
+        mode.find("completion") != std::string::npos ||
+        mode.find("timeout") != std::string::npos) {
       recovered(path, mode);
       return 0;
     }

@@ -202,7 +202,8 @@ static int ple_pump_count() { return g_ple_nrings; }
 
 // IOCP 批量读：与 PleUring::run 相同语义——n 行从文件偏移
 // g_ple_foff + (addrs[i] - table_va) 读入 staging + i*g_ple_rb；提交失败、
-// 读取失败或短读的行从 addrs[i] 指向的同一映射表同步补齐。
+// 读取失败或短读的行从 addrs[i] 指向的同一映射表同步补齐。完成等待默认
+// 5 秒（QWENOX_PLE_IO_TIMEOUT_MS，0=无限）；超时先取消并排空活跃 I/O，再回退。
 // 一个实例 = 一个文件句柄 + 一个 IOCP，完成包按 OVERLAPPED 地址回推槽位，
 // 因此同一实例同一时刻只能有一个读批次：run() 加锁串行；issue() 也取得同一把锁，
 // 并持有到 wait_all() 取完全部完成包，覆盖 OVERLAPPED 的整个生命周期。
@@ -266,6 +267,18 @@ struct PleWin {
   static void mapped_row(const uint64_t* addrs, uint8_t* staging, size_t row) {
     memcpy(staging + row * g_ple_rb, (const void*)(uintptr_t)addrs[row], g_ple_rb);
   }
+  static DWORD io_timeout_ms() {
+    static const DWORD ms = [] {
+      const char* e = getenv("QWENOX_PLE_IO_TIMEOUT_MS");
+      if (e && !strcmp(e, "0")) return (DWORD)INFINITE;
+      return (DWORD)std::min(600000, std::max(100, e ? atoi(e) : 5000));
+    }();
+    return ms;
+  }
+  void cancel_one(OVERLAPPED* ov) {
+    if (!CancelIoEx(fh, ov) && GetLastError() != ERROR_NOT_FOUND)
+      fprintf(stderr, "ple_win: CancelIoEx failed: %lu\n", (unsigned long)GetLastError());
+  }
 
   void run(const uint64_t* addrs, uint8_t* staging, uint64_t table_va,
            size_t n) {
@@ -274,6 +287,7 @@ struct PleWin {
     const size_t depth = std::min(DEPTH, n);
     std::vector<OVERLAPPED> ovs(depth);
     std::vector<size_t> rows(depth);  // slot -> row（报错定位与映射回退）
+    std::vector<char> active(depth, 0);
     // 自由槽位队列：槽位只有在自己的 completion 到达后才能复用
     // （完成顺序任意，不能用 sub%DEPTH 环形推断）。
     std::vector<size_t> free_(depth);
@@ -289,12 +303,14 @@ struct PleWin {
         uint64_t off = g_ple_foff + (addrs[sub] - table_va);
         ov->Offset = (DWORD)(off & 0xffffffffu);
         ov->OffsetHigh = (DWORD)(off >> 32);
+        active[slot] = 1;
         BOOL r = ReadFile(fh, staging + sub * g_ple_rb, g_ple_rb, nullptr, ov);
         const DWORD error = r ? ERROR_SUCCESS : GetLastError();
         if (!r && error != ERROR_IO_PENDING) {
           fprintf(stderr, "ple_win: ReadFile row %zu failed: %lu; using mapped read\n", sub,
                   (unsigned long)error);
           mapped_row(addrs, staging, sub);
+          active[slot] = 0;
           free_[nfree++] = slot;
           sub++;
           done++;
@@ -306,9 +322,56 @@ struct PleWin {
       DWORD got = 0;
       ULONG_PTR key = 0;
       OVERLAPPED* pov = nullptr;
-      BOOL okr = GetQueuedCompletionStatus(iocp, &got, &key, &pov, INFINITE);
+      BOOL okr = GetQueuedCompletionStatus(iocp, &got, &key, &pov, io_timeout_ms());
       const DWORD error = okr ? ERROR_SUCCESS : GetLastError();
+      if (!okr && !pov && error == WAIT_TIMEOUT) {
+        fprintf(stderr, "ple_win: IO timeout after %lu ms; cancelling %zu/%zu rows\n",
+                (unsigned long)io_timeout_ms(), sub - done, n);
+        size_t pending = 0;
+        for (size_t i = 0; i < depth; i++)
+          if (active[i]) {
+            pending++;
+            cancel_one(&ovs[i]);
+          }
+        if (pending != sub - done) {
+          fprintf(stderr, "ple_win: inconsistent active batch (%zu != %zu)\n", pending,
+                  sub - done);
+          abort();
+        }
+        // Rows never submitted have no kernel writer and are safe to copy now.
+        for (size_t row = sub; row < n; row++) mapped_row(addrs, staging, row);
+        // A cancelled ReadFile still owns its OVERLAPPED/staging until its
+        // completion arrives. Drain all of them before returning to the caller.
+        while (pending) {
+          got = 0;
+          key = 0;
+          pov = nullptr;
+          okr = GetQueuedCompletionStatus(iocp, &got, &key, &pov, io_timeout_ms());
+          const DWORD cancel_error = okr ? ERROR_SUCCESS : GetLastError();
+          if (!okr && !pov && cancel_error == WAIT_TIMEOUT) {
+            fprintf(stderr, "ple_win: cancelled IO still pending; retrying cancel\n");
+            for (size_t i = 0; i < depth; i++)
+              if (active[i]) cancel_one(&ovs[i]);
+            continue;
+          }
+          const size_t slot = completion_slot(pov, ovs.data(), depth, got, cancel_error);
+          if (!active[slot]) {
+            fprintf(stderr, "ple_win: duplicate completion for slot %zu\n", slot);
+            abort();
+          }
+          active[slot] = 0;
+          if (!okr || got != g_ple_rb) mapped_row(addrs, staging, rows[slot]);
+          pending--;
+        }
+        done = n;
+        break;
+      }
       const size_t slot = completion_slot(pov, ovs.data(), depth, got, error);
+      if (!active[slot]) {
+        fprintf(stderr, "ple_win: duplicate completion for slot %zu\n", slot);
+        abort();
+      }
+      active[slot] = 0;
       if (!okr || got != g_ple_rb) {
         fprintf(stderr,
                 "ple_win: read completion failed (row=%zu, got=%lu, err=%lu); "
@@ -328,12 +391,14 @@ struct PleWin {
   // no helper thread (10-12: spawning threads per verify cost ~2 ms under
   // serving load). One batch in flight at a time.
   std::vector<OVERLAPPED> b_ovs;
+  std::vector<char> b_active;
   size_t b_sub = 0;
   const uint64_t* b_addrs = nullptr;
   uint8_t* b_staging = nullptr;
   void issue(const uint64_t* addrs, uint8_t* staging, uint64_t table_va, size_t n) {
     std::unique_lock<std::mutex> lk(run_mu);
     b_ovs.assign(n, OVERLAPPED{});  // never reallocated while reads are pending
+    b_active.assign(n, 0);
     b_sub = 0;
     b_addrs = addrs;
     b_staging = staging;
@@ -350,25 +415,41 @@ struct PleWin {
         for (size_t j = i; j < n; j++) mapped_row(addrs, staging, j);
         break;
       }
+      b_active[i] = 1;
       b_sub++;
     }
     batch_lk = std::move(lk);
   }
   void wait_all() {
-    for (size_t done = 0; done < b_sub; done++) {
+    size_t done = 0;
+    while (done < b_sub) {
       DWORD got = 0;
       ULONG_PTR key = 0;
       OVERLAPPED* pov = nullptr;
-      BOOL okr = GetQueuedCompletionStatus(iocp, &got, &key, &pov, INFINITE);
+      BOOL okr = GetQueuedCompletionStatus(iocp, &got, &key, &pov, io_timeout_ms());
       const DWORD error = okr ? ERROR_SUCCESS : GetLastError();
+      if (!okr && !pov && error == WAIT_TIMEOUT) {
+        fprintf(stderr, "ple_win: split IO timeout after %lu ms; cancelling %zu rows\n",
+                (unsigned long)io_timeout_ms(), b_sub - done);
+        for (size_t i = 0; i < b_sub; i++)
+          if (b_active[i]) cancel_one(&b_ovs[i]);
+        continue;
+      }
       const size_t slot = completion_slot(pov, b_ovs.data(), b_sub, got, error);
+      if (!b_active[slot]) {
+        fprintf(stderr, "ple_win: duplicate split completion for slot %zu\n", slot);
+        abort();
+      }
+      b_active[slot] = 0;
       if (!okr || got != g_ple_rb) {
         fprintf(stderr, "ple_win: read completion failed (row=%zu, got=%lu, err=%lu); "
                         "using mapped read\n",
                 slot, (unsigned long)got, (unsigned long)error);
         mapped_row(b_addrs, b_staging, slot);
       }
+      done++;
     }
+    b_active.clear();
     b_sub = 0;
     b_addrs = nullptr;
     b_staging = nullptr;
