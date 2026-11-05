@@ -376,6 +376,32 @@ kernel 的运算顺序一致。这里按 v2 `k_ht_wmma` 的做法实现（f16 WM
 `hipEventSynchronize` 内部）。同一命令用 6eb7c9e 基线与新二进制各重跑 2 次都正常，输出逐 token 相同，
 因此与本次改动无关，原因待查。
 
+## IQ2_XXS / IQ2_XS 混合量化专家
+
+外部混合量化（实测：`Dongfangshuo-Qwen3.8-Flash-Next-NSFW-IQ3_XXS`，2026-11-04）会在部分层的
+`ffn_{gate,up}_exps` 里使用 **IQ2_XXS / IQ2_XS**。这两种类型现已支持原生加载、CPU 解量化、
+小 P GEMV（含专家去重）和大 P LUT/WMMA，不需要把专家重量化成其他格式。
+
+该模型 48 层中：10 层 gate/up 为 IQ2_XS（0,2,4,5,9,10,14,19,25,39），9 层为 IQ2_XXS
+（1,3,6,7,11,13,16,27,31），其余 29 层为 IQ3_S/IQ2_S/IQ3_XXS。down 类型为 IQ4_NL/Q2_0。
+实现布局为 IQ2_XXS 256 元素 / 66 B、IQ2_XS 256 / 74 B；码本来自 llama.cpp，CPU 与 GPU
+共用同一 ggml 解码语义。IQ2_XXS 每 32 元素一个 scale，IQ2_XS 每 16 元素一个 scale。
+
+验证（真实权重与 CPU 参考对拍）：
+
+- `tools/gguf_dequant_ref_check.cpp`：IQ2_XXS/IQ2_XS 各 4096 个随机块与 ggml 原函数逐位相同；
+  原有 IQ3_S/Q6_K 对照也保持零 mismatch。
+- 第 0 层（IQ2_XS/IQ4_NL）与第 1 层（IQ2_XXS/Q2_0）：P=2048 的 64/128-slot WMMA 均 PASS，
+  gate/up 最大 rel-L2 分别为 5.406e-4 / 5.824e-4（门槛 1e-2）。
+- 同两层 P=1/4/48 GEMV 均 PASS，最大 rel-L2 < 2e-7；P=4/48 的 dedup 与普通路径 hid/out
+  均逐位相同。
+- 第 12 层 IQ2_S 与第 35 层 IQ3_XXS 的 GEMV/WMMA 回归均 PASS。
+- 完整 48 层纯 GGUF 已成功加载并推理：2047-token PPL 为 10.6162（chunk 2048）/ 9.98484
+  （chunk 4，相差 5.95%；小 chunk PPL 的混沌性见上文，不能单独作门槛）。普通 greedy 生成
+  128 token、98 个不同 token，28.9 tok/s。
+- Q8_0 MTP sidecar 可加载并启用草稿头：37.4 tok/s、commit/round 3.07。与普通 greedy 的前
+  54 个生成 token 一致，之后因 verify/decode 数值路径差异分叉，不要求逐 bit 相同。
+
 ## 验证脚本
 
 - `tools/g2_verify.sh` — G2（专家）
@@ -396,7 +422,7 @@ kernel 的运算顺序一致。这里按 v2 `k_ht_wmma` 的做法实现（f16 WM
 - `tools/q8_wmma_test.cu`（`bash tools/ht_wmma_test.sh q8`）— `k_q8g32_wmma` 精度 / 行无关 / 切片 / 速度
 - `tools/iq4xs_conc_win.sh` — UD-IQ4_XS（Windows）：并发（conc_verify 单路 vs 8 路 + 控制面）、生产配置显存、prefill 分段
 - `tools/iq4xs_verify_win.sh` — UD-IQ4_XS（Windows）：kernel 对拍、v2 逐位不变、PPL 一致性/质量、服务端到端、速度
-- `tools/gguf_dequant_ref_check.cpp` — gguf.h CPU 解码（IQ3_S、Q6_K）vs ggml 原函数逐位
+- `tools/gguf_dequant_ref_check.cpp` — gguf.h CPU 解码（IQ2_XXS、IQ2_XS、IQ3_S、Q6_K）vs ggml 原函数逐位
 - `tools/moe_gguf_test.cu` — MoE kernel（含 IQ 类型，经 `moe_ggx_*`）vs CPU 参考
 - `tools/moe_gguf_gemv_test.cu` — 小 P 专家 GEMV（含去重路径逐位对照）vs CPU 参考
 - `tools/q8g32_gemv_bench.cu` — q8g32 dense GEMV 各变体（P=1 与 P=4）

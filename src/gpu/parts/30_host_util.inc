@@ -512,7 +512,8 @@ static void gguf_experts_open() {
     (void)mtp;
     const uint32_t tg = t[0]->type, td = t[2]->type;
     if (tg != gguf::Q4_K && tg != gguf::Q5_K && tg != gguf::Q8_0 && tg != gguf::IQ4_XS &&
-        tg != gguf::IQ3_S && tg != gguf::Q2_0 && tg != gguf::IQ3_XXS && tg != gguf::IQ2_S)
+        tg != gguf::IQ3_S && tg != gguf::Q2_0 && tg != gguf::IQ2_XXS && tg != gguf::IQ2_XS &&
+        tg != gguf::IQ3_XXS && tg != gguf::IQ2_S)
       throw std::runtime_error(std::string("QWENOX_GGUF: gate/up type ") +
                                gguf::type_name(t[0]->type) + " unsupported");
     if (td != gguf::Q5_1 && td != gguf::Q8_0 && td != gguf::IQ4_NL && td != gguf::Q2_0)

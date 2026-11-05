@@ -31,6 +31,7 @@
 
 #include "../../gguf_iq3s_grid.h"
 #include "../../gguf_iq3xxs_iq2s_grid.h"
+#include "../../gguf_iq2xxs_iq2xs_grid.h"
 
 namespace moegg {
 
@@ -39,7 +40,9 @@ constexpr int kQ4K = 12, kQ5K = 13, kQ51 = 7, kQ80 = 8;  // gguf::Type values
 // LUT kernel family (27_kernels_moe_lut.inc, moe_ggx_up / moe_ggx_down).
 // Names differ from moelut::kIQ4NL/... (k_moe_lut uses both namespaces).
 constexpr int kIq4nl = 20, kIq3s = 21, kIq4xs = 23;
-constexpr int kIq3xxs = 18, kIq2s = 22;  // gate/up only (down k = 640 is not 256-aligned)
+// These IQ2/IQ3 gate/up formats need 256-aligned k (down k = 640 is not aligned).
+constexpr int kIq2xxs = 16, kIq2xs = 17;
+constexpr int kIq3xxs = 18, kIq2s = 22;
 constexpr int kQ20 = 42;  // GGML_TYPE_Q2_0: 18 B / 64, 2.25 bpw
 constexpr uint32_t kHalfMagic = 0x64646464U;              // 1024.0 high bytes
 
@@ -58,6 +61,8 @@ __host__ __device__ constexpr size_t row_bytes(size_t k) {
        : T == kIq4nl ? (k / 32) * 18
        : T == kIq4xs ? (k / 256) * 136
        : T == kIq3s  ? (k / 256) * 110
+       : T == kIq2xxs ? (k / 256) * 66
+       : T == kIq2xs ? (k / 256) * 74
        : T == kIq3xxs ? (k / 256) * 98
        : T == kIq2s  ? (k / 256) * 82
        : T == kQ20  ? (k / 64) * 18
@@ -822,6 +827,8 @@ template <> struct UnitW<kIq4xs> {  // 136 B / 256: d, scales_h, scales_l[4], qs
 // constant cache.
 __constant__ uint32_t c_iq3s_grid[512] = GGUF_IQ3S_GRID_INIT;
 __constant__ uint32_t c_iq3xxs_grid[256] = GGUF_IQ3XXS_GRID_INIT;
+__constant__ uint64_t c_iq2xxs_grid[256] = GGUF_IQ2XXS_GRID_INIT;
+__constant__ uint64_t c_iq2xs_grid[512] = GGUF_IQ2XS_GRID_INIT;
 __constant__ uint64_t c_iq2s_grid[1024] = GGUF_IQ2S_GRID_INIT;
 __constant__ uint8_t c_iq2xs_signs[128] = GGUF_KSIGNS_IQ2XS_INIT;
 template <> struct UnitW<kIq3s> {  // 110 B / 256: d, qs[64], qh[8], signs[32], scales[4]
@@ -928,6 +935,87 @@ template <> struct UnitW<kIq2s> {  // 82 B / 256: d, qs[64], qh[8], scales[8]
       const uint64_t gg = c_iq2s_grid[((qs >> (8 * l)) & 0xFF) | ((qh << (8 - 2 * l)) & 0x300)];
       g[2 * l] = (uint32_t)gg;
       g[2 * l + 1] = (uint32_t)(gg >> 32);
+    }
+    off = u * 32;
+  }
+  __device__ __forceinline__ float dot(const float* __restrict__ x) const {
+    const float* x0 = x + off;
+    float acc0 = 0.f, acc1 = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      const float4 xv = *(const float4*)(x0 + 4 * i);
+      const float xs[4] = {xv.x, xv.y, xv.z, xv.w};
+#pragma unroll
+      for (int b = 0; b < 4; b++) {
+        const uint32_t xb = __float_as_uint(xs[b]) ^ (((sg >> (4 * i + b)) & 1U) << 31);
+        const float v = (float)((g[i] >> (8 * b)) & 0xFFU);
+        if (i < 4) acc0 = fmaf(v, __uint_as_float(xb), acc0);
+        else acc1 = fmaf(v, __uint_as_float(xb), acc1);
+      }
+    }
+    return __fmul_rn(db0, acc0) + __fmul_rn(db1, acc1);
+  }
+};
+template <> struct UnitW<kIq2xxs> {  // 66 B / 256: d, qs[32] (grid indices + scales/signs)
+  float db;
+  uint32_t g[8];
+  uint32_t sg;
+  int off;
+  __device__ __forceinline__ void load(const uint8_t* __restrict__ row, int u) {
+    const int sb = u >> 3, ib = u & 7;
+    const uint8_t* blk = row + (size_t)sb * 66;  // 2-byte aligned
+    const uint16_t* b16 = (const uint16_t*)blk;
+    const float d = __half2float(__ushort_as_half(b16[0]));
+    const uint32_t q = (uint32_t)b16[1 + 4 * ib] | ((uint32_t)b16[2 + 4 * ib] << 16);
+    const uint32_t aux = (uint32_t)b16[3 + 4 * ib] | ((uint32_t)b16[4 + 4 * ib] << 16);
+    db = d * (0.5f + (float)(aux >> 28)) * 0.25f;
+    sg = 0;
+#pragma unroll
+    for (int l = 0; l < 4; l++) {
+      const uint64_t gg = c_iq2xxs_grid[(q >> (8 * l)) & 0xFFU];
+      g[2 * l] = (uint32_t)gg;
+      g[2 * l + 1] = (uint32_t)(gg >> 32);
+      sg |= (uint32_t)c_iq2xs_signs[(aux >> (7 * l)) & 127] << (8 * l);
+    }
+    off = u * 32;
+  }
+  __device__ __forceinline__ float dot(const float* __restrict__ x) const {
+    const float* x0 = x + off;
+    float acc = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      const float4 xv = *(const float4*)(x0 + 4 * i);
+      const float xs[4] = {xv.x, xv.y, xv.z, xv.w};
+#pragma unroll
+      for (int b = 0; b < 4; b++) {
+        const uint32_t xb = __float_as_uint(xs[b]) ^ (((sg >> (4 * i + b)) & 1U) << 31);
+        acc = fmaf((float)((g[i] >> (8 * b)) & 0xFFU), __uint_as_float(xb), acc);
+      }
+    }
+    return __fmul_rn(db, acc);
+  }
+};
+template <> struct UnitW<kIq2xs> {  // 74 B / 256: d, qs[32] (9-bit grid + 7-bit signs), scales[8]
+  float db0, db1;
+  uint32_t g[8];
+  uint32_t sg;
+  int off;
+  __device__ __forceinline__ void load(const uint8_t* __restrict__ row, int u) {
+    const int sb = u >> 3, ib = u & 7;
+    const uint8_t* blk = row + (size_t)sb * 74;  // 2-byte aligned
+    const uint16_t* b16 = (const uint16_t*)blk;
+    const float d = __half2float(__ushort_as_half(b16[0]));
+    const uint8_t sc = blk[66 + ib];
+    db0 = d * (0.5f + (float)(sc & 0xF)) * 0.25f;
+    db1 = d * (0.5f + (float)(sc >> 4)) * 0.25f;
+    sg = 0;
+#pragma unroll
+    for (int l = 0; l < 4; l++) {
+      const uint16_t q = b16[1 + 4 * ib + l];
+      const uint64_t gg = c_iq2xs_grid[q & 511];
+      g[2 * l] = (uint32_t)gg;
+      g[2 * l + 1] = (uint32_t)(gg >> 32);
+      sg |= (uint32_t)c_iq2xs_signs[q >> 9] << (8 * l);
     }
     off = u * 32;
   }
@@ -1179,7 +1267,7 @@ namespace moegg {
 // gate/up and down types with GEMV instances (type checks by the caller)
 inline bool gemv_gu_ok(int t) {
   return t == kQ4K || t == kQ5K || t == kQ80 || t == kIq4xs || t == kIq3s || t == kQ20 ||
-         t == kIq3xxs || t == kIq2s;
+         t == kIq2xxs || t == kIq2xs || t == kIq3xxs || t == kIq2s;
 }
 inline bool gemv_dn_ok(int t) { return t == kQ51 || t == kQ80 || t == kIq4nl || t == kQ20; }
 // f(std::integral_constant<int, T>) for the runtime type t (one of the gemv_*_ok sets)
@@ -1190,6 +1278,8 @@ inline void with_gu_type(int t, F&& f) {
     case kQ5K: f(std::integral_constant<int, kQ5K>{}); break;
     case kQ80: f(std::integral_constant<int, kQ80>{}); break;
     case kIq4xs: f(std::integral_constant<int, kIq4xs>{}); break;
+    case kIq2xxs: f(std::integral_constant<int, kIq2xxs>{}); break;
+    case kIq2xs: f(std::integral_constant<int, kIq2xs>{}); break;
     case kIq3xxs: f(std::integral_constant<int, kIq3xxs>{}); break;
     case kIq2s: f(std::integral_constant<int, kIq2s>{}); break;
     case kQ20: f(std::integral_constant<int, kQ20>{}); break;

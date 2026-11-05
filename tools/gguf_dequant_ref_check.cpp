@@ -1,5 +1,6 @@
-// gguf_dequant_ref_check.cpp — bit-exact check of gguf::dequant_row (IQ3_S, Q6_K)
-// against llama.cpp ggml-quants.c reference functions copied verbatim below
+// gguf_dequant_ref_check.cpp — bit-exact check of gguf::dequant_row
+// (IQ2_XXS, IQ2_XS, IQ3_S, Q6_K) against llama.cpp ggml-quants.c reference
+// functions copied verbatim below
 // (llama.cpp commit 85c5522, MIT License, Copyright (c) 2023-2026 The ggml authors).
 // Build: g++ -O1 -std=c++17 -I src tools/gguf_dequant_ref_check.cpp -o /tmp/gdrc && /tmp/gdrc
 #include <cstdint>
@@ -8,14 +9,29 @@
 #include <cmath>
 #include <cassert>
 #include <random>
+#include <vector>
 #include "gguf.h"
 #define QK_K 256
 #define GGML_RESTRICT
 typedef uint16_t ggml_half;
 #define GGML_FP16_TO_FP32(x) gguf::h2f(x)
 static const uint32_t iq3s_grid[512] = GGUF_IQ3S_GRID_INIT;
+static const uint64_t iq2xxs_grid[256] = GGUF_IQ2XXS_GRID_INIT;
+static const uint64_t iq2xs_grid[512] = GGUF_IQ2XS_GRID_INIT;
+static const uint8_t ksigns_iq2xs[128] = GGUF_KSIGNS_IQ2XS_INIT;
 static const uint8_t kmask_iq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128};
 #define IQ3S_N_SCALE QK_K/64
+typedef struct {
+    ggml_half d;
+    uint16_t qs[QK_K/8];
+} block_iq2_xxs;
+static_assert(sizeof(block_iq2_xxs) == 66, "wrong iq2_xxs block size/padding");
+typedef struct {
+    ggml_half d;
+    uint16_t qs[QK_K/8];
+    uint8_t scales[QK_K/32];
+} block_iq2_xs;
+static_assert(sizeof(block_iq2_xs) == 74, "wrong iq2_xs block size/padding");
 typedef struct {
     ggml_half d;
     uint8_t qs[QK_K/4];
@@ -29,6 +45,55 @@ typedef struct {
     int8_t  scales[QK_K/16]; // scales, quantized with 8 bits
     ggml_half d;             // super-block scale
 } block_q6_K;
+void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+
+    uint32_t aux32[2];
+    const uint8_t * aux8 = (const uint8_t *)aux32;
+
+    for (int i = 0; i < nb; i++) {
+
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
+            memcpy(aux32, x[i].qs + 4*ib32, 2*sizeof(uint32_t));
+            const float db = d * (0.5f + (aux32[1] >> 28)) * 0.25f;
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t * grid = (const uint8_t *)(iq2xxs_grid + aux8[l]);
+                const uint8_t  signs = ksigns_iq2xs[(aux32[1] >> 7*l) & 127];
+                for (int j = 0; j < 8; ++j) {
+                    y[j] = db * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+                }
+                y += 8;
+            }
+        }
+    }
+}
+void dequantize_row_iq2_xs(const block_iq2_xs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+
+    float db[2];
+
+    for (int i = 0; i < nb; i++) {
+
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
+            db[0] = d * (0.5f + (x[i].scales[ib32] & 0xf)) * 0.25f;
+            db[1] = d * (0.5f + (x[i].scales[ib32] >>  4)) * 0.25f;
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t * grid = (const uint8_t *)(iq2xs_grid + (x[i].qs[4*ib32 + l] & 511));
+                const uint8_t  signs = ksigns_iq2xs[x[i].qs[4*ib32 + l] >> 9];
+                for (int j = 0; j < 8; ++j) {
+                    y[j] = db[l/2] * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+                }
+                y += 8;
+            }
+        }
+    }
+}
 void dequantize_row_iq3_s(const block_iq3_s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_K == 0);
     const int64_t nb = k / QK_K;
@@ -100,21 +165,59 @@ void dequantize_row_q6_K(const block_q6_K * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 int main() {
+  using RefFn = void (*)(const uint8_t*, float*, int64_t);
+  struct TestCase {
+    const char* name;
+    uint32_t type;
+    int bs;
+    int d_off;
+    RefFn ref;
+  };
+  const TestCase tests[] = {
+    {"IQ2_XXS", gguf::IQ2_XXS, 66, 0, [](const uint8_t* p, float* y, int64_t k) {
+      dequantize_row_iq2_xxs((const block_iq2_xxs*)p, y, k);
+    }},
+    {"IQ2_XS", gguf::IQ2_XS, 74, 0, [](const uint8_t* p, float* y, int64_t k) {
+      dequantize_row_iq2_xs((const block_iq2_xs*)p, y, k);
+    }},
+    {"IQ3_S", gguf::IQ3_S, 110, 0, [](const uint8_t* p, float* y, int64_t k) {
+      dequantize_row_iq3_s((const block_iq3_s*)p, y, k);
+    }},
+    {"Q6_K", gguf::Q6_K, 210, 208, [](const uint8_t* p, float* y, int64_t k) {
+      dequantize_row_q6_K((const block_q6_K*)p, y, k);
+    }},
+  };
+
+  constexpr int nb = 4096;
   std::mt19937 rng(1);
-  for (int t = 0; t < 2; t++) {
-    const int bs = t ? 210 : 110, nb = 4096;
-    std::vector<uint8_t> buf(bs * nb);
+  long total_bad = 0;
+  for (const auto& tc : tests) {
+    std::vector<uint8_t> buf(tc.bs * nb);
     for (auto& b : buf) b = rng();
     for (int i = 0; i < nb; i++) {  // finite fp16 d in [2^-10, 2^-6)
       uint16_t h = (uint16_t)(((5 + rng() % 4) << 10) | (rng() & 0x3ff)) | (rng() & 1 ? 0x8000 : 0);
-      memcpy(&buf[i * bs + (t ? 208 : 0)], &h, 2);
+      memcpy(&buf[i * tc.bs + tc.d_off], &h, 2);
     }
     std::vector<float> a(256 * nb), b(256 * nb);
-    if (t) dequantize_row_q6_K((const block_q6_K*)buf.data(), a.data(), 256 * nb);
-    else dequantize_row_iq3_s((const block_iq3_s*)buf.data(), a.data(), 256 * nb);
-    gguf::dequant_row(t ? gguf::Q6_K : gguf::IQ3_S, buf.data(), b.data(), 256 * nb);
-    long bad = 0; double mx = 0;
-    for (size_t i = 0; i < a.size(); i++) { if (a[i] != b[i]) bad++; mx = fmax(mx, fabs(a[i])); }
-    printf("%s: %zu elems, mismatches %ld, max|y| %.4g -> %s\n", t ? "Q6_K" : "IQ3_S", a.size(), bad, mx, bad ? "FAIL" : "PASS");
+    tc.ref(buf.data(), a.data(), 256 * nb);
+    gguf::dequant_row(tc.type, buf.data(), b.data(), 256 * nb);
+
+    long bad = 0;
+    uint32_t be, bb;
+    gguf::block_info(tc.type, be, bb);
+    if (be != 256 || bb != (uint32_t)tc.bs) {
+      printf("%s layout: got {%u, %u}, expected {256, %d} -> FAIL\n", tc.name, be, bb, tc.bs);
+      bad++;
+    }
+    double mx = 0;
+    for (size_t i = 0; i < a.size(); i++) {
+      if (memcmp(&a[i], &b[i], sizeof(float)) != 0) bad++;
+      mx = fmax(mx, fabs(a[i]));
+    }
+    total_bad += bad;
+    printf("%s: %d blocks, %zu elems, mismatches %ld, max|y| %.4g -> %s\n",
+           tc.name, nb, a.size(), bad, mx, bad ? "FAIL" : "PASS");
   }
+  printf("TOTAL: mismatches %ld -> %s\n", total_bad, total_bad ? "FAIL" : "PASS");
+  return total_bad ? 1 : 0;
 }

@@ -30,6 +30,7 @@
 #include "gpu/os_win32.h"
 #endif
 #include "gguf_iq3s_grid.h"
+#include "gguf_iq2xxs_iq2xs_grid.h"
 #include "gguf_iq3xxs_iq2s_grid.h"
 
 namespace gguf {
@@ -63,6 +64,8 @@ inline void block_info(uint32_t t, uint32_t& be, uint32_t& bb) {
     case Q4_K: be = 256; bb = 144; return;
     case Q5_K: be = 256; bb = 176; return;
     case Q6_K: be = 256; bb = 210; return;
+    case IQ2_XXS: be = 256; bb = 66; return;
+    case IQ2_XS: be = 256; bb = 74; return;
     case IQ4_XS: be = 256; bb = 136; return;
     case IQ3_S: be = 256; bb = 110; return;
     case IQ3_XXS: be = 256; bb = 98; return;
@@ -408,6 +411,7 @@ inline void scale_min_k4(int j, const uint8_t* q, uint8_t& d, uint8_t& m) {
 
 // Dequantize one row of `k` elements of type `t` starting at `src`.
 inline void dequant_row(uint32_t t, const uint8_t* src, float* y, uint64_t k) {
+  static const uint8_t signs_tab[128] = GGUF_KSIGNS_IQ2XS_INIT;
   if (t == F32) { memcpy(y, src, k * 4); return; }
   if (t == F16) {
     for (uint64_t i = 0; i < k; i++) { uint16_t h; memcpy(&h, src + 2 * i, 2); y[i] = h2f(h); }
@@ -514,9 +518,54 @@ inline void dequant_row(uint32_t t, const uint8_t* src, float* y, uint64_t k) {
     }
     return;
   }
+  if (t == IQ2_XXS) {  // 66 B / 256: d, qs[32] (grid indices + scales/signs)
+    static const uint64_t grid[256] = GGUF_IQ2XXS_GRID_INIT;
+    for (uint64_t b = 0; b < k / 256; b++, src += 66) {
+      uint16_t dh; memcpy(&dh, src, 2);
+      const float d = h2f(dh);
+      const uint8_t* qs = src + 2;
+      float* yy = y + b * 256;
+      for (int ib = 0; ib < 8; ib++) {  // 32 elements: one scale, 4 grids/signs
+        uint32_t aux32[2]; memcpy(aux32, qs + 8 * ib, sizeof(aux32));
+        const float db = d * (0.5f + (float)(aux32[1] >> 28)) * 0.25f;
+        for (int l = 0; l < 4; l++) {
+          const uint32_t code = (aux32[l / 4] >> (8 * (l & 3))) & 0xFF;
+          const uint64_t g = grid[code];
+          const uint8_t signs = signs_tab[(aux32[1] >> (7 * l)) & 127];
+          for (int j = 0; j < 8; j++)
+            yy[ib * 32 + l * 8 + j] = db * (float)((g >> (8 * j)) & 0xFF) *
+                                      ((signs >> j) & 1 ? -1.f : 1.f);
+        }
+      }
+    }
+    return;
+  }
+  if (t == IQ2_XS) {  // 74 B / 256: d, qs[32] (grid indices + signs), scales[8]
+    static const uint64_t grid[512] = GGUF_IQ2XS_GRID_INIT;
+    for (uint64_t b = 0; b < k / 256; b++, src += 74) {
+      uint16_t dh; memcpy(&dh, src, 2);
+      const float d = h2f(dh);
+      const uint8_t* qs = src + 2;
+      const uint8_t* sc = src + 66;
+      float* yy = y + b * 256;
+      for (int ib = 0; ib < 8; ib++) {  // Two 16-element scales per 32 elements
+        const float db0 = d * (0.5f + (float)(sc[ib] & 0xF)) * 0.25f;
+        const float db1 = d * (0.5f + (float)(sc[ib] >> 4)) * 0.25f;
+        for (int l = 0; l < 4; l++) {
+          uint16_t q; memcpy(&q, qs + 2 * (4 * ib + l), sizeof(q));
+          const uint64_t g = grid[q & 511];
+          const uint8_t signs = signs_tab[q >> 9];
+          const float dl = l < 2 ? db0 : db1;
+          for (int j = 0; j < 8; j++)
+            yy[ib * 32 + l * 8 + j] = dl * (float)((g >> (8 * j)) & 0xFF) *
+                                      ((signs >> j) & 1 ? -1.f : 1.f);
+        }
+      }
+    }
+    return;
+  }
   if (t == IQ3_XXS) {  // 98 B / 256: d, qs[64], scales_and_signs[32]
     static const uint32_t grid[256] = GGUF_IQ3XXS_GRID_INIT;
-    static const uint8_t signs_tab[128] = GGUF_KSIGNS_IQ2XS_INIT;
     for (uint64_t b = 0; b < k / 256; b++, src += 98) {
       uint16_t dh; memcpy(&dh, src, 2);
       const float d = h2f(dh);
