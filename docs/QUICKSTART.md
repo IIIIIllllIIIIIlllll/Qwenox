@@ -105,6 +105,24 @@ HIP 设备分配、`mmap + hipHostRegister` 的专家权重、pinned host 内存
 进程 RSS；`gpu_accessible_committed_bytes` 是引擎自身可准确记账的合计，
 不会把未注册、可回收的文件 mmap 页缓存误算为显存。
 
+### Repeat penalties（llama.cpp 语义）
+
+chat / completions / responses / Anthropic Messages 请求都可使用 `repeat_last_n`
+（整数，默认 64）和 `repeat_penalty`（有限数值，默认 1.0，必须 > 0）。只给其中一个
+字段时，另一个取默认值。两个字段也都支持下文的服务端覆盖。
+
+只有请求体**显式包含**其中任一字段时才进入 llama.cpp penalties 模式；由覆盖表注入
+也算显式包含。此时 repeat、presence、frequency penalties 使用同一个由 **prompt +
+已接受生成 token** 组成的窗口。两个 repeat 字段都没出现时，旧请求的
+`presence_penalty` / `frequency_penalty` 行为保持不变。
+
+- `repeat_last_n=0` 禁用本请求的整个 penalties 路径（包括 presence/frequency）；
+  `-1` 使用本请求的全部历史；其余有效范围是 `1..2147483647`。
+- `repeat_penalty=1.0` 虽是中性值，显式写出仍会进入上述共享窗口模式。
+- sampled 解码使用 dense correction。显式 repeat 在 greedy（`temperature=0`）下也会
+  生效，引擎需要时回退到串行解码，API 不会因为是 greedy 而拒绝。连接不支持该能力的
+  旧引擎时，显式 repeat 请求返回 502；未显式 repeat 的旧请求不受影响。
+
 ### 控制台与服务端参数覆盖
 
 浏览器打开 `http://<主机>:8731/` 即是控制台,包括健康状态、内存记账、
@@ -114,7 +132,7 @@ HIP 设备分配、`mmap + hipHostRegister` 的专家权重、pinned host 内存
 覆盖表用来防止客户端传错采样参数或思考开关。可覆盖的字段:
 `enable_thinking`、`reasoning_effort`、`preserve_thinking`、`temperature`、
 `top_p`、`top_k`、`min_p`、`presence_penalty`、`frequency_penalty`、
-`max_tokens`。每个字段三种模式:
+`repeat_last_n`、`repeat_penalty`、`max_tokens`。每个字段三种模式:
 
 - 跟随客户端:不干预(表里没有该字段)。
 - 默认值:仅在客户端没传该字段时使用。
@@ -195,7 +213,8 @@ curl -X POST http://127.0.0.1:8731/admin/overrides -H 'Content-Type: application
 | `stop_sequences` | `stop`;命中时 `stop_reason=stop_sequence` 并回填 `stop_sequence` |
 
 `temperature`、`top_p`、`top_k`、`max_tokens` 同名透传;本服务的 chat 扩展字段
-(`min_p`、`seed`、`enable_thinking`、`tool_call_format` 等)也可直接写在请求里。
+(`min_p`、`seed`、`repeat_last_n`、`repeat_penalty`、`enable_thinking`、
+`tool_call_format` 等)也可直接写在请求里。
 
 响应按 Anthropic 格式返回 `thinking`(`signature` 为空串)、`text`、`tool_use`
 内容块;`stop_reason` 为 `end_turn` / `max_tokens` / `stop_sequence` / `tool_use`;

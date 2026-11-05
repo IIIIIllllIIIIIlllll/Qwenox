@@ -110,6 +110,28 @@ response separates HIP device allocations, expert weights backed by
 `gpu_accessible_committed_bytes` is the engine-accounted total; unregistered,
 reclaimable file-mmap page cache is intentionally excluded.
 
+### Repeat penalties (llama.cpp semantics)
+
+Chat, completions, responses and Anthropic Messages requests accept `repeat_last_n`
+(integer, default 64) and `repeat_penalty` (finite number, default 1.0, must be > 0).
+If only one is present, the other uses its default. Both are also available as server
+overrides.
+
+llama.cpp penalties mode is selected only when the request body **explicitly contains**
+at least one of these fields; injection by an override counts too. Repeat, presence and
+frequency penalties then share one window containing the **prompt plus accepted generated
+tokens**. With neither repeat field present, existing `presence_penalty` /
+`frequency_penalty` behavior is unchanged.
+
+- `repeat_last_n=0` disables the request's entire penalties path (including
+  presence/frequency); `-1` uses the request's full history. Other valid values are
+  `1..2147483647`.
+- Explicit `repeat_penalty=1.0` is neutral but still selects the shared-window mode.
+- Sampled decoding uses dense correction. Explicit repeat also works with greedy decoding
+  (`temperature=0`): the engine falls back to serial decoding when needed, and the API does
+  not reject it for being greedy. An explicit repeat request to an older engine without the
+  capability returns 502; legacy requests without repeat fields are unaffected.
+
 The engine uses `tools/run_capped.sh`, with a default memory cap of 86 GiB and at least
 100 GiB of free memory required before startup; it refuses to start while another engine or a startup task from the same project is running.
 If there is no progress in logs, engine I/O, or GPU GTT allocation for 60 seconds during loading, startup stops; the maximum
@@ -167,8 +189,8 @@ apply by their chat field names). Field mapping:
 | `stop_sequences` | `stop`; a match gives `stop_reason=stop_sequence` and fills `stop_sequence` |
 
 `temperature`, `top_p`, `top_k` and `max_tokens` pass through unchanged; this
-server's chat extensions (`min_p`, `seed`, `enable_thinking`,
-`tool_call_format`, ...) are accepted in the request as well.
+server's chat extensions (`min_p`, `seed`, `repeat_last_n`, `repeat_penalty`,
+`enable_thinking`, `tool_call_format`, ...) are accepted in the request as well.
 
 Responses carry Anthropic `thinking` (empty `signature`), `text` and `tool_use`
 content blocks; `stop_reason` is `end_turn` / `max_tokens` / `stop_sequence` /

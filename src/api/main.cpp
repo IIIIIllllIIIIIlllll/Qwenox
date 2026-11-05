@@ -113,6 +113,7 @@ std::atomic<long long> g_req_seq{0};
 // queries (MEM/VIZ) use g_ctl and never wait for a generation slot.
 int g_slots = 1;
 int g_kv_pool = 0;  // shared KV pool tokens from INFO (0 = old engine, unknown)
+std::atomic<bool> g_repeat_penalties{false};  // INFO repeat_penalties == 1
 std::vector<std::unique_ptr<qwenox::EngineClient>> g_pool;  // g_slots clients
 std::vector<qwenox::EngineClient*> g_pool_free;             // under g_slot_mtx
 qwenox::EngineClient g_ctl;
@@ -205,10 +206,20 @@ class SlotGuard {
     qwenox::EngineClient* eng_ = nullptr;
 };
 
-bool engine_ready(qwenox::EngineClient& eng, std::string* err) {
+void refresh_engine_info(qwenox::EngineClient& eng);
+
+bool engine_ready(qwenox::EngineClient& eng, std::string* err, bool* repeat_supported) {
     std::lock_guard<std::mutex> lk(g_conn_mtx);
-    if (eng.connected()) return true;
-    return eng.connect(g_cfg.engine_addr, err);
+    if (!eng.connected()) {
+        if (!eng.connect(g_cfg.engine_addr, err)) return false;
+        // A request can win the race with the background start-up re-probe. Read
+        // INFO on every fresh generation connection too, so a new engine is
+        // recognised here while an old one remains conservatively unsupported.
+        g_repeat_penalties.store(false, std::memory_order_release);
+        refresh_engine_info(eng);
+    }
+    *repeat_supported = g_repeat_penalties.load(std::memory_order_acquire);
+    return true;
 }
 
 // ------------------------------------------------------- incremental text --
@@ -698,6 +709,9 @@ struct GenSpec {
     bool seeded = false;  // client-supplied seed (engine SEEDED flag)
     float presence = 0.0f;
     float frequency = 0.0f;
+    long long repeat_last_n = 64;
+    float repeat_penalty = 1.0f;
+    bool llama_penalties = false;
     std::vector<std::pair<int, float>> bias;
     bool logprobs = false;
     std::vector<std::string> stop;
@@ -767,9 +781,17 @@ GenOutcome run_generation(GenSpec& spec,
     }
     qwenox::EngineClient& eng = slot->engine();
     std::string err;
-    if (!engine_ready(eng, &err)) {
+    bool repeat_supported = false;
+    if (!engine_ready(eng, &err, &repeat_supported)) {
         fprintf(stderr, "REQ %s 502 engine connect failed: %s\n", log_tag.c_str(), err.c_str());
         http::fail(502, "engine not reachable: " + err, "server_error", "server_error");
+    }
+    if (spec.llama_penalties && !repeat_supported) {
+        http::fail(502,
+                   "the connected engine does not support repeat_last_n/repeat_penalty "
+                   "(INFO repeat_penalties=1 is required); upgrade the engine or remove "
+                   "the explicit repeat penalty fields",
+                   "server_error", "server_error");
     }
 
     const long long req_id = ++g_req_seq;
@@ -792,6 +814,9 @@ GenOutcome run_generation(GenSpec& spec,
     p.seeded = spec.seeded;
     p.presence = spec.presence;
     p.frequency = spec.frequency;
+    p.repeat_last_n = spec.repeat_last_n;
+    p.repeat_penalty = spec.repeat_penalty;
+    p.llama_penalties = spec.llama_penalties;
     p.bias = spec.bias;
     p.logprobs = spec.logprobs;
     p.mrope_grids = spec.mrope_grids;
@@ -1051,6 +1076,13 @@ void apply_sampling(const json& body, GenSpec* spec) {
         http::fail(400, "presence_penalty must be between -2 and 2");
     if (spec->frequency < -2.0f || spec->frequency > 2.0f)
         http::fail(400, "frequency_penalty must be between -2 and 2");
+    spec->llama_penalties = body.contains("repeat_last_n") || body.contains("repeat_penalty");
+    spec->repeat_last_n = integer_field(body, "repeat_last_n", 64);
+    if (spec->repeat_last_n < -1 || spec->repeat_last_n > std::numeric_limits<int>::max())
+        http::fail(400, "repeat_last_n must be between -1 and 2147483647");
+    spec->repeat_penalty = static_cast<float>(number_field(body, "repeat_penalty", 1.0));
+    if (!std::isfinite(spec->repeat_penalty) || spec->repeat_penalty <= 0.0f)
+        http::fail(400, "repeat_penalty must be finite and greater than 0");
 
     spec->logprobs = request_wants_logprobs(body);
     if (spec->logprobs && !spec->sample)
@@ -1214,7 +1246,7 @@ const json* normalize_reasoning_effort(const json* value, json* storage) {
 
 struct OverrideField {
     const char* key;
-    char kind;  // b = bool, n = number, i = integer, e = reasoning effort
+    char kind;  // b = bool, n = number, p = positive number, i = integer, e = effort
     double lo, hi;
 };
 const OverrideField kOverrideFields[] = {
@@ -1229,6 +1261,8 @@ const OverrideField kOverrideFields[] = {
     {"min_p", 'n', 0.0, 1.0},
     {"presence_penalty", 'n', -2.0, 2.0},
     {"frequency_penalty", 'n', -2.0, 2.0},
+    {"repeat_last_n", 'i', -1, 2147483647.0},
+    {"repeat_penalty", 'p', 0.0, std::numeric_limits<double>::max()},
     {"max_tokens", 'i', 1, 2147483647.0},
 };
 
@@ -1269,10 +1303,14 @@ json validate_overrides(const json& in) {
             const bool ok = f->kind == 'i' ? (v.is_number_integer() || v.is_number_unsigned())
                                            : v.is_number();
             const double d = ok ? v.get<double>() : 0.0;
-            if (!ok || !std::isfinite(d) || d < f->lo || d > f->hi)
+            if (!ok || !std::isfinite(d) || d < f->lo || d > f->hi ||
+                (f->kind == 'p' && d <= 0.0)) {
+                if (f->kind == 'p')
+                    http::fail(400, k + " must be a finite number greater than 0");
                 http::fail(400, k + " must be " + (f->kind == 'i' ? "an integer" : "a number") +
                                     " in " + json_py::py_float(f->lo) + ".." +
                                     json_py::py_float(f->hi));
+            }
         }
         out[k] = json{{"mode", mode}, {"value", std::move(v)}};
     }
@@ -2729,7 +2767,7 @@ void handle_health(const http::Request&, http::Response* r, http::Stream*) {
          "max_tool_response_chars", "stop",
          "max_tokens", "max_completion_tokens", "max_output_tokens", "stream",
          "seed", "temperature", "top_p", "top_k", "min_p", "presence_penalty",
-         "frequency_penalty", "logit_bias", "logprobs", "tools", "tool_choice",
+         "frequency_penalty", "repeat_last_n", "repeat_penalty", "logit_bias", "logprobs", "tools", "tool_choice",
          "parallel_tool_calls", "image_url", "input_image", "add_vision_id"});
     j["token_budget_aliases"] =
         json::array({"max_tokens", "max_completion_tokens", "max_output_tokens"});
@@ -2740,6 +2778,7 @@ void handle_health(const http::Request&, http::Response* r, http::Stream*) {
     j["sampling"] = {
         {"implemented", json::array({"temperature", "top_p", "top_k", "min_p", "seed",
                                      "presence_penalty", "frequency_penalty",
+                                     "repeat_last_n", "repeat_penalty",
                                      "logit_bias", "logprobs"})}};
     j["max_tokens_cap"] = nullptr;
     j["reasoning_effort_values"] =
@@ -4040,7 +4079,8 @@ json anthropic_to_chat(const json& in, std::string* prefill) {
     // Anthropic sampling fields share the chat names; the rest are this
     // server's chat extensions, accepted here too.
     for (const char* k : {"max_tokens", "temperature", "top_p", "top_k", "stream", "seed",
-                          "min_p", "presence_penalty", "frequency_penalty", "logit_bias",
+                          "min_p", "presence_penalty", "frequency_penalty", "repeat_last_n",
+                          "repeat_penalty", "logit_bias",
                           "enable_thinking", "preserve_thinking", "preserve_reasoning",
                           "auto_disable_thinking_with_tools", "reasoning_effort",
                           "tool_call_format", "max_tool_arg_chars", "max_tool_response_chars",
@@ -4546,10 +4586,12 @@ void handle_detokenize(const http::Request& q, http::Response* r,
 
 // INFO 行：I mtp draft_head ctx spec_rows default drafter_weights dflash2
 //   cache_mb cache_align kv_slots slot_ctx cache_mode sampling kv_pool_tokens
+//   repeat_penalties
 struct EngineInfo {
     int context = 0;
     int kv_slots = 0;  // 0 = 老引擎未上报（按单槽处理）
     int kv_pool = 0;
+    bool repeat_penalties = false;
 };
 
 bool parse_engine_info(const std::string& line, EngineInfo* ei) {
@@ -4563,6 +4605,7 @@ bool parse_engine_info(const std::string& line, EngineInfo* ei) {
     ei->context = (int)f[2];
     if (f.size() >= 10 && f[9] >= 1 && f[9] <= 64) ei->kv_slots = (int)f[9];
     if (f.size() >= 14 && f[13] > 0) ei->kv_pool = (int)f[13];
+    ei->repeat_penalties = f.size() >= 15 && f[14] == 1;
     return true;
 }
 
@@ -4571,6 +4614,7 @@ bool parse_engine_info(const std::string& line, EngineInfo* ei) {
 // SlotGuard 持有池内对象指针，缩减需要排空在途请求；引擎重启改 PARALLEL
 // 的场景请重启 API。
 void apply_engine_info(const EngineInfo& ei) {
+    g_repeat_penalties.store(ei.repeat_penalties, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lk(g_slot_mtx);
         if (ei.context > 0) g_cfg.context = ei.context;
@@ -4584,6 +4628,13 @@ void apply_engine_info(const EngineInfo& ei) {
         }
     }
     g_slot_cv.notify_all();  // 排队中的请求重新评估 g_in_flight < g_slots
+}
+
+void refresh_engine_info(qwenox::EngineClient& eng) {
+    std::string line, err;
+    if (!eng.info(&line, &err)) return;  // unsupported stays false; generate reports transport loss
+    EngineInfo ei;
+    if (parse_engine_info(line, &ei)) apply_engine_info(ei);
 }
 
 void log_slots() {

@@ -3,6 +3,7 @@
 import argparse
 import base64
 import json
+import socket
 import threading
 import time
 import urllib.error
@@ -49,11 +50,140 @@ def parse_sse(raw):
     return events
 
 
+def engine_command(engine, command):
+    host, port = engine.rsplit(":", 1)
+    with socket.create_connection((host, int(port)), timeout=2) as conn:
+        conn.sendall((command + "\n").encode("ascii"))
+        with conn.makefile("rb") as reader:
+            return reader.readline()
+
+
+def bias_log(engine):
+    return json.loads(engine_command(engine, "BIASLOG"))
+
+
+def run_repeat_checks(base, engine, slots):
+    status, _, raw = get(base, "/health")
+    health = json.loads(raw)
+    supported = health.get("supported", [])
+    implemented = health.get("sampling", {}).get("implemented", [])
+    check(status == 200 and all(k in supported and k in implemented
+                               for k in ("repeat_last_n", "repeat_penalty")),
+          "repeat-health-declarations", raw[:600])
+
+    invalid = [
+        ("repeat-last-n-too-small", {"repeat_last_n": -2}),
+        ("repeat-last-n-too-large", {"repeat_last_n": 2147483648}),
+        ("repeat-last-n-type", {"repeat_last_n": 1.5}),
+        ("repeat-penalty-zero", {"repeat_penalty": 0}),
+        ("repeat-penalty-negative", {"repeat_penalty": -1}),
+        ("repeat-penalty-type", {"repeat_penalty": "bad"}),
+    ]
+    for name, fields in invalid:
+        body = {"prompt": "x", "temperature": 0, "max_tokens": 2, **fields}
+        status, _, raw = request(base, "/v1/completions", body)
+        check(status == 400 and "error" in json.loads(raw), name, raw[:300])
+
+    if not engine:
+        print("SKIP repeat wire checks (no --engine)")
+        return
+    try:
+        probe = bias_log(engine)
+        if not isinstance(probe, list):
+            raise ValueError("BIASLOG did not return a list")
+    except (OSError, ValueError) as error:
+        print(f"SKIP repeat wire checks (fake engine log unavailable: {error})")
+        return
+
+    def wire_case(name, path, body, expected):
+        bias_log(engine)  # drop earlier GEN records
+        status, _, raw = request(base, path, body)
+        log = bias_log(engine)
+        check(status == 200 and len(log) == 1 and log[0].get("repeat") == expected,
+              name, {"status": status, "response": raw[:300], "gen": log})
+
+    wire_case("repeat-default-omitted", "/v1/completions", {
+        "prompt": "x", "temperature": 0, "max_tokens": 2,
+        "presence_penalty": 0.25, "frequency_penalty": 0.5,
+    }, None)
+    wire_case("repeat-explicit-completions", "/v1/completions", {
+        "prompt": "x", "temperature": 0.75, "seed": 7, "max_tokens": 2,
+        "repeat_last_n": 32, "repeat_penalty": 1.25,
+    }, [32, 1.25])
+    wire_case("repeat-explicit-neutral-greedy-chat", "/v1/chat/completions", {
+        "messages": [{"role": "user", "content": "hi"}], "enable_thinking": False,
+        "temperature": 0, "max_tokens": 2, "repeat_penalty": 1.0,
+    }, [64, 1.0])
+    wire_case("repeat-zero-responses", "/v1/responses", {
+        "input": "hi", "temperature": 0, "max_output_tokens": 2, "repeat_last_n": 0,
+    }, [0, 1.0])
+    wire_case("repeat-full-history-anthropic", "/v1/messages", {
+        "messages": [{"role": "user", "content": "hi"}], "enable_thinking": False,
+        "temperature": 0, "max_tokens": 2, "repeat_last_n": -1, "repeat_penalty": 1.25,
+    }, [-1, 1.25])
+
+    try:
+        table = {
+            "repeat_last_n": {"mode": "default", "value": 16},
+            "repeat_penalty": {"mode": "force", "value": 1.25},
+        }
+        status, _, raw = request(base, "/admin/overrides", table)
+        check(status == 200, "repeat-override-set", raw[:400])
+        wire_case("repeat-override-injected", "/v1/completions", {
+            "prompt": "x", "temperature": 0, "max_tokens": 2,
+        }, [16, 1.25])
+        status, _, raw = request(base, "/admin/overrides", {
+            "repeat_penalty": {"mode": "force", "value": 0},
+        })
+        check(status == 400, "repeat-override-positive-validation", raw[:300])
+    finally:
+        request(base, "/admin/overrides", {})
+
+    if slots != 1:
+        print("SKIP repeat mixed-INFO checks (requires --slots 1)")
+        return
+
+    def set_support(value):
+        check(engine_command(engine, f"SETREPEAT {value}").strip() == b"OK",
+              f"repeat-fake-info-{value}")
+
+    def default_body(seed=None):
+        body = {"prompt": "x", "temperature": 0, "max_tokens": 2}
+        if seed is not None:
+            body["seed"] = seed
+            body["temperature"] = 1
+        return body
+
+    # A fresh generation connection re-reads INFO. Once it reports an old
+    # engine, explicit repeat fails before GEN while legacy requests still run.
+    set_support(0)
+    status, _, raw = request(base, "/v1/completions", default_body(424242))
+    check(status == 502, "repeat-mixed-disconnect-to-old", raw[:300])
+    status, _, raw = request(base, "/v1/completions", default_body())
+    check(status == 200, "repeat-mixed-old-info-probed", raw[:300])
+    bias_log(engine)
+    status, _, raw = request(base, "/v1/completions",
+                             dict(default_body(), repeat_last_n=64))
+    check(status == 502 and not bias_log(engine), "repeat-old-engine-502-before-gen", raw[:400])
+    status, _, raw = request(base, "/v1/completions", default_body())
+    check(status == 200, "repeat-old-engine-legacy-request-unaffected", raw[:300])
+
+    set_support(1)
+    status, _, raw = request(base, "/v1/completions", default_body(424242))
+    check(status == 502, "repeat-mixed-disconnect-to-new", raw[:300])
+    status, _, raw = request(base, "/v1/completions", default_body())
+    check(status == 200, "repeat-mixed-new-info-probed", raw[:300])
+    wire_case("repeat-new-engine-accepted-after-reprobe", "/v1/completions",
+              dict(default_body(), repeat_penalty=1.25), [64, 1.25])
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", default="http://127.0.0.1:18731")
     parser.add_argument("--slots", type=int, default=1,
                         help="the fake engine's --slots (concurrent generations)")
+    parser.add_argument("--engine", default="127.0.0.1:18730",
+                        help="fake engine host:port for GEN wire checks; empty = skip")
     args = parser.parse_args()
 
     tiny_png = (
@@ -110,6 +240,8 @@ def main():
         status, _, raw = request(args.base, path, body)
         payload = json.loads(raw)
         check(status == 400 and "error" in payload, name, raw[:200])
+
+    run_repeat_checks(args.base, args.engine, args.slots)
 
     status, _, raw = request(args.base, "/v1/chat/completions", {
         "messages": [{"role": "user", "content": "hi"}],

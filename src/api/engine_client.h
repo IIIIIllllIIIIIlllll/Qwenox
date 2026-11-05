@@ -38,6 +38,9 @@ struct GenParams {
     bool seeded = false;                 // seed came from the client (SEEDED)
     float presence = 0.0f;
     float frequency = 0.0f;
+    long long repeat_last_n = 64;
+    float repeat_penalty = 1.0f;
+    bool llama_penalties = false;            // explicit repeat_*: shared prompt+accepted window
     std::vector<std::pair<int, float>> bias;   // <= 20480, tid < 248320
     bool logprobs = false;               // sampler-only, like PENALTY/BIAS
     std::vector<std::array<int, 3>> mrope_grids;  // MROPE k t h w ...

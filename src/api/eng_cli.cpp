@@ -8,6 +8,7 @@
 //    "ids":[...],               // ...or explicit token ids (wins over prompt)
 //    "max_tokens":8, "temperature":0, "drafter":1, "seed":7,
 //    "eos":[248046,248044], "logprobs":false, "req":1,
+//    "repeat_last_n":64, "repeat_penalty":1.0,
 //    "snap":-1, "snap2":-1}
 // Output: one JSON line with the reply tokens, decoded text and D-line stats.
 #include <cstdio>
@@ -49,6 +50,9 @@ static qwenox::GenParams params_from_json(const json& q, qwenox::Tokenizer* tok)
     }
     p.presence = q.value("presence_penalty", 0.0f);
     p.frequency = q.value("frequency_penalty", 0.0f);
+    p.llama_penalties = q.contains("repeat_last_n") || q.contains("repeat_penalty");
+    p.repeat_last_n = q.value("repeat_last_n", 64LL);
+    p.repeat_penalty = q.value("repeat_penalty", 1.0f);
     if (q.contains("logit_bias")) {
         for (auto& [k, v] : q["logit_bias"].items())
             p.bias.emplace_back(std::stoi(k), v.get<float>());

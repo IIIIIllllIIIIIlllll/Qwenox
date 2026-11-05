@@ -167,6 +167,7 @@
       <b>跟随客户端</b>：不干预。<b>默认值</b>：只在客户端没传该字段时使用。
       <b>强制</b>：不管客户端传什么都改成这个值（max_tokens 的"强制"是上限，超过才压到此值）。
       对 /v1/chat/completions、/v1/responses、/v1/completions 都生效，思考相关字段对 completions 不起作用。
+      客户端传入或覆盖注入任一 repeat 字段都会启用 llama.cpp 共享窗口；两个字段都不出现则保持旧 presence/frequency 语义。
       被改写的字段会写进响应头 <span class="mono">X-Qwenox-Overrides</span>。保存后立即生效，并持久化到服务端文件，重启后仍有效。
     </p>
     <table class="ovr">
@@ -336,6 +337,10 @@ const OVR_FIELDS = [
     note: "-2 ~ 2" },
   { k: "frequency_penalty", label: "frequency_penalty", type: "num", min: -2, max: 2, step: 0.1, def: 0,
     note: "-2 ~ 2" },
+  { k: "repeat_last_n", label: "repeat_last_n", type: "int", min: -1, max: 2147483647, step: 1, def: 64,
+    note: "默认 64；0 = 禁用整个 penalties，-1 = 本请求全历史；共享 prompt + accepted tokens 窗口" },
+  { k: "repeat_penalty", label: "repeat_penalty", type: "num", min: 0, max: Number.MAX_VALUE, positive: true,
+    step: 0.05, def: 1.0, note: "默认 1.0，必须 > 0；显式设置即进入 llama.cpp penalties 模式" },
   { k: "max_tokens", label: "max_tokens", type: "int", min: 1, max: 2147483647, step: 1, def: 32768,
     note: "默认值 = 客户端没给输出上限时用它；强制 = 输出上限，客户端给得更大时压到此值" },
 ];
@@ -393,6 +398,7 @@ function getVal(f) {
   const n = Number(raw);
   if (!isFinite(n)) throw new Error(f.k + " 不是有效数字");
   if (f.type === "int" && !Number.isInteger(n)) throw new Error(f.k + " 必须是整数");
+  if (f.positive && n <= 0) throw new Error(f.k + " 必须大于 0");
   if (n < f.min || n > f.max) throw new Error(f.k + " 超出范围 " + f.min + " ~ " + f.max);
   return n;
 }

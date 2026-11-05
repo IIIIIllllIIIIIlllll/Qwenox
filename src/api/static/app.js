@@ -77,6 +77,7 @@ const I18N = {
     "ovr.hint": "跟随客户端：不干预。默认值：只在客户端没传该字段时使用。" +
       "强制：不管客户端传什么都改成这个值（max_tokens 的“强制”是上限，超过才压到此值）。" +
       "对 /v1/chat/completions、/v1/responses、/v1/completions 都生效，思考相关字段对 completions 不起作用。" +
+      "客户端传入或覆盖注入任一 repeat 字段都会启用 llama.cpp 共享窗口；两个字段都不出现则保持旧 presence/frequency 语义。" +
       "被改写的字段会写进响应头 X-Qwenox-Overrides。保存后立即生效，并持久化到服务端文件，重启后仍有效。",
     "ovr.th_param": "参数", "ovr.th_mode": "模式", "ovr.th_value": "值", "ovr.th_note": "说明",
     "ovr.mode_client": "跟随客户端", "ovr.mode_default": "默认值", "ovr.mode_force": "强制",
@@ -92,6 +93,7 @@ const I18N = {
     "ovr.meta_persist": "持久化文件：{p}", "ovr.meta_memory": "仅内存（未持久化）",
     "ovr.e_need": "{k} 需要填写数值", "ovr.e_num": "{k} 不是有效数字",
     "ovr.e_int": "{k} 必须是整数", "ovr.e_range": "{k} 超出范围 {lo} ~ {hi}",
+    "ovr.e_positive": "{k} 必须大于 0",
     "ovr.f_thinking": "思考开关", "ovr.f_effort": "思考强度", "ovr.f_preserve": "保留历史思考",
     "ovr.n_thinking": "关 = 模板关闭思考，不输出 reasoning_content；客户端不传时为开",
     "ovr.n_effort": "low / medium / xhigh（客户端传 high→xhigh，minimal→low）；仅思考开启时有效",
@@ -100,6 +102,8 @@ const I18N = {
     "ovr.n_top_p": "客户端不传时为 0.95", "ovr.n_top_k": "0 = 不限；客户端不传时为 20",
     "ovr.n_min_p": "客户端不传时为 0",
     "ovr.n_presence": "-2 ~ 2", "ovr.n_frequency": "-2 ~ 2",
+    "ovr.n_repeat_last_n": "默认 64；0 = 禁用整个 penalties，-1 = 本请求全历史；共享 prompt + accepted tokens 窗口",
+    "ovr.n_repeat_penalty": "默认 1.0，必须 > 0；显式设置即进入 llama.cpp penalties 模式",
     "ovr.n_max_tokens": "默认值 = 客户端没给输出上限时用它；强制 = 输出上限，客户端给得更大时压到此值",
     "eng.status": "引擎状态", "eng.start": "启动引擎", "eng.stop": "停止引擎",
     "eng.state_stopped": "已停止", "eng.state_starting": "启动中（冷加载可能要几分钟）",
@@ -191,7 +195,9 @@ const I18N = {
     "ovr.hint": "Follow client: no interference. Default: used only when the client omitted the field. " +
       "Force: replaces whatever the client sent (for max_tokens it is a cap: larger values clamp to it). " +
       "Applies to /v1/chat/completions, /v1/responses and /v1/completions; thinking fields have no " +
-      "effect on completions. Rewritten fields are reported in the X-Qwenox-Overrides response header. " +
+      "effect on completions. A repeat field sent by the client or injected by an override enables " +
+      "llama.cpp's shared window; with neither repeat field, legacy presence/frequency semantics stay unchanged. " +
+      "Rewritten fields are reported in the X-Qwenox-Overrides response header. " +
       "Saving takes effect immediately and is persisted server-side, surviving restarts.",
     "ovr.th_param": "Parameter", "ovr.th_mode": "Mode", "ovr.th_value": "Value", "ovr.th_note": "Note",
     "ovr.mode_client": "Follow client", "ovr.mode_default": "Default", "ovr.mode_force": "Force",
@@ -207,6 +213,7 @@ const I18N = {
     "ovr.meta_persist": "persist file: {p}", "ovr.meta_memory": "memory only (not persisted)",
     "ovr.e_need": "{k} needs a value", "ovr.e_num": "{k} is not a valid number",
     "ovr.e_int": "{k} must be an integer", "ovr.e_range": "{k} out of range {lo} ~ {hi}",
+    "ovr.e_positive": "{k} must be greater than 0",
     "ovr.f_thinking": "thinking toggle", "ovr.f_effort": "thinking effort",
     "ovr.f_preserve": "preserve history",
     "ovr.n_thinking": "off = template disables thinking, no reasoning_content; on when client omits",
@@ -216,6 +223,8 @@ const I18N = {
     "ovr.n_top_p": "0.95 when the client omits it", "ovr.n_top_k": "0 = unlimited; 20 when omitted",
     "ovr.n_min_p": "0 when the client omits it",
     "ovr.n_presence": "-2 ~ 2", "ovr.n_frequency": "-2 ~ 2",
+    "ovr.n_repeat_last_n": "64 by default; 0 disables all penalties, -1 uses this request's full history; shared prompt + accepted-token window",
+    "ovr.n_repeat_penalty": "1.0 by default, must be > 0; explicitly setting it selects llama.cpp penalties",
     "ovr.n_max_tokens": "default = used when the client gives no output cap; " +
       "force = cap, larger client values clamp to it",
     "eng.status": "Engine status", "eng.start": "Start engine", "eng.stop": "Stop engine",
@@ -729,6 +738,10 @@ const OVR_FIELDS = [
     note: "ovr.n_presence" },
   { k: "frequency_penalty", type: "num", min: -2, max: 2, step: 0.1, def: 0,
     note: "ovr.n_frequency" },
+  { k: "repeat_last_n", type: "int", min: -1, max: 2147483647, step: 1, def: 64,
+    note: "ovr.n_repeat_last_n" },
+  { k: "repeat_penalty", type: "num", min: 0, max: Number.MAX_VALUE, positive: true,
+    step: 0.05, def: 1.0, note: "ovr.n_repeat_penalty" },
   { k: "max_tokens", type: "int", min: 1, max: 2147483647, step: 1, def: 32768,
     note: "ovr.n_max_tokens" },
 ];
@@ -876,6 +889,7 @@ function getSample() {
       const n = Number(raw);
       if (!isFinite(n)) throw new Error(fmtMsg("ovr.e_num", { k: f.k }));
       if (f.type === "int" && !Number.isInteger(n)) throw new Error(fmtMsg("ovr.e_int", { k: f.k }));
+      if (f.positive && n <= 0) throw new Error(fmtMsg("ovr.e_positive", { k: f.k }));
       if (n < f.min || n > f.max)
         throw new Error(fmtMsg("ovr.e_range", { k: f.k, lo: f.min, hi: f.max }));
       v = n;

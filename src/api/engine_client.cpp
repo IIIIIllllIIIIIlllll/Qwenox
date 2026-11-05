@@ -327,6 +327,10 @@ std::string build_gen_request(const GenParams& p) {
     }
     if (p.presence != 0.0f || p.frequency != 0.0f)
         s += " PENALTY " + g9(p.presence) + " " + g9(p.frequency);
+    // REPEAT is an explicit mode selector, not just a non-default value: even
+    // 0 / 1.0 selects the shared prompt+accepted-token penalty window.
+    if (p.llama_penalties)
+        s += " REPEAT " + std::to_string(p.repeat_last_n) + " " + g9(p.repeat_penalty);
     if (!p.bias.empty()) {
         s += " BIAS " + std::to_string(p.bias.size());
         for (const auto& b : p.bias) s += " " + std::to_string(b.first) + " " + g9(b.second);

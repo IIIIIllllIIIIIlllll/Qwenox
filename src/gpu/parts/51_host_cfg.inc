@@ -1942,6 +1942,8 @@ static bool send_all(sockfd_t fd, const std::string& s) {
 // (73159c9).
 constexpr int kVimgMax = 256;
 
+#include "../penalty_state.h"
+
 struct GenReq {
   int64_t req = 0;
   int max_tokens = 0;
@@ -1959,8 +1961,17 @@ struct GenReq {
   // occupancy (PARALLEL) so the output is reproducible under concurrency;
   // unseeded ones follow the live rendezvous size (Model::OccGamma).
   bool seeded = false;
-  // PENALTY (presence, frequency) / BIAS (tid,val pairs) / LOGPROBS: sampler-only.
+  // PENALTY (presence, frequency): legacy sampler-only; REPEAT enables greedy.
+  // BIAS (tid,val pairs) and LOGPROBS remain sampler-only.
   float presence = 0.0f, frequency = 0.0f;
+  // Explicit REPEAT selects llama.cpp's shared prompt+accepted-token window.
+  int64_t repeat_last_n = 64;
+  float repeat_penalty = 1.0f;
+  bool llama_penalties = false;
+  bool repeat_active() const {
+    return llama_penalties && repeat_last_n != 0 &&
+           (repeat_penalty != 1.0f || presence != 0.0f || frequency != 0.0f);
+  }
   std::vector<std::pair<int, float>> bias;
   bool logprobs = false;
   // SNAP / SNAP2: frontend-hinted prefix lengths worth an SSD snapshot (the
@@ -1997,8 +2008,10 @@ struct HostSampler {
   int top_k;
   uint64_t rng;
   float presence, frequency;
+  bool llama_penalties = false;
+  LlamaPenaltyState llama;
   std::vector<std::pair<int, float>> bias;
-  std::unordered_map<int, int> hist;  // emitted token counts (not the prompt)
+  std::unordered_map<int, int> hist;  // legacy mode: emitted token counts (not the prompt)
   std::vector<int> cand;              // scratch: candidate token ids
   std::vector<float> work;            // scratch: top-k preservation / residual
 
@@ -2024,18 +2037,43 @@ struct HostSampler {
     return out;
   }
 
-  void remember(int id) { hist[id]++; }
+  void remember(int id) {
+    hist[id]++;
+    if (llama_penalties) llama.accept(id);
+  }
+
+  void seed_prompt(const std::vector<int>& ids) {
+    if (!llama_penalties) return;
+    for (int id : ids) llama.accept(id);
+  }
+
+  void correct(std::vector<float>& logits) {
+    const int n = (int)logits.size();
+    for (auto& b : bias)
+      if (b.first >= 0 && b.first < n) logits[b.first] += b.second;
+    if (llama_penalties) {
+      llama.apply(logits);
+    } else if (presence != 0.0f || frequency != 0.0f) {
+      for (auto& h : hist)
+        if (h.first >= 0 && h.first < n)
+          logits[h.first] -= presence + frequency * (float)h.second;
+    }
+  }
+
+  int greedy(std::vector<float>& logits) {
+    correct(logits);
+    int sel = 0;
+    for (int i = 1; i < (int)logits.size(); i++)
+      if (logits[i] > logits[sel]) sel = i;
+    remember(sel);
+    return sel;
+  }
 
   // Convert raw logits in place to the normalized distribution after the
   // engine's penalty/bias -> temperature -> top-k -> top-p -> min-p pipeline.
   void prepare(std::vector<float>& logits) {
+    correct(logits);
     const int n = (int)logits.size();
-    for (auto& b : bias)
-      if (b.first >= 0 && b.first < n) logits[b.first] += b.second;
-    if (presence != 0.0f || frequency != 0.0f)
-      for (auto& h : hist)
-        if (h.first >= 0 && h.first < n)
-          logits[h.first] -= presence + frequency * (float)h.second;
     float lmax = -INFINITY;
     for (int i = 0; i < n; i++) lmax = fmaxf(lmax, logits[i]);
     // unnormalized probs after temperature
@@ -2336,6 +2374,14 @@ static GenReq parse_gen(std::istringstream& ss) {
       g.drafter = 3;
     } else if (tok == "PENALTY") {
       if (!(ss >> g.presence >> g.frequency)) { g.reject = true; return g; }
+    } else if (tok == "REPEAT") {
+      if (!(ss >> g.repeat_last_n >> g.repeat_penalty) || g.repeat_last_n < -1 ||
+          g.repeat_last_n > 2147483647LL || !std::isfinite(g.repeat_penalty) ||
+          g.repeat_penalty <= 0.0f) {
+        g.reject = true;
+        return g;
+      }
+      g.llama_penalties = true;
     } else if (tok == "BIAS") {
       int nb;
       if (!(ss >> nb) || nb < 0 || nb > 20480) { g.reject = true; return g; }
@@ -2403,10 +2449,11 @@ static GenReq parse_gen(std::istringstream& ss) {
     static const int def = env_default_drafter();
     g.drafter = (def == 3 && g.sample) ? -1 : def;
   }
-  // PENALTY/BIAS/LOGPROBS are sampler-only (protocol spec): no sampler, no-op
-  // fields would silently mislead the client.
+  // PENALTY/BIAS/LOGPROBS are sampler-only in legacy mode. Explicit REPEAT
+  // also enables llama-style penalties for greedy requests.
   if (!g.sample &&
-      (g.presence != 0.0f || g.frequency != 0.0f || !g.bias.empty() || g.logprobs))
+      ((!g.llama_penalties && (g.presence != 0.0f || g.frequency != 0.0f)) ||
+       !g.bias.empty() || g.logprobs))
     g.reject = true;
   return g;
 }
@@ -3554,17 +3601,25 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     }
     HostSampler smp;
     std::vector<float> lbuf;
-    if (g.sample) {
-      smp.temp = g.temp;
-      smp.top_p = g.top_p;
-      smp.min_p = g.min_p;
-      smp.top_k = g.top_k;
-      smp.rng = g.seed;
+    if (g.sample || g.llama_penalties) {
+      if (g.sample) {
+        smp.temp = g.temp;
+        smp.top_p = g.top_p;
+        smp.min_p = g.min_p;
+        smp.top_k = g.top_k;
+        smp.rng = g.seed;
+      }
       smp.presence = g.presence;
       smp.frequency = g.frequency;
       smp.bias = g.bias;
-      // penalties count GENERATED tokens only: hist starts empty and
-      // sample() records each emitted token
+      smp.llama_penalties = g.llama_penalties;
+      if (g.llama_penalties) {
+        smp.llama.configure(g.repeat_last_n, g.repeat_penalty, g.frequency, g.presence,
+                            g.ids.size() + (size_t)g.max_tokens);
+        smp.seed_prompt(g.ids);
+      }
+      // Legacy penalties count GENERATED tokens only: hist starts empty and
+      // sample() records each emitted token. Llama mode seeds only its own ring.
     }
     auto t0 = std::chrono::steady_clock::now();
     int cur;
@@ -3610,7 +3665,8 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       finish(err_line());
       return;
     }
-    const bool use_ngram = g.drafter == 3 && !g.sample;
+    const bool repeat_greedy = !g.sample && g.repeat_active();
+    const bool use_ngram = !repeat_greedy && g.drafter == 3 && !g.sample;
     // Chain mode (llama.cpp-style fallback): ngram drafts every round it
     // can, MTP takes the rounds where the table has nothing. Sampled
     // requests run spec_loop_chain_sample (ngram rounds re-draw from the
@@ -3618,13 +3674,13 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     // as use_spec). The MTP leg requires a complete MTP KV: a fresh
     // prefill always has one; a cont/restored turn only if the previous
     // request (or the restored checkpoint) left MTP live.
-    const bool use_chain = g.drafter == 4 &&
+    const bool use_chain = !repeat_greedy && g.drafter == 4 &&
                            (!g.sample ||
                             getenv("QWENOX_NOSPEC_SAMPLE") == nullptr);
     const bool chain_mtp = use_chain && m.mtp_avail &&
                            (!cont || mtp_live) &&
                            getenv("QWENOX_NOSPEC") == nullptr;
-    const bool use_spec = !use_ngram && !use_chain && m.mtp_avail &&
+    const bool use_spec = !repeat_greedy && !use_ngram && !use_chain && m.mtp_avail &&
                           g.drafter != 0 && g.drafter != 2 &&
                           g.drafter != 3 && g.drafter != 4 &&
                           (!cont || mtp_live) &&
@@ -3635,7 +3691,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     // single-slot, and requires a fresh prompt: target taps only exist for
     // positions this process prefilled (a restored/continued prefix has no
     // tap ring). Anything else falls back to plain serial decode.
-    const bool use_df2 = g.drafter == 2 && m.df2.on && m.nslots == 1 &&
+    const bool use_df2 = !repeat_greedy && g.drafter == 2 && m.df2.on && m.nslots == 1 &&
                          !cont && ckpt_toks.empty() &&
                          getenv("QWENOX_NOSPEC") == nullptr;
     // Hybrid (QWENOX_DF2_HYBRID=1, greedy, needs MTP weights): the MTP layer
@@ -3798,6 +3854,9 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     if (g.sample) {  // d_logits still holds the last position's logits
       m.get_logits(lbuf);
       cur = smp.sample(lbuf, &cur_lp);
+    } else if (repeat_greedy) {
+      m.get_logits(lbuf);
+      cur = smp.greedy(lbuf);
     }
     cut_lap("sample");
     double pre_ms = std::chrono::duration<double, std::milli>(
@@ -4101,6 +4160,9 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
           if (g.sample) {
             m.get_logits(lbuf);
             cur = smp.sample(lbuf, &cur_lp);
+          } else if (repeat_greedy) {
+            m.get_logits(lbuf);
+            cur = smp.greedy(lbuf);
           }
         }
         dl_tick();
@@ -4278,7 +4340,7 @@ static void conn_main(GpuModel& m, sockfd_t cfd, const kvsnap::Cfg& kvs) {
       char ib[160];
       // fields: mtp draft_head ctx spec_rows default drafter_weights dflash2
       //         cache_mb cache_align kv_slots slot_ctx cache_mode sampling
-      //         kv_pool_tokens
+      //         kv_pool_tokens repeat_penalties
       // The default drafter is the chain (ngram first, MTP fallback) unless
       // QWENOX_DRAFTER overrides; draft_head is a separate shortlist readout
       // and is not part of this checkpoint. kv_slots: concurrent sequences.
@@ -4287,7 +4349,7 @@ static void conn_main(GpuModel& m, sockfd_t cfd, const kvsnap::Cfg& kvs) {
       const long long kv_pool_tokens =
           m.kv_paged ? (long long)m.kv_pool_pages * KV_PAGE
                      : (long long)m.nslots * m.maxctx;
-      snprintf(ib, sizeof ib, "I %d 0 %d 8 %d %d %d 0 0 %d %d 1 1 %lld\n",
+      snprintf(ib, sizeof ib, "I %d 0 %d 8 %d %d %d 0 0 %d %d 1 1 %lld 1\n",
                m.mtp_avail ? 1 : 0, m.maxctx,
                env_default_drafter() >= 0 ? env_default_drafter()
                                           : (m.mtp_avail ? 1 : 0),

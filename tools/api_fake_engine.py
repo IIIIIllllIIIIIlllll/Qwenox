@@ -19,6 +19,8 @@ def send_line(conn, line):
 
 SLOTS = 1
 POOL = 0
+REPEAT_SUPPORT = 1
+LEGACY_INFO = False
 TRACE = []
 TRACE_LOCK = threading.Lock()
 
@@ -72,6 +74,7 @@ def guard_scenario(key, resumed, max_tokens):
 
 
 def handle(conn):
+    global REPEAT_SUPPORT
     pending = b""
 
     def record_cancel(req):
@@ -80,9 +83,10 @@ def handle(conn):
                 if entry["req"] == req:
                     entry["cancel"] += 1
 
-    def cancellable(req, seed):
+    def cancellable(req, seed, repeat):
         nonlocal pending
-        entry = {"req": req, "seed": seed, "cancel": 0, "tokens": 0, "done": False}
+        entry = {"req": req, "seed": seed, "cancel": 0, "tokens": 0, "done": False,
+                 "repeat": repeat}
         with TRACE_LOCK:
             TRACE.append(entry)
         deadline = time.monotonic() + (2.2 if seed == 616163 else 6.0)
@@ -133,8 +137,16 @@ def handle(conn):
                 send_line(conn, "PONG")
                 continue
             if line == "INFO":
-                pool = f" {POOL}" if POOL > 0 else ""
-                send_line(conn, f"I 1 0 262144 8 1 1 0 0 0 {SLOTS} 262144 0 1{pool}")
+                if LEGACY_INFO:
+                    pool = f" {POOL}" if POOL > 0 else ""
+                    send_line(conn, f"I 1 0 262144 8 1 1 0 0 0 {SLOTS} 262144 0 1{pool}")
+                else:
+                    send_line(conn, f"I 1 0 262144 8 1 1 0 0 0 {SLOTS} 262144 0 1 "
+                                    f"{POOL} {REPEAT_SUPPORT}")
+                continue
+            if line.startswith("SETREPEAT "):
+                REPEAT_SUPPORT = int(line.split()[1])
+                send_line(conn, "OK")
                 continue
             if line == "MEM":
                 send_line(conn, "M 1 100 120 200 10 20 310 900 1000 100 400 50")
@@ -170,15 +182,20 @@ def handle(conn):
             n_ids_at = 4 + n_eos
             n_ids = int(fields[n_ids_at])
             ids = [int(v) for v in fields[n_ids_at + 1:n_ids_at + 1 + n_ids]]
+            options_at = n_ids_at + 1 + n_ids
+            repeat = None
+            if "REPEAT" in fields[options_at:]:
+                at = fields.index("REPEAT", options_at)
+                repeat = [int(fields[at + 1]), float(fields[at + 2])]
             bias = []
-            if "BIAS" in fields[n_ids_at + 1 + n_ids:]:
-                at = fields.index("BIAS", n_ids_at + 1 + n_ids)
+            if "BIAS" in fields[options_at:]:
+                at = fields.index("BIAS", options_at)
                 count = int(fields[at + 1])
                 bias = [[int(fields[at + 2 + 2 * i]), float(fields[at + 3 + 2 * i])]
                         for i in range(count)]
             with TRACE_LOCK:
                 BIAS_LOG.append({"max_tokens": int(fields[2]), "sampled": "SAMPLE" in fields,
-                                 "bias": bias})
+                                 "bias": bias, "repeat": repeat})
                 IDS_LOG.append(ids)
 
             grids = []
@@ -217,7 +234,7 @@ def handle(conn):
 
             seed = int(fields[fields.index("SAMPLE") + 5]) if "SAMPLE" in fields else 0
             if seed in (616161, 616162, 616163):
-                cancellable(req, seed)
+                cancellable(req, seed, repeat)
                 continue
 
             max_tokens = int(fields[2])
@@ -275,11 +292,14 @@ def main():
     parser.add_argument("--port", type=int, default=18730)
     parser.add_argument("--slots", type=int, default=1, help="INFO kv_slots")
     parser.add_argument("--pool", type=int, default=0,
-                        help="INFO kv_pool_tokens; 0 = omit (old engine)")
+                        help="INFO kv_pool_tokens (0 = unknown)")
+    parser.add_argument("--legacy-info", action="store_true",
+                        help="omit kv_pool_tokens and repeat_penalties like an old engine")
     args = parser.parse_args()
-    global SLOTS, POOL
+    global SLOTS, POOL, LEGACY_INFO
     SLOTS = args.slots
     POOL = args.pool
+    LEGACY_INFO = args.legacy_info
     with socket.socket() as server:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind(("127.0.0.1", args.port))

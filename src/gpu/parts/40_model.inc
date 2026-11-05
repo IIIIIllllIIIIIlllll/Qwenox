@@ -9251,6 +9251,9 @@ struct GpuModel {
     static const bool off =
         getenv("QWENOX_SMS_GPU") && atoi(getenv("QWENOX_SMS_GPU")) == 0;
     if (off) return false;
+    // Shared/prefix GPU corrections are additive; llama repeat needs one
+    // sign-dependent multiplicative correction over the merged window.
+    if (s.llama_penalties) return false;
     if (s.top_k <= 0 || s.top_k > 64 || s.top_k >= g_cfg.vocab) return false;
     if ((int)s.bias.size() > SMS_BIAS_CAP) return false;
     if (s.bias.size() > 1) {
