@@ -414,18 +414,19 @@
 [data-style="aero"] .style-knob { display: grid; justify-items: center; gap: 5px; padding: 0; border: 0; background: none; color: var(--ink-mid); cursor: pointer; }
 [data-style="aero"] .sk-scale { display: flex; gap: 11px; font: 600 8px/1 var(--f-aero); letter-spacing: .04em; }
 [data-style="aero"] .sk-scale span { opacity: .55; }
-[data-style="aero"] .style-knob[data-pos="cassette"] .sk-a, [data-style="aero"] .style-knob[data-pos="punch"] .sk-b, [data-style="aero"] .style-knob[data-pos="constructivist"] .sk-c, [data-style="aero"] .style-knob[data-pos="aero"] .sk-d { opacity: 1; color: var(--blue-deep); }
+[data-style="aero"] .style-knob[data-pos="cassette"] .sk-a, [data-style="aero"] .style-knob[data-pos="punch"] .sk-b, [data-style="aero"] .style-knob[data-pos="constructivist"] .sk-c, [data-style="aero"] .style-knob[data-pos="aero"] .sk-d, [data-style="aero"] .style-knob[data-pos="faded"] .sk-e { opacity: 1; color: var(--blue-deep); }
 [data-style="aero"] .sk-dial { position: relative; width: 38px; height: 38px; border: 1px solid rgba(38, 112, 139, .4); border-radius: 50%; background: radial-gradient(circle at 32% 24%, #fff, #e0f5f8 38%, #94c7d5 72%, #f1ffff 76%, #6d9faf); box-shadow: 0 3px 7px rgba(12, 67, 89, .35), inset 0 1px 2px #fff; transition: transform .25s cubic-bezier(.5, 1.6, .5, 1); }
 [data-style="aero"] .sk-pointer { position: absolute; left: 50%; top: 4px; width: 3px; height: 14px; margin-left: -1.5px; border-radius: 3px; background: #006da9; box-shadow: 0 1px 0 #fff; }
-[data-style="aero"] .style-knob[data-pos="cassette"] .sk-dial { transform: rotate(-67.5deg); }
-[data-style="aero"] .style-knob[data-pos="punch"] .sk-dial { transform: rotate(-22.5deg); }
-[data-style="aero"] .style-knob[data-pos="constructivist"] .sk-dial { transform: rotate(22.5deg); }
-[data-style="aero"] .style-knob[data-pos="aero"] .sk-dial { transform: rotate(67.5deg); }
+[data-style="aero"] .style-knob[data-pos="cassette"] .sk-dial { transform: rotate(-72deg); }
+[data-style="aero"] .style-knob[data-pos="punch"] .sk-dial { transform: rotate(-36deg); }
+[data-style="aero"] .style-knob[data-pos="constructivist"] .sk-dial { transform: rotate(0deg); }
+[data-style="aero"] .style-knob[data-pos="aero"] .sk-dial { transform: rotate(36deg); }
+[data-style="aero"] .style-knob[data-pos="faded"] .sk-dial { transform: rotate(72deg); }
 
 [data-style="aero"] .plate { grid-area: plate; display: flex; align-items: center; }
 [data-style="aero"] .plate-tag { padding: 5px 16px; border: 1px solid rgba(255, 255, 255, .7); border-radius: 999px; background: linear-gradient(rgba(246, 255, 255, .72), rgba(159, 216, 226, .48)); color: var(--ink-mid); font: 600 11px/1 var(--f-aero); letter-spacing: .16em; box-shadow: inset 0 1px 0 #fff, 0 2px 5px rgba(4, 65, 85, .18); }
 [data-style="aero"] .plate-aero { width: 58px; height: 3px; margin-left: 10px; border-radius: 3px; background: linear-gradient(90deg, #5cecff, transparent); }
-[data-style="aero"] .deco-cassette, [data-style="aero"] .deco-punch, [data-style="aero"] .deco-constructivist { display: none !important; }
+[data-style="aero"] .deco-cassette, [data-style="aero"] .deco-punch, [data-style="aero"] .deco-constructivist, [data-style="aero"] .deco-faded { display: none !important; }
 
 [data-style="aero"] .fpick-overlay { position: absolute; inset: 0; z-index: 60; display: flex; align-items: center; justify-content: center; padding: 30px; background: rgba(4, 46, 74, .38); backdrop-filter: blur(6px); }
 [data-style="aero"] .fpick { display: flex; flex-direction: column; width: min(560px, 100%); max-height: 100%; padding: 16px 18px 11px; border: 1px solid var(--glass-line); border-radius: 14px; background: var(--glass-strong); color: var(--ink); box-shadow: var(--panel-shadow); backdrop-filter: blur(18px); font: 13px/1.5 var(--f-aero); }

@@ -935,7 +935,7 @@
 
 /* ================= 多风格接入（以下规则只作用于新增元素） ================= */
 /* 其它风格的装饰件不显示 */
-[data-style="cassette"] .deco-punch, [data-style="cassette"] .deco-constructivist, [data-style="cassette"] .deco-aero { display: none !important; }
+[data-style="cassette"] .deco-punch, [data-style="cassette"] .deco-constructivist, [data-style="cassette"] .deco-aero, [data-style="cassette"] .deco-faded { display: none !important; }
 
 /* 风格旋钮：米色胶木旋钮，指针指向当前风格；上方小字为各档位 */
 [data-style="cassette"] .style-knob {
@@ -958,7 +958,8 @@
 [data-style="cassette"] .style-knob[data-pos="cassette"] .sk-a,
 [data-style="cassette"] .style-knob[data-pos="punch"] .sk-b,
 [data-style="cassette"] .style-knob[data-pos="constructivist"] .sk-c,
-[data-style="cassette"] .style-knob[data-pos="aero"] .sk-d { opacity: 1; color: #e8862c; }
+[data-style="cassette"] .style-knob[data-pos="aero"] .sk-d,
+[data-style="cassette"] .style-knob[data-pos="faded"] .sk-e { opacity: 1; color: #e8862c; }
 [data-style="cassette"] .sk-dial {
   position: relative;
   width: 38px; height: 38px;
@@ -977,10 +978,11 @@
   border-radius: 1px;
   background: var(--key-ink);
 }
-[data-style="cassette"] .style-knob[data-pos="cassette"] .sk-dial { transform: rotate(-67.5deg); }
-[data-style="cassette"] .style-knob[data-pos="punch"] .sk-dial { transform: rotate(-22.5deg); }
-[data-style="cassette"] .style-knob[data-pos="constructivist"] .sk-dial { transform: rotate(22.5deg); }
-[data-style="cassette"] .style-knob[data-pos="aero"] .sk-dial { transform: rotate(67.5deg); }
+[data-style="cassette"] .style-knob[data-pos="cassette"] .sk-dial { transform: rotate(-72deg); }
+[data-style="cassette"] .style-knob[data-pos="punch"] .sk-dial { transform: rotate(-36deg); }
+[data-style="cassette"] .style-knob[data-pos="constructivist"] .sk-dial { transform: rotate(0deg); }
+[data-style="cassette"] .style-knob[data-pos="aero"] .sk-dial { transform: rotate(36deg); }
+[data-style="cassette"] .style-knob[data-pos="faded"] .sk-dial { transform: rotate(72deg); }
 [data-style="cassette"] .style-knob:hover .sk-dial { filter: brightness(1.04); }
 @media (max-height: 800px) {
   [data-style="cassette"] .sk-dial { width: 34px; height: 34px; }

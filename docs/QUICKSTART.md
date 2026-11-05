@@ -171,7 +171,7 @@ curl -X POST http://127.0.0.1:8731/admin/overrides -H 'Content-Type: application
 
 控制台和可视化页面编译时嵌入 API，源文件在 `src/api/static/`：`index.html`、
 `dashboard.html`、`app.js`、`skin-cassette.css`、`skin-punch.css`、`skin-constructivist.css`、
-`skin-aero.css`、`aero-landscape.svg`、`viz-live.html`、
+`skin-aero.css`、`aero-landscape.svg`、`skin-faded.css`、`qwen-faded.png`、`viz-live.html`、
 `viz-model.html`。项目根（`service.conf` 所在目录）的 `web/` 里有同名文件时，API
 返回这份文件。每次请求都现读，改完刷新浏览器就生效，不用重编，也不用重启。
 

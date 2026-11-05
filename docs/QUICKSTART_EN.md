@@ -142,7 +142,7 @@ startup time is 360 seconds. Exit only cleans up the processes started this time
 The console and visualization pages are embedded into the API at build time; the
 sources are in `src/api/static/`: `index.html`, `dashboard.html`, `app.js`,
 `skin-cassette.css`, `skin-punch.css`, `skin-constructivist.css`, `skin-aero.css`,
-`aero-landscape.svg`, `viz-live.html`,
+`aero-landscape.svg`, `skin-faded.css`, `qwen-faded.png`, `viz-live.html`,
 `viz-model.html`. When
 `web/` in the project root (the directory holding `service.conf`) contains a file
 with the same name, the API serves that file instead. It is read on every request,

@@ -320,9 +320,9 @@ document.getElementById("theme-btn").addEventListener("click", () => {
 // 每种风格一份 skin-<名>.css，规则全部挂在 <html data-style="<名>"> 下，页面预加载全部皮肤，
 // 切换只改属性。旋钮按 STYLES 顺序轮换，data-pos 决定指针角度。
 // 新增风格：STYLES 加一项；index.html 加 link 与首帧脚本白名单；各皮肤的旋钮 CSS 加档位。
-const STYLES = ["cassette", "punch", "constructivist", "aero"];
-// 显示累计请求数的风格（打孔机读卡计数器 / 构成主义海报大数字）
-const COUNT_STYLES = ["punch", "constructivist"];
+const STYLES = ["cassette", "punch", "constructivist", "aero", "faded"];
+// 显示累计请求数的风格（打孔机读卡计数器 / 构成主义海报大数字 / 褪色包装的小票流水号与侧板批号）
+const COUNT_STYLES = ["punch", "constructivist", "faded"];
 
 function applyStyle(s) {
   if (!STYLES.includes(s)) s = STYLES[0];
@@ -407,8 +407,100 @@ function buildPunchDeco() {
   svg.innerHTML = body;
 }
 
-// 读卡机计数器 / 构成主义海报数字 = 累计请求数（/reqstat/page 的 total）。只在这两种风格下取：
-// 一次推理结束（ENG 灯离开 busy）时刷新，平时最多 30 秒一次。
+// 褪色包装的装饰件：盒面插画 + 一维码（其它风格下 .deco-faded 隐藏，启动时一次性生成）
+const EAN_L = ["0001101", "0011001", "0010011", "0111101", "0100011", "0110001", "0101111", "0111011", "0110111", "0001011"];
+const EAN_G = ["0100111", "0110011", "0011011", "0100001", "0011101", "0111001", "0000101", "0010001", "0001001", "0010111"];
+const EAN_R = ["1110010", "1100110", "1101100", "1000010", "1011100", "1001110", "1010000", "1000100", "1001000", "1110100"];
+const EAN_PARITY = ["LLLLLL", "LLGLGG", "LLGGLG", "LLGGGL", "LGLLGG", "LGGLLG", "LGGGLL", "LGLGLG", "LGLGGL", "LGGLGL"];
+
+function ean13Svg(code) {
+  const d = [...code].map(Number), parity = EAN_PARITY[d[0]];
+  let bits = "101";
+  for (let i = 1; i <= 6; i++) bits += (parity[i - 1] === "L" ? EAN_L : EAN_G)[d[i]];
+  bits += "01010";
+  for (let i = 7; i <= 12; i++) bits += EAN_R[d[i]];
+  bits += "101";
+  let body = "";
+  for (let i = 0; i < bits.length; i++) {
+    if (bits[i] !== "1") continue;
+    // 起始/中间/终止护线比数据条长
+    const guard = i < 3 || (i >= 45 && i < 50) || i >= 92;
+    body += `<rect x="${i * 2}" width="2" height="${guard ? 50 : 44}" fill="currentColor"/>`;
+  }
+  return `<svg viewBox="0 0 ${bits.length * 2} 50" preserveAspectRatio="none" shape-rendering="crispEdges">${body}</svg>`;
+}
+
+// 盒面插画：右上消失点放出的光束、顺着光线的数据碎片与玻璃板、Neo-Y2K 弧形光带、轨道环、HUD 细节。
+// 固定种子；褪色层与价签下的原色层画同一张，颜色只由 skin-faded.css 的 --fa-* 决定。
+// 渐变/蒙版 id 带前缀，两份 SVG 才不会互相引用到对方的定义。
+function fadedArtSvg(px) {
+  let seed = 1151;
+  const rnd = () => (seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 4294967296;
+  const R = (a, b) => a + (b - a) * rnd();
+  const W = 1600, H = 1000, vx = 1270, vy = 160;
+  const at = (deg, len) => [vx + Math.cos(deg * Math.PI / 180) * len, vy + Math.sin(deg * Math.PI / 180) * len];
+  const f = (n) => n.toFixed(1);
+  let rays = "";
+  for (let i = 0; i < 18; i++) {  // 宽光束，扇形向左下散开
+    const a = R(96, 214), w = R(1.2, 5.5), [x1, y1] = at(a, 2600), [x2, y2] = at(a + w, 2600);
+    rays += `<polygon class="fa-sh" opacity="${f(R(.05, .2))}" points="${vx},${vy} ${f(x1)},${f(y1)} ${f(x2)},${f(y2)}"/>`;
+  }
+  for (let i = 0; i < 95; i++) {  // 细光线，部分断成数据段
+    const a = R(92, 222), d0 = R(20, 700), [x1, y1] = at(a, d0), [x2, y2] = at(a, d0 + R(180, 1500));
+    const dash = rnd() < .35 ? ` stroke-dasharray="${f(R(20, 90))} ${f(R(6, 20))} ${f(R(3, 10))} ${f(R(6, 20))}"` : "";
+    rays += `<line class="fa-ray" x1="${f(x1)}" y1="${f(y1)}" x2="${f(x2)}" y2="${f(y2)}" stroke-width="${f(R(.5, 2.4))}" opacity="${f(R(.18, .8))}"${dash}/>`;
+  }
+  for (let i = 0; i < 80; i++) {  // 碎片
+    const a = R(95, 218), [x, y] = at(a, R(160, 1550));
+    rays += `<rect class="fa-shard" x="${f(x)}" y="${f(y)}" width="${f(R(5, 64))}" height="${f(R(2, 9))}" opacity="${f(R(.2, .75))}" transform="rotate(${f(a)} ${f(x)} ${f(y)})"/>`;
+  }
+  for (let i = 0; i < 12; i++) {  // 玻璃板
+    const a = R(110, 205), [x, y] = at(a, R(300, 1300)), s = R(60, 230), k = R(.2, .7);
+    rays += `<polygon class="fa-pane" opacity="${f(R(.12, .3))}" points="${f(x)},${f(y)} ${f(x + s)},${f(y - s * k)} ${f(x + s * 1.1)},${f(y + s * .5)} ${f(x + s * .1)},${f(y + s * (1 - k) * .9)}" transform="rotate(${f(a - 180)} ${f(x)} ${f(y)})"/>`;
+  }
+  let fg = "";
+  for (const d of [  // 光带：宽的半透明外层 + 中层 + 亮芯
+    "M -120 830 C 300 600, 720 990, 1080 430 S 1480 90, 1720 250",
+    "M 180 1120 C 380 720, 900 720, 1010 390 S 1150 120, 1290 150",
+    "M -80 420 C 380 280, 820 620, 1270 160",
+    "M 560 1120 C 820 820, 1380 930, 1720 520",
+  ]) {
+    fg += `<path class="fa-rib" d="${d}" stroke-width="78" opacity=".1"/><path class="fa-rib" d="${d}" stroke-width="20" opacity=".2"/><path class="fa-core" d="${d}" stroke-width="2.2" opacity=".75"/>`;
+  }
+  fg += `<ellipse class="fa-ring" cx="${vx}" cy="${vy}" rx="430" ry="118" transform="rotate(-17 ${vx} ${vy})" stroke-width="1.3" opacity=".55"/>`;
+  fg += `<ellipse class="fa-ring" cx="${vx}" cy="${vy}" rx="720" ry="205" transform="rotate(-23 ${vx} ${vy})" stroke-width="1" opacity=".35" stroke-dasharray="2 7"/>`;
+  for (let r = 0; r < 6; r++) for (let c = 0; c < 14; c++) fg += `<circle class="fa-hud" cx="${1370 + c * 13}" cy="${640 + r * 13}" r="1.7" opacity="${f(R(.3, .8))}"/>`;
+  for (let i = 0; i < 7; i++) fg += `<rect class="${rnd() < .5 ? "fa-hud" : "fa-hud-l"}" x="${1080 + i * 14}" y="642" width="9" height="9" opacity=".75"/>`;
+  fg += `<g class="fa-hud-l" opacity=".7"><circle cx="1470" cy="420" r="15"/><line x1="1440" y1="420" x2="1500" y2="420"/><line x1="1470" y1="390" x2="1470" y2="450"/></g>`;
+  fg += `<path class="fa-hud-l" opacity=".6" d="M1062 586 v-22 h22 M1540 564 h22 v22 M1562 738 v22 h-22 M1084 760 h-22 v-22"/>`;
+  fg += `<text class="fa-hud-t" x="1080" y="620" opacity=".75">NEURAL INFERENCE / LOCAL 1151</text>`;
+  fg += `<text class="fa-hud-t" x="1080" y="700" opacity=".55" style="font-size:12px">MIXTURE OF EXPERTS / 262K CONTEXT</text>`;
+  return `<svg class="fade-art" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid slice">
+    <defs>
+      <linearGradient id="${px}bg" x1="0" y1="1" x2="1" y2="0"><stop offset="0" class="fa-st-deep"/><stop offset=".6" class="fa-st-mid"/><stop offset="1" class="fa-st-mid2"/></linearGradient>
+      <radialGradient id="${px}glow" gradientUnits="userSpaceOnUse" cx="${vx}" cy="${vy}" r="900"><stop offset="0" class="fa-st-light" stop-opacity=".85"/><stop offset=".3" class="fa-st-light" stop-opacity=".22"/><stop offset="1" class="fa-st-light" stop-opacity="0"/></radialGradient>
+      <radialGradient id="${px}fall" gradientUnits="userSpaceOnUse" cx="${vx}" cy="${vy}" r="1700"><stop offset="0" stop-color="#fff"/><stop offset=".65" stop-color="#666"/><stop offset="1" stop-color="#111"/></radialGradient>
+      <mask id="${px}m"><rect width="${W}" height="${H}" fill="url(#${px}fall)"/></mask>
+    </defs>
+    <rect width="${W}" height="${H}" fill="url(#${px}bg)"/>
+    <rect width="${W}" height="${H}" fill="url(#${px}glow)"/>
+    <g mask="url(#${px}m)">${rays}</g>
+    ${fg}
+  </svg>`;
+}
+
+function buildFadedDeco() {
+  for (const [sel, px] of [[".fade-print-old", "fao"], [".fade-print-orig", "far"]]) {
+    const el = document.querySelector(sel);
+    if (el) el.insertAdjacentHTML("afterbegin", fadedArtSvg(px));
+  }
+  for (const el of document.querySelectorAll(".fade-barcode[data-code]")) {
+    if (/^\d{13}$/.test(el.dataset.code)) el.innerHTML = ean13Svg(el.dataset.code);
+  }
+}
+
+// 读卡机计数器 / 构成主义海报数字 / 褪色包装的流水号与批号 = 累计请求数（/reqstat/page 的 total）。
+// 只在这几种风格下取：一次推理结束（ENG 灯离开 busy）时刷新，平时最多 30 秒一次。
 const readerCount = { at: 0, lastDot: "" };
 async function readerCountRefresh() {
   if (!COUNT_STYLES.includes(document.documentElement.dataset.style)) return;
@@ -416,7 +508,7 @@ async function readerCountRefresh() {
   try {
     const j = await getJSON("/reqstat/page?offset=0&limit=1");
     const txt = String(Math.min(j.total || 0, 999999)).padStart(6, "0");
-    for (const id of ["reader-count", "proun-count"]) document.getElementById(id).textContent = txt;
+    for (const el of document.querySelectorAll("#reader-count, #proun-count, .fade-count")) el.textContent = txt;
   } catch (e) { /* 计数器只是装饰，失败保持原值 */ }
 }
 function readerCountTick(dotCls) {
@@ -1710,6 +1802,7 @@ function enterEngine() {
 // ---------------- 启动 ----------------
 
 buildPunchDeco();
+buildFadedDeco();
 initStyle();
 initTheme();
 applyLang();
