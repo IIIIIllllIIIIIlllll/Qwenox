@@ -1,4 +1,5 @@
 #include "../src/kv_admission.h"
+#include "../src/vision_memory.h"
 
 #include <array>
 #include <atomic>
@@ -37,7 +38,21 @@ struct GpuModel {
     if (mutating.load()) unsafe_reads++;
     return pages[(size_t)slot];
   }
+  size_t test_vision_need = 0;
+  mutable std::atomic<int> vision_checks{0};
+  size_t vision_memory_need(int, const VisionMemDemand&) const {
+    vision_checks++;
+    return test_vision_need;
+  }
 };
+
+struct EngineMemStats {
+  uint64_t hip_free = 0, hip_total = 0;
+};
+static std::atomic<uint64_t> g_test_hip_free{0}, g_test_hip_total{0};
+static EngineMemStats memstats_snapshot() {
+  return {g_test_hip_free.load(), g_test_hip_total.load()};
+}
 
 namespace rckpt {
 static bool enabled() { return false; }
@@ -78,6 +93,7 @@ static void reset_slots(int count) {
   g_reserve_decode = 4096;
   g_conn_id = 0;
   tl_slot = -1;
+  g_test_hip_free = g_test_hip_total = (uint64_t)1 << 40;
 }
 
 static void require_turn_free() {
@@ -136,7 +152,23 @@ static void test_arithmetic() {
           "chosen slot must not count itself twice");
   require(kv_admission_need(90, 400, false) == 90, "non-prefix slot reset");
   require(kv_admission_need(90, 100, true) == 100, "continuation keeps mapped pages");
-  std::puts("PASS admission arithmetic / decode cap / context edge");
+  const VisionMemDemand image{14400, 3600};
+  require(vision_workspace_bytes(14400) == 1092556800,
+          "ViT workspace byte formula");
+  const size_t fresh_embedding = 4096 * kVisionEmbeddingRowBytes;
+  require(vision_memory_budget(0, 0, image) ==
+              fresh_embedding + vision_workspace_bytes(14400) + kVisionMemorySafetyBytes,
+          "fresh vision request budget");
+  require(vision_memory_budget(14400, 4096, image) == 0,
+          "vision high-water marks charged twice");
+  const VisionMemDemand embedding_only{14400, 5000};
+  require(vision_memory_budget(14400, 4096, embedding_only) ==
+              5000 * kVisionEmbeddingRowBytes + kVisionMemorySafetyBytes,
+          "embedding old+new allocation peak");
+  const VisionMemDemand huge{1, std::numeric_limits<size_t>::max()};
+  require(vision_memory_budget(0, 0, huge) == std::numeric_limits<size_t>::max(),
+          "vision budget overflow not saturated");
+  std::puts("PASS admission arithmetic / decode cap / context edge / vision budget");
 }
 
 static void test_reset_slot() {
@@ -250,6 +282,63 @@ static void test_cancellation() {
   std::puts("PASS cancellation while waiting for GPU / idle slot");
 }
 
+static void test_vision_memory_queue() {
+  const VisionMemDemand image{1024, 256};
+  reset_slots(2);
+  GpuModel model;
+  model.test_vision_need = 100;
+  g_test_hip_total = 1000;
+  g_test_hip_free = 50;
+  std::atomic<bool> cancel{false};
+  require(slot_admit(model, {20}, 16, cancel, 13, image) == -3,
+          "permanent vision memory shortage did not fail");
+  require_turn_free();
+  require(!admission_waiting(), "failed vision admission left a FIFO ticket");
+
+  reset_slots(2);
+  g_slots[0].busy = true;
+  model.test_vision_need = 100;
+  model.vision_checks = 0;
+  g_test_hip_free = 50;
+  int result = -3;
+  std::thread queued([&] {
+    result = slot_admit(model, {21}, 16, cancel, 14, image);
+    if (result >= 0) release_slot(result);
+  });
+  wait_until([&] { return model.vision_checks.load() >= 1; });
+  // Acquiring the turn here proves the memory waiter released it. Hold the
+  // turn until memory becomes available so resume cannot race this assertion.
+  g_turn.acquire();
+  g_test_hip_free = 200;
+  g_turn.release();
+  queued.join();
+  require(result == 1, "vision request did not resume when memory became available");
+  require_turn_free();
+  slot_leave(0);
+
+  reset_slots(2);
+  g_slots[0].busy = true;
+  model.test_vision_need = 100;
+  model.vision_checks = 0;
+  g_test_hip_free = 50;
+  cancel = false;
+  result = -3;
+  std::thread cancelled([&] {
+    result = slot_admit(model, {22}, 16, cancel, 15, image);
+    if (result >= 0) release_slot(result);
+  });
+  wait_until([&] { return model.vision_checks.load() >= 1; });
+  cancel = true;
+  g_scv.notify_all();
+  cancelled.join();
+  require(result == -1, "cancelled vision memory wait was not cancelled");
+  require_turn_free();
+  require(!admission_waiting(), "cancelled vision wait left a FIFO ticket");
+  slot_leave(0);
+  reset_slots(2);
+  std::puts("PASS vision memory queue / resume / cancellation / permanent failure");
+}
+
 static void test_continuation_and_single_slot() {
   reset_slots(2);
   GpuModel model;
@@ -331,6 +420,7 @@ int main() {
     test_synchronized_reads();
     test_rejection_and_context_edge();
     test_cancellation();
+    test_vision_memory_queue();
     test_continuation_and_single_slot();
     test_churn();
     std::puts("ALL PASS (KV admission host regression)");

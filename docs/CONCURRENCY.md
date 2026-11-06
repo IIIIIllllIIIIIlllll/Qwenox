@@ -59,6 +59,12 @@ rckpt 检查点连同 MTP 层的页一起钉住，恢复后继续 MTP 投机（`
   恢复逐段轮流。同一版修了 PLE 下一段预取跨槽误用的问题：两路同时起步时，分段起点相同，
   先进来的那路会读到另一路的 PLE 行。验证脚本是 `tools/prefill_sched_win.sh`（`SMOKE=1` 只跑约 2 分钟冒烟）。
 - **超出路数**：第 N+1 个请求在引擎（和 API）里排队，直到有槽位空出；排队中可以取消。
+- **视觉临时显存不足**：带图片的请求在认领槽位前，按最大图片 patch 数、累计图像 embedding、共享 ViT
+  和候选槽位已有的高水位计算新增分配峰值，并保留 512 MiB 安全余量。余量不足且还有其他活动请求时，
+  请求保留 FIFO 位置但释放 GPU turn，等余量恢复后自动继续；排队中可以取消。已经没有其他活动请求仍不足时，
+  只拒绝当前图片请求。ViT 或图像 embedding 分配中途失败也会清理部分分配、返回请求级错误，不再终止整个引擎。
+  注意 ViT 工作区和每槽位 embedding 都是高水位常驻，排队本身不会把它们缩回去；持续不足仍需降低 KV 池、
+  上下文或图片规格。
 - **槽位复用**：新请求优先选 hist 是其严格前缀的空闲槽位（多轮对话免 prefill），其次
   空槽，再次连接已断开的最久未用槽，最后最久未用槽。
 - **池不够时**（按顺序）：先淘汰 RAM 检查点；再丢空闲槽位的 KV（最久未用优先）；
@@ -119,3 +125,9 @@ bash tools/conc_diverge_win.sh         # 排查用：单跑参考 + 若干并发
 是否一致”一节，用 `QWENOX_OCC_FORCE=4` 判定，按人数选 γ 的那次只报告。
 `conc_diverge_win.sh` 的用法见文件头（`CONFIGS="base|QWENOX_OCC_FORCE=4"`、`CONC_SEEDED=1`、
 GGUF 用 `MODEL_ARGS=<gguf> GGUF_MTP=<sidecar>`）。
+
+视觉显存恢复测试不需要主模型：`python tools/kv_admission_test.py` 覆盖分配前排队、恢复、取消和持续不足；
+`python tools/vision_oom_test.py --engine build/qwenox-engine-win.exe` 用真实视觉塔逐一注入 16 个 ViT
+分配失败，检查正常基线与请求级错误。测试注入变量 `QWENOX_VISION_OOM_AT=1..16`（工作区第 N 次分配）
+和 `QWENOX_VISION_EMBED_OOM=1`（图像 embedding）默认关闭，且每进程最多触发一次。
+`QWENOX_VISION_TEST_LOW_ONCE=1` 则只让第一次 admission 显存检查失败，用于验证排队后按真实余量自动恢复。

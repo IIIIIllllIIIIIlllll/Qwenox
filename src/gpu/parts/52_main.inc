@@ -438,8 +438,14 @@ int main(int argc, char** argv) {
     vt.lt_ws = vws_bytes;
     auto t0 = std::chrono::steady_clock::now();
     vt.load(vision_tower.c_str());
-    int M = vt.forward((const float*)patches.data.data(), P, g[1], g[2],
-                       vision_test.c_str());
+    int M = -1;
+    try {
+      M = vt.forward((const float*)patches.data.data(), P, g[1], g[2],
+                     vision_test.c_str());
+    } catch (const std::exception& e) {
+      fprintf(stderr, "vision-test: %s\n", e.what());
+      return 1;
+    }
     CK(hipStreamSynchronize(g_str));
     double ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - t0)

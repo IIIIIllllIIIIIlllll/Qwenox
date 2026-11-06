@@ -117,6 +117,7 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -146,6 +147,7 @@
 #include "../engine_net.h"
 #include "../ple_prefetch.h"
 #include "../kv_admission.h"
+#include "../vision_memory.h"
 #include "../perfsnap.h"
 #include "../version.h"
 #include "../crashdiag.h"  // 崩溃报告 / 飞行记录（CK 记录调用点，见 00_platform.inc）

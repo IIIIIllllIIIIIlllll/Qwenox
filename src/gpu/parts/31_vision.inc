@@ -627,6 +627,17 @@ static void vit_npy_write_u16(const char* path, const uint16_t* p,
   fclose(f);
 }
 
+[[noreturn]] static void vision_alloc_fail(const char* name, size_t bytes, int P,
+                                           hipError_t error, const EngineMemStats& ms) {
+  char message[512];
+  snprintf(message, sizeof message,
+           "vision allocation %s failed for P=%d: %.2f MiB, %s; "
+           "HIP free %.2f/%.2f GiB",
+           name, P, bytes / 1048576.0, hipGetErrorString(error),
+           ms.hip_free / 1073741824.0, ms.hip_total / 1073741824.0);
+  throw std::runtime_error(message);
+}
+
 // ---- VisionTower: weights + forward, handles borrowed from the engine ----
 struct VisionTower {
   hipblasLtHandle_t lth = nullptr;
@@ -841,35 +852,61 @@ struct VisionTower {
     return __half_as_ushort(h);
   }
 
+  void clear_workspace() {
+#define QWENOX_VIT_FREE(p) \
+    do {                   \
+      if (p) (void)hipFree(p); \
+      p = nullptr;         \
+    } while (0)
+    QWENOX_VIT_FREE(d_h); QWENOX_VIT_FREE(d_n); QWENOX_VIT_FREE(d_qkv);
+    QWENOX_VIT_FREE(d_attn); QWENOX_VIT_FREE(d_mlp); QWENOX_VIT_FREE(d_out);
+    QWENOX_VIT_FREE(d_xbf); QWENOX_VIT_FREE(d_xlo);
+    QWENOX_VIT_FREE(d_qb); QWENOX_VIT_FREE(d_kb); QWENOX_VIT_FREE(d_vb);
+    QWENOX_VIT_FREE(d_emb_bf16); QWENOX_VIT_FREE(d_cos); QWENOX_VIT_FREE(d_sin);
+    QWENOX_VIT_FREE(d_idx); QWENOX_VIT_FREE(d_wts);
+#undef QWENOX_VIT_FREE
+    capP = 0;
+  }
+
   void ensure(int P) {
     if (P <= capP) return;
-    if (capP) {
-      (void)hipFree(d_h); (void)hipFree(d_n); (void)hipFree(d_qkv);
-      (void)hipFree(d_attn);
-      (void)hipFree(d_mlp); (void)hipFree(d_out); (void)hipFree(d_xbf);
-      (void)hipFree(d_xlo);
-      (void)hipFree(d_qb); (void)hipFree(d_kb); (void)hipFree(d_vb);
-      (void)hipFree(d_emb_bf16);
-      (void)hipFree(d_cos); (void)hipFree(d_sin); (void)hipFree(d_idx);
-      (void)hipFree(d_wts);
-    }
+    clear_workspace();
+    static std::atomic<bool> test_fired{false};
+    const char* test = getenv("QWENOX_VISION_OOM_AT");
+    const int fail_at = test ? atoi(test) : 0;
+    int allocation_index = 0;
+    auto alloc = [&](auto* p, size_t bytes, const char* name) {
+      allocation_index++;
+      hipError_t error = hipSuccess;
+      if (fail_at == allocation_index && !test_fired.exchange(true)) {
+        fprintf(stderr, "vision: injected allocation failure at %s (P=%d)\n", name, P);
+        error = hipErrorMemoryAllocation;
+      } else {
+        error = hipMalloc(p, bytes);
+      }
+      if (error != hipSuccess) {
+        const EngineMemStats ms = memstats_snapshot();
+        clear_workspace();
+        vision_alloc_fail(name, bytes, P, error, ms);
+      }
+    };
     int M = P / 4;
-    CK(hipMalloc(&d_h, (size_t)P * 1152 * 4));
-    CK(hipMalloc(&d_n, (size_t)P * 1152 * 4));
-    CK(hipMalloc(&d_qkv, (size_t)P * 3456 * 4));
-    CK(hipMalloc(&d_attn, (size_t)P * 1152 * 4));
-    CK(hipMalloc(&d_mlp, (size_t)P * 4608 * 4));  // merger fc1 also needs 4608
-    CK(hipMalloc(&d_out, (size_t)M * 2560 * 4));
-    CK(hipMalloc(&d_xbf, (size_t)P * 4608 * 2));
-    CK(hipMalloc(&d_xlo, (size_t)P * 4608 * 2));
-    CK(hipMalloc(&d_qb, (size_t)P * 1152 * 2));
-    CK(hipMalloc(&d_kb, (size_t)P * 1152 * 2));
-    CK(hipMalloc(&d_vb, (size_t)P * 1152 * 2));
-    CK(hipMalloc(&d_emb_bf16, (size_t)M * 2560 * 2));
-    CK(hipMalloc(&d_cos, (size_t)P * 72 * 4));
-    CK(hipMalloc(&d_sin, (size_t)P * 72 * 4));
-    CK(hipMalloc(&d_idx, (size_t)P * 4 * 4));
-    CK(hipMalloc(&d_wts, (size_t)P * 4 * 4));
+    alloc(&d_h, (size_t)P * 1152 * 4, "d_h");
+    alloc(&d_n, (size_t)P * 1152 * 4, "d_n");
+    alloc(&d_qkv, (size_t)P * 3456 * 4, "d_qkv");
+    alloc(&d_attn, (size_t)P * 1152 * 4, "d_attn");
+    alloc(&d_mlp, (size_t)P * 4608 * 4, "d_mlp");  // merger fc1 also needs 4608
+    alloc(&d_out, (size_t)M * 2560 * 4, "d_out");
+    alloc(&d_xbf, (size_t)P * 4608 * 2, "d_xbf");
+    alloc(&d_xlo, (size_t)P * 4608 * 2, "d_xlo");
+    alloc(&d_qb, (size_t)P * 1152 * 2, "d_qb");
+    alloc(&d_kb, (size_t)P * 1152 * 2, "d_kb");
+    alloc(&d_vb, (size_t)P * 1152 * 2, "d_vb");
+    alloc(&d_emb_bf16, (size_t)M * 2560 * 2, "d_emb_bf16");
+    alloc(&d_cos, (size_t)P * 72 * 4, "d_cos");
+    alloc(&d_sin, (size_t)P * 72 * 4, "d_sin");
+    alloc(&d_idx, (size_t)P * 4 * 4, "d_idx");
+    alloc(&d_wts, (size_t)P * 4 * 4, "d_wts");
     capP = P;
   }
 

@@ -2692,12 +2692,16 @@ static size_t log_prefix_miss(long long req, const std::vector<int>& ids, int ch
 
 // Wait (FIFO) for an idle slot and claim it; -1 if cancelled while queued,
 // -2 if the shared KV pool cannot fit the request alongside the reservations
-// of the requests already running.
+// of the requests already running, -3 if a vision request cannot fit even
+// after all other requests have left.
 static int slot_admit(GpuModel& m, const std::vector<int>& ids, int max_tokens,
-                      const std::atomic<bool>& cancel, long long req) {
+                      const std::atomic<bool>& cancel, long long req,
+                      const VisionMemDemand& vision = VisionMemDemand{}) {
   std::unique_lock<std::mutex> lk(g_sm);
   const uint64_t t = g_ticket++;
   g_wait.push_back(t);
+  bool vision_waiting = false;
+  std::chrono::steady_clock::time_point vision_wait_start;
   for (;;) {
     if (cancel) {
       g_wait.remove(t);
@@ -2717,6 +2721,61 @@ static int slot_admit(GpuModel& m, const std::vector<int>& ids, int max_tokens,
       }
       const int s = pick_slot(ids);
       if (s >= 0) {
+        const size_t vision_need =
+            vision.max_p > 0 ? m.vision_memory_need(s, vision) : 0;
+        EngineMemStats vision_ms;
+        if (vision_need || vision_waiting) vision_ms = memstats_snapshot();
+        static std::atomic<bool> test_low_fired{false};
+        const char* test_low = getenv("QWENOX_VISION_TEST_LOW_ONCE");
+        if (vision_need && test_low && atoi(test_low) != 0 &&
+            !test_low_fired.exchange(true)) {
+          vision_ms.hip_free = 0;
+          fprintf(stderr, "%s req %lld: injected low vision memory once\n", log_ts(), req);
+        }
+        if (vision_need && vision_ms.hip_total && vision_ms.hip_free < vision_need) {
+          bool peers = false;
+          for (size_t i = 0; i < g_slots.size(); i++)
+            if ((int)i != s && g_slots[i].busy) peers = true;
+          if (!peers) {
+            fprintf(stderr,
+                    "%s req %lld rejected at admission: vision memory needs %.2f GiB "
+                    "(P=%d rows=%zu), only %.2f GiB free with no active peer to wait for\n",
+                    log_ts(), req, vision_need / 1073741824.0, vision.max_p,
+                    vision.rows, vision_ms.hip_free / 1073741824.0);
+            g_wait.pop_front();
+            g_scv.notify_all();
+            lk.unlock();
+            g_turn.release();
+            return -3;
+          }
+          if (!vision_waiting) {
+            vision_waiting = true;
+            vision_wait_start = std::chrono::steady_clock::now();
+            fprintf(stderr,
+                    "%s req %lld waiting for vision memory: need %.2f GiB, free %.2f GiB "
+                    "(P=%d rows=%zu)\n",
+                    log_ts(), req, vision_need / 1073741824.0,
+                    vision_ms.hip_free / 1073741824.0, vision.max_p, vision.rows);
+          }
+          // Keep the FIFO ticket, but never hold the GPU while sleeping: the
+          // active peer must be able to finish and release its temporary memory.
+          lk.unlock();
+          g_turn.release();
+          lk.lock();
+          g_scv.wait_for(lk, std::chrono::milliseconds(50));
+          continue;
+        }
+        if (vision_waiting) {
+          const double waited = std::chrono::duration<double>(
+                                    std::chrono::steady_clock::now() - vision_wait_start)
+                                    .count();
+          fprintf(stderr,
+                  "%s req %lld vision memory ready after %.1f s: need %.2f GiB, "
+                  "free %.2f GiB\n",
+                  log_ts(), req, waited, vision_need / 1073741824.0,
+                  vision_ms.hip_free / 1073741824.0);
+          vision_waiting = false;
+        }
         if (m.nslots > 1 && m.kv_paged) {
           const Slot& sl = g_slots[(size_t)s];
           size_t lcp = 0;
@@ -3397,7 +3456,18 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       return;
     }
   }
-  const int s = slot_admit(m, g.ids, g.max_tokens, cancel, (long long)g.req);
+  VisionMemDemand vision_demand;
+  for (int i = 0; i < g.vimg; i++) {
+    const int p = (int)(vpatches[i].size() / 1536);
+    vision_demand.max_p = std::max(vision_demand.max_p, p);
+    vision_demand.rows = vision_mem_add(vision_demand.rows, (size_t)p / 4);
+  }
+  const int s =
+      slot_admit(m, g.ids, g.max_tokens, cancel, (long long)g.req, vision_demand);
+  if (s == -3) {
+    finish(err_line());
+    return;
+  }
   if (s == -2) {
     fprintf(stderr, "%s serve: req %lld failed: KV pool cannot fit it "
             "alongside the running request(s)\n", log_ts(), (long long)g.req);
