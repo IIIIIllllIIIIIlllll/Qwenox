@@ -106,7 +106,8 @@ hf download peonist-ai/halogen-qwen3.8-flash-next --local-dir ./models --include
 | `UD-Q4_K_XL/…-0000{1..4}-of-00004.gguf` | 103.7 GiB | 主模型（Linux），4 个分片都要 |
 | `UD-IQ4_XS/…-0000{1..3}-of-00003.gguf` | 87.2 GiB | 主模型（Windows），3 个分片都要 |
 | `MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` | 2.6 GiB | MTP 草稿头 |
-| `mtp-Qwen3.8-Flash-Next-Q8_0.gguf`（仓库根目录） | 3.9 GiB | MTP 草稿头，和上一个二选一即可；Q4_K_M 版不支持 |
+| `mtp-Qwen3.8-Flash-Next-Q8_0.gguf`（仓库根目录） | 3.9 GiB | MTP 草稿头，与 shared-Q8_0、Q4_K_M 版三选一 |
+| `mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf`（仓库根目录） | 2.6 GiB | MTP 草稿头；Q5_0 HC-up 在加载时转为 q8g32，已实测 |
 | `mmproj-BF16.gguf` | 0.85 GiB | 视觉塔；也可以用 hgn 仓库的 `qwen38-flash-next-vision.hgn` |
 
 GGUF 不带 `tokenizer.json`，要从原模型仓库另取（和 hgn 仓库 `tokenizer/` 里的是同一份）。

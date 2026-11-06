@@ -114,7 +114,8 @@ These are the same files llama.cpp uses; if you already have them, symlink them 
 | `UD-Q4_K_XL/…-0000{1..4}-of-00004.gguf` | 103.7 GiB | Main model (Linux), all 4 shards |
 | `UD-IQ4_XS/…-0000{1..3}-of-00003.gguf` | 87.2 GiB | Main model (Windows), all 3 shards |
 | `MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` | 2.6 GiB | MTP draft head |
-| `mtp-Qwen3.8-Flash-Next-Q8_0.gguf` (repo root) | 3.9 GiB | MTP draft head, either this or the previous one; the Q4_K_M version is not supported |
+| `mtp-Qwen3.8-Flash-Next-Q8_0.gguf` (repo root) | 3.9 GiB | MTP draft head; choose one of the shared-Q8_0, Q8_0, and Q4_K_M sidecars |
+| `mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf` (repo root) | 2.6 GiB | MTP draft head; Q5_0 HC-up tensors are converted to q8g32 at load; tested |
 | `mmproj-BF16.gguf` | 0.85 GiB | Vision tower; `qwen38-flash-next-vision.hgn` from the hgn repo also works |
 
 The GGUF repo has no `tokenizer.json`; take it from the original model repo (it is the same file as in the

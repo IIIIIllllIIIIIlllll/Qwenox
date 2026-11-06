@@ -229,11 +229,13 @@ sidecar（没有时不投机），加上 Q8_0 sidecar 后权重为 63.0 GiB。v2
 79.4 / 83.9 vs v2 82.6 GiB；512K 页池 2 路 93.5 vs 92.2 GiB；2026-10-13 实测）。显存上 UD-IQ4_XS 只在不用
 MTP 时占优。
 
-MTP sidecar 用 `mtp-Qwen3.8-Flash-Next-Q8_0.gguf`（4.1 GB，dense 全 Q8_0，路由专家 Q8_0）。它比 Linux 上
-用的 `…-shared-Q8_0.gguf` 多带了 `token_embd` / `output`，引擎不读这两个，草稿头沿用主干的 embed 和
-lm_head：`token_embd` 两边逐字节相同（md5 一致），说明出自同一个 checkpoint。`…-Q4_K_M.gguf` 版里有
-Q5_0 张量（hc_*_up），引擎还不支持，而且草稿头精度越低接受率越低，不推荐。分片目录里有多个 `mtp-*.gguf`
-时引擎不会自动挑，必须显式指定（`GGUF_MTP_FILE` 或 `QWENOX_GGUF_MTP`）。
+MTP sidecar 可选 `mtp-Qwen3.8-Flash-Next-Q8_0.gguf` 或 `mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf`。Q8_0 版
+（4.1 GB，dense 全 Q8_0，路由专家 Q8_0）比 Linux 上用的 `…-shared-Q8_0.gguf` 多带了
+`token_embd` / `output`，引擎不读这两个，草稿头沿用主干的 embed 和 lm_head：`token_embd` 两边逐字节相同
+（md5 一致），说明出自同一个 checkpoint。Q4_K_M 版中的三个 `hc_*_up` 为 Q5_0，现由通用 CPU 反量化路径
+解码，并在加载时重量化为 q8g32；routed-expert gate/up/down 分别为 Q4_K/Q4_K/Q8_0，不经过原生 Q5_0
+dense GPU kernel。分片目录里有多个 `mtp-*.gguf` 时引擎不会自动挑，必须显式指定（`GGUF_MTP_FILE` 或
+`QWENOX_GGUF_MTP`）。
 
 实现要点：
 
@@ -244,7 +246,7 @@ Q5_0 张量（hc_*_up），引擎还不支持，而且草稿头精度越低接�
 - 小 P（decode/投机验证）GEMV：`26_kernels_moe_gguf.inc` 新增 `UnitW<kIq4nl / kIq4xs / kIq3s>`；IQ4 码本
   在寄存器里用 `v_perm` 查表，IQ3_S grid 在 `__constant__`。点积写成显式 `fmaf` 链：专家去重路径要求与
   普通路径逐位相同，隐式 fp-contract 在两个 kernel 里不一定一样。
-- 逐层混合类型：`moe_ggx_up/down`（27 末尾）按每层的 `tgu/tdn` 派发——K-quant/Q5_1/Q8_0 走 `k_moe_gg`，
+- 逐层混合类型：`moe_ggx_up/down`（27 末尾）按每层的 `tgu/tdn` 派发——K-quant/Q5_0/Q5_1/Q8_0 走 `k_moe_gg`，
   IQ 走 `k_moe_lut`。
 - lm_head Q6_K：加载时按 ggml 语义反量化，再每 32 个元素重量化为 q8g32（`gguf_map::add_q8` 的非 Q8_0 分支）。
   8-bit 码对 6-bit 源，误差不超过源量化步长的 1/8；decode logits GEMV 读取字节与 Q8_0 dense 一致。
@@ -422,6 +424,17 @@ CPU `gguf::dequant_row` 按 ggml 的 32 元素 / 22 B 块解码；小 P GEMV 复
 - 完整四分片纯 GGUF（禁用 MTP、KVSNAP 和 RAM 检查点）已成功加载并生成 128 token：
   权重 60.6 GiB，device arena 70.20 GiB；2048-token prefill 为 711.2 tok/s，普通 decode
   为 28.8 tok/s，进程正常退出。
+
+### Q4_K_M MTP sidecar（2026-11-06）
+
+Q5_0 的支持按张量槽位区分：routed-expert down 使用原生 GPU 路径；dense 映射槽位在加载时经 CPU
+反量化并重量化为 q8g32；routed-expert gate/up 尚未支持 Q5_0。Q4_K_M MTP 的三个 Q5_0 都位于 dense
+HC-up，因此属于已支持范围。
+
+实测 UD-IQ4_XS 主权重与 Q4_K_M MTP sidecar 组合，`qwenox-bench` 的模型加载、完整 prefill、增量
+prefill 和 MTP decode 全部 PASS，日志出现 `mtp: draft head enabled`。在 maxctx 262144、gamma=4、
+每场景生成 128 token、单轮采样下，加权 prefill 为 **1534.4 tok/s**，MTP decode 为 **35.6 tok/s**，
+草稿接受率为 **47.6%**，最终结果为 `Benchmark complete: PASS`。
 
 ## 验证脚本
 
