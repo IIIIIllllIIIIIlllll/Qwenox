@@ -5,6 +5,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <list>
 #include <mutex>
 #include <stdexcept>
@@ -13,8 +15,18 @@
 
 static constexpr int KV_PAGE = 256;
 static const char* log_ts() { return "test:"; }
+static bool g_turn_prof = false;
+static thread_local int tl_turn_tag = 0;
+static struct {
+  void on_acquire() {}
+  void on_release(int) {}
+} g_turnprof;
 
 struct GpuModel {
+  static bool env_zero(const char* name) {
+    const char* value = std::getenv(name);
+    return value && std::strcmp(value, "0") == 0;
+  }
   int nslots = 2;
   bool kv_paged = true;
   int kv_pool_pages = 2048, maxctx = 524288;
@@ -27,7 +39,19 @@ struct GpuModel {
   }
 };
 
+namespace rckpt {
+static bool enabled() { return false; }
+static size_t lcp(const std::vector<int>&) { return 0; }
+}
+namespace kvsnap {
+static uint64_t g_fp = 0;
+static size_t shared_tokens(const std::vector<int>&, uint64_t) { return 0; }
+}
+
 #include "kv_admission_serve.inc"
+
+static void borrow_abort_check() {}
+static void borrow_turn(GpuModel&) {}
 
 static void require(bool passed, const char* name) {
   if (!passed) throw std::runtime_error(name);
@@ -67,6 +91,15 @@ static void release_slot(int slot) {
 }
 
 static void test_arithmetic() {
+  (void)&borrow_abort_check;
+  (void)&borrow_turn;
+  require(lend_light_only() == !GpuModel::env_zero("QWENOX_CONC_LEND_LIGHT_ONLY"),
+          "light-only lending configuration");
+  require(prefill_srpt() == !GpuModel::env_zero("QWENOX_PREFILL_SRPT"),
+          "prefill SRPT configuration");
+  const size_t expected_fork = GpuModel::env_zero("QWENOX_FORK_CKPT") ? 0 : 1984;
+  require(fork_cut(std::vector<int>(4096, 3), 2048, 0, 0, 1) == expected_fork,
+          "fork cut checkpoint selection");
   int cap = -1;
   require(kv_admission_decode_cap(nullptr, cap) && cap == 4096, "default decode cap");
   require(kv_admission_decode_cap("0", cap) && cap == 0, "zero decode cap");

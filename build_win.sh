@@ -416,6 +416,7 @@ build_settings() {
 
 build_test() {
     python tools/kv_admission_test.py --cxx "$TR/lib/llvm/bin/clang++.exe"
+    python tools/kv_page_test.py --cxx "$TR/lib/llvm/bin/clang++.exe"
     echo "[编译] build/ktest-win.exe"
     "$HIPCC" "${FLAGS[@]}" ${NPU_FLAGS[@]+"${NPU_FLAGS[@]}"} -I src/gpu tools/ktest.cu \
       -o build/ktest-win.exe ${NPU_LINK[@]+"${NPU_LINK[@]}"}

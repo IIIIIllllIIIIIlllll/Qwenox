@@ -176,6 +176,11 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
   const bool btv = getenv("QWENOX_QSA_WMMA") && !kv_fp32 &&
                    getenv("QWENOX_QSA_WMMA_BTV");
   const bool fused = getenv("QWENOX_PREFILL_UNFUSED") == nullptr;
+  const char* cut_off = getenv("QWENOX_CUT_INPASS");
+  const bool cut_inpass = !(cut_off && cut_off[0] == '0' && cut_off[1] == 0) &&
+                          getenv("QWENOX_GDN_FUSED") && !getenv("QWENOX_GDN_LOOP") &&
+                          !getenv("QWENOX_GDN_NOSPLIT") && getenv("QWENOX_GR_BF16") && fused &&
+                          !getenv("QWENOX_PLE_LOOP");
   const bool moe_det = getenv("QWENOX_MOE_ATOMIC") == nullptr;  // 与 40_model.inc 同步
   const bool moe_lt_ok = getenv("QWENOX_MOE_LT") && !moe_q4w_env() && g_cfg.topk == 10 && moe_det &&
                          !getenv("QWENOX_MOE_HOST_ROUTE") &&
@@ -224,6 +229,10 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
   add((size_t)g_cfg.vocab * 4 * 65);        // d_logits_b
   add(ngdn * 48 * 128 * 128 * 4 + ngdn * 3 * 10240 * 4 + 9 * 10240 * 4 +
       (qsa_dense ? 0 : nqsa * 4 * 128 * 4));  // d_ckpt
+  if (cut_inpass) {
+    add(rb * 4);                              // d_cR（大页复用 d_ckpt）
+    if (!qsa_dense) add(4 * 128 * 4);         // d_cmiraw
+  }
   add((size_t)48 * 2 * 64 * 128 * 4);       // d_gdn_ws
   if (gdn_split)
     add((gdn_str ? std::min<size_t>(gdn_window_chunks, (BP + 63) / 64)

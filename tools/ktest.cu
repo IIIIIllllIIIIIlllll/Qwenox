@@ -1774,7 +1774,7 @@ int main() {
     float* dws;
     TCK(hipMalloc(&dids, P * 16 * 4));
     TCK(hipMalloc(&dws, P * 16 * 4));
-    k_router_topk<<<P, 512>>>(dlg, dids, dws, N, K);
+    k_router_topk<<<P, 512>>>(dlg, dids, dws, N, K, VizTap{});
     std::vector<int> ids(P * 16);
     std::vector<float> ws(P * 16);
     TCK(hipMemcpy(ids.data(), dids, P * 16 * 4, hipMemcpyDeviceToHost));

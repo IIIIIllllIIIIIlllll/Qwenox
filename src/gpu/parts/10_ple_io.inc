@@ -682,6 +682,15 @@ struct KvSeqTable {
     identity = true;
   }
   int rows() const { return mapped * KV_PAGE; }
+  // Additional physical pages needed to write [start, end): unmapped tail
+  // pages plus a private replacement for every shared page in the range.
+  int prepare_need(const KvPagePool& pool, int start, int end) const {
+    const int last = (end + KV_PAGE - 1) / KV_PAGE;
+    int need = std::max(0, last - mapped);
+    for (int lp = std::max(0, start) / KV_PAGE; lp < std::min(last, mapped); lp++)
+      if (pool.ref[(size_t)tab[(size_t)lp]] > 1) need++;
+    return need;
+  }
   // Back rows [0, end). false: end beyond the table or pool exhausted (pages
   // mapped so far stay mapped; a later trim releases them).
   bool reserve(KvPagePool& pool, int end) {

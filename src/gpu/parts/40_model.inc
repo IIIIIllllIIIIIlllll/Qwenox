@@ -1420,6 +1420,10 @@ struct GpuModel {
       ckpt_ring = (size_t)9 * 10240 * 4;
       ckpt_iraw = qsa_dense ? 0 : (size_t)(g_cfg.layers / 4) * 4 * 128 * 4;
       DALLOC(&d_ckpt, ckpt_S + ckpt_convst + ckpt_ring + ckpt_iraw);
+      if (cut_snap_supported()) {
+        DALLOC(&d_cR, (size_t)rb * 4);
+        if (!qsa_dense) DALLOC(&d_cmiraw, 4 * 128 * 4);
+      }
     }
     DALLOC(&d_argmax, 4);
     DALLOC(&d_hnorm_mixer, 10240 * 4);
@@ -4377,8 +4381,15 @@ struct GpuModel {
       kv_fatal_seq("beyond maxctx", end, seq.mapped);
     const int m0 = seq.mapped;
     // pool dry: evict pinned checkpoints (LRU first) until the rows fit
-    while (!seq.reserve(kv_pool, end))
-      if (!kv_evict_one()) kv_fatal_seq("pool exhausted", end, seq.mapped);
+    try {
+      while (!seq.reserve(kv_pool, end))
+        if (!kv_evict_one()) kv_fatal_seq("pool exhausted", end, seq.mapped);
+    } catch (...) {
+      if (seq.mapped > m0)
+        CK(hipMemcpy(ptab + m0, seq.tab.data() + m0,
+                     (size_t)(seq.mapped - m0) * 4, hipMemcpyHostToDevice));
+      throw;
+    }
     CK(hipMemcpy(ptab + m0, seq.tab.data() + m0,
                  (size_t)(seq.mapped - m0) * 4, hipMemcpyHostToDevice));
     if (kv_zero_dbg)  // debug: fresh pages read as zeros, like a zeroed unpaged cache
@@ -4396,6 +4407,10 @@ struct GpuModel {
   void kv_prepare(int start, int end) { kv_prepare_seq(kv_seq, d_ptab, start, end); }
   void kv_prepare_seq(KvSeqTable& seq, int* ptab, int start, int end) {
     if (!kv_paged) return;
+    // Reclaim before the first COW or tail mapping. If eviction throws, this
+    // sequence and its device page table are still at the same boundary.
+    while (kv_pool.nfree() < seq.prepare_need(kv_pool, start, end))
+      if (!kv_evict_one()) kv_fatal_seq("pool exhausted (prepare)", end, seq.mapped);
     const int lp1 = std::min(seq.mapped, (end + KV_PAGE - 1) / KV_PAGE);
     for (int lp = std::max(0, start) / KV_PAGE; lp < lp1; lp++)
       if (kv_pool.ref[(size_t)seq.tab[(size_t)lp]] > 1) kv_cow_seq(seq, ptab, lp);
@@ -5319,14 +5334,13 @@ struct GpuModel {
     return !off && gdn_fused && !gdn_loop && !gdn_nosplit && gr_bf16 && !ple_loop;
   }
   void cut_alloc() {
-    if (d_cS) return;
-    const int nqsa = g_cfg.layers / 4, ngdn = g_cfg.layers - nqsa;
-    CK(hipMalloc(&d_cS, (size_t)ngdn * 48 * 128 * 128 * 4));
-    CK(hipMalloc(&d_cconvst, (size_t)ngdn * 3 * 10240 * 4));
-    CK(hipMalloc(&d_cring, (size_t)9 * 10240 * 4));
-    CK(hipMalloc(&d_ciraw, (size_t)nqsa * 4 * 128 * 4));
-    CK(hipMalloc(&d_cR, (size_t)g_cfg.branches * g_cfg.d * 4));
-    CK(hipMalloc(&d_cmiraw, (size_t)4 * 128 * 4));
+    // Prompt ingest and speculative verify are mutually exclusive on a slot,
+    // so the cut shadow can reuse that slot's verifier checkpoint. Rebind on
+    // every cut: cut_busy serializes owners, but the bound slot may differ.
+    d_cS = d_ckpt;
+    d_cconvst = d_ckpt + ckpt_S / 4;
+    d_cring = d_cconvst + ckpt_convst / 4;
+    d_ciraw = ckpt_iraw ? d_cring + ckpt_ring / 4 : nullptr;
   }
   // chunk start: r = chunk-local cut row in (0, P], else 0. Copies the
   // pre-chunk rings / conv state; the per-site replays below update them.

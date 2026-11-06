@@ -343,6 +343,7 @@ build_api() {
 
 build_test() {
   run 8 180 python3 tools/kv_admission_test.py --cxx "$CXX" || return 1
+  run 8 180 python3 tools/kv_page_test.py --cxx "$CXX" || return 1
   compile build/ktest 8 600 "$HIPCC" -O3 -Werror --offload-arch="$GPU_ARCH" \
     "${NPU_FLAGS[@]}" -I src/gpu tools/ktest.cu -lrocblas -lhipblaslt \
     "${NPU_LINK[@]}" "${BUNDLE_RPATH[@]}" || return 1
