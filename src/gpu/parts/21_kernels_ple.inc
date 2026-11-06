@@ -253,6 +253,8 @@ static void argmax_rows(const float* x, int n, int rows,
 // bias adds first, then penalty subtracts, then this row's draft-prefix
 // penalty subtracts. Each list has unique ids, so within a phase the adds are
 // independent; phases are ordered by __syncthreads (one block per row).
+// Llama rows carry their full window in either the shared or the prefix list;
+// repeat is applied once per corrected id before the additive penalty.
 __global__ void k_corr_apply(float* __restrict__ x, int stride,
                              const int* __restrict__ b_ids,
                              const float* __restrict__ b_vals, int nb,
@@ -260,16 +262,24 @@ __global__ void k_corr_apply(float* __restrict__ x, int stride,
                              const float* __restrict__ h_vals, int nh,
                              const int* __restrict__ p_ids,
                              const float* __restrict__ p_vals,
-                             const int* __restrict__ p_n, int pcap) {
+                             const int* __restrict__ p_n, int pcap, float repeat) {
   float* xr = x + (size_t)blockIdx.y * stride;
   for (int i = threadIdx.x; i < nb; i += blockDim.x) xr[b_ids[i]] += b_vals[i];
   __syncthreads();
-  for (int i = threadIdx.x; i < nh; i += blockDim.x) xr[h_ids[i]] -= h_vals[i];
+  for (int i = threadIdx.x; i < nh; i += blockDim.x) {
+    float& v = xr[h_ids[i]];
+    if (repeat != 1.0f) v = v <= 0.0f ? v * repeat : v / repeat;
+    v -= h_vals[i];
+  }
   __syncthreads();
   const int np = p_n ? p_n[blockIdx.y] : 0;
   const int* pr_ids = p_ids + (size_t)blockIdx.y * pcap;
   const float* pr_vals = p_vals + (size_t)blockIdx.y * pcap;
-  for (int i = threadIdx.x; i < np; i += blockDim.x) xr[pr_ids[i]] -= pr_vals[i];
+  for (int i = threadIdx.x; i < np; i += blockDim.x) {
+    float& v = xr[pr_ids[i]];
+    if (repeat != 1.0f) v = v <= 0.0f ? v * repeat : v / repeat;
+    v -= pr_vals[i];
+  }
 }
 
 // Radix top-k over fp32 logits via their monotonic u32 keys (same map as

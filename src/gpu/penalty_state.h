@@ -65,3 +65,39 @@ struct LlamaPenaltyState {
     }
   }
 };
+
+struct LlamaPenaltyRows {
+  std::vector<int> ids;
+  std::vector<float> values;
+  std::vector<int> counts;
+};
+
+// Row r sees the base window plus drafts[0..base_off+r). The base state is
+// copied once; provisional drafts only advance the copy. A full per-row list
+// keeps repeat/presence singular and naturally handles eviction and rollback.
+inline bool llama_penalty_rows(const LlamaPenaltyState& base, const int* drafts,
+                               int base_off, int rows, size_t stride,
+                               LlamaPenaltyRows& out) {
+  if (base_off < 0 || rows < 0 || (rows && !stride)) return false;
+  out.counts.assign(rows, 0);
+  out.ids.assign((size_t)rows * stride, 0);
+  out.values.assign((size_t)rows * stride, 0.0f);
+  LlamaPenaltyState view = base;
+  for (int r = 0; r < rows; r++) {
+    if (view.counts.size() > stride) return false;
+    int n = 0;
+    for (const auto& h : view.counts) {
+      if (h.second <= 0) continue;
+      out.ids[(size_t)r * stride + n] = h.first;
+      out.values[(size_t)r * stride + n] =
+          (float)h.second * view.frequency + view.presence;
+      n++;
+    }
+    out.counts[r] = n;
+    if (r + 1 < rows) {
+      if (!drafts) return false;
+      view.accept(drafts[base_off + r]);
+    }
+  }
+  return true;
+}

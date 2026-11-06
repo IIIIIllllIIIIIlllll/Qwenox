@@ -255,13 +255,16 @@ static void test_topk(int n) {
   CK(hipFree(d_cn));
 }
 
-static void test_corr(int n) {
+static void test_corr(int n, float repeat) {
   std::mt19937 rng(7);
   const int R = 4, PC = 64;
   std::vector<float> h((size_t)R * n);
   for (auto& v : h) v = (float)(rng() % 1000) * 0.01f;
   std::vector<int> bi = {5, 17, n - 1}, hi = {17, 300, 9000};
   std::vector<float> bv = {1.5f, -2.0f, 3.0f}, hv = {0.25f, 1.0f, 0.5f};
+  h[5] = -1.0f;
+  h[17] = 1.0f;
+  h[n - 1] = -3.0f;
   std::vector<int> pi((size_t)R * PC, 0), pn = {0, 1, 2, 3};
   std::vector<float> pv((size_t)R * PC, 0.0f);
   for (int r = 0; r < R; r++)
@@ -270,11 +273,15 @@ static void test_corr(int n) {
       pv[(size_t)r * PC + j] = 0.125f * (j + 1);
     }
   std::vector<float> ref = h;
+  auto penalize = [&](float& x, float p) {
+    if (repeat != 1.0f) x = x <= 0.0f ? x * repeat : x / repeat;
+    x -= p;
+  };
   for (int r = 0; r < R; r++) {
     float* x = ref.data() + (size_t)r * n;
     for (size_t j = 0; j < bi.size(); j++) x[bi[j]] += bv[j];
-    for (size_t j = 0; j < hi.size(); j++) x[hi[j]] -= hv[j];
-    for (int j = 0; j < pn[r]; j++) x[pi[(size_t)r * PC + j]] -= pv[(size_t)r * PC + j];
+    for (size_t j = 0; j < hi.size(); j++) penalize(x[hi[j]], hv[j]);
+    for (int j = 0; j < pn[r]; j++) penalize(x[pi[(size_t)r * PC + j]], pv[(size_t)r * PC + j]);
   }
   float *d_x, *d_bv, *d_hv, *d_pv;
   int *d_bi, *d_hi, *d_pi, *d_pn;
@@ -295,12 +302,12 @@ static void test_corr(int n) {
   CK(hipMemcpy(d_pv, pv.data(), pv.size() * 4, hipMemcpyHostToDevice));
   CK(hipMemcpy(d_pn, pn.data(), R * 4, hipMemcpyHostToDevice));
   k_corr_apply<<<dim3(1, R), 256>>>(d_x, n, d_bi, d_bv, (int)bi.size(), d_hi,
-                                     d_hv, (int)hi.size(), d_pi, d_pv, d_pn, PC);
+                                     d_hv, (int)hi.size(), d_pi, d_pv, d_pn, PC, repeat);
   CK(hipDeviceSynchronize());
   std::vector<float> out(h.size());
   CK(hipMemcpy(out.data(), d_x, out.size() * 4, hipMemcpyDeviceToHost));
   const bool ok = memcmp(out.data(), ref.data(), out.size() * 4) == 0;
-  printf("  corr_apply: %s\n", ok ? "bit-exact vs CPU" : "MISMATCH");
+  printf("  corr_apply repeat=%g: %s\n", repeat, ok ? "bit-exact vs CPU" : "MISMATCH");
   if (!ok) bad("k_corr_apply differs from CPU");
   for (void* p : {(void*)d_x, (void*)d_bi, (void*)d_bv, (void*)d_hi, (void*)d_hv,
                   (void*)d_pi, (void*)d_pv, (void*)d_pn})
@@ -310,7 +317,7 @@ static void test_corr(int n) {
 int main() {
   for (int n : {248320, 151937, 4099}) test_argmax(n);
   for (int n : {248320, 151937}) test_topk(n);
-  test_corr(248320);
+  for (float repeat : {1.0f, 1.03f, 0.8f}) test_corr(248320, repeat);
   printf(fails ? "FAIL\n" : "PASS\n");
   return fails ? 1 : 0;
 }

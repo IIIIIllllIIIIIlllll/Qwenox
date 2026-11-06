@@ -50,9 +50,17 @@ All on by default; turn off only for troubleshooting:
 
 | Switch | Effect |
 |---|---|
-| `QWENOX_SMS_GPU=0` | Disable GPU sampling prep (bias/penalty corrections + top-k on the GPU, only candidates copied back; active for top_k 1..64, otherwise the host full-vocab path is used). Output distribution unchanged; the exact tokens for a given seed may differ |
+| `QWENOX_SMS_GPU=0` | Disable GPU sampling prep (bias, legacy presence/frequency and llama repeat corrections + top-k on the GPU, only candidates copied back; active for top_k 1..64, otherwise the host full-vocab path is used). Output distribution unchanged; the exact tokens for a given seed may differ |
 | `QWENOX_DRAFT_LM_Q4=0` | Drafts use the production lm_head again (default: the base file's 4-bit copy; affects drafts only, never committed tokens; ~350 MB extra VRAM) |
 | `QWENOX_ARGMAX_OLD=1` | Single-block argmax (differs only on exact ties) |
+
+llama `REPEAT` also uses the GPU sparse path for MTP/chain sampling: drafts share the base window,
+while each verify row simulates its complete hypothetical window, including duplicates, full-window eviction
+and rollback. A per-row window with more than 1024 live IDs, and DFlash2 with active llama penalties, still
+uses the host full-vocab fallback. `repeat_penalty_test` covers window planning; `tg_kernels_test` checks
+bit-exact GPU corrections at repeat=1/1.03/0.8. A real-model small-window run passed 224 `sms-check` rows
+with `bad=0`, and concurrent rendezvous with different repeat parameters produced the same IDs as serial runs.
+The production 32K four-shard IQ4 + Q8_0 MTP comparison improved from 31.8 to 36.2 tok/s (2026-11-06).
 
 Offline reproduction of the API decode paths (`--spec-gen N`, or `tools/pp_prod.sh <tok> LABEL SPEC=256 ...`):
 
