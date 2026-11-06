@@ -6,15 +6,17 @@
 // k_moe_tiles, outputs indexed by slot.
 //
 // Weights stay in their raw llama.cpp block formats (Q4_K / Q5_K for
-// gate+up, Q5_1 / Q8_0 for down; the MTP sidecar has Q8_0 gate+up too). Each stage (two 32-element K blocks) stages
+// gate+up, Q5_0 / Q5_1 / Q8_0 for down; the MTP sidecar has Q8_0 gate+up too).
+// Each stage (two 32-element K blocks) stages
 // the packed codes plus one (scale, bias) half2 per (row, K block) in LDS;
 // each wave then decodes only its own 16 rows to F16 right after the LDS read:
 //
 //   code -> half via v_perm into the mantissa of 1024.0 (0x6400 | q == 1024+q
-//   exactly for q < 32), a packed subtract of 1024 (1152 for Q8_0, whose
-//   signed bytes are carried as q+128 by flipping the sign bit), then one
-//   packed FMA  w = q * scale + bias,
-//   (scale, bias) = (d*sc, -dmin*mn) for Q4_K/Q5_K, (d, m) for Q5_1, (d, 0) Q8_0.
+//   exactly for q < 32), a packed subtract of 1024 (1040 for Q5_0 to produce
+//   q-16, or 1152 for Q8_0 whose signed bytes are q+128 after flipping the
+//   sign bit), then one packed FMA w = q * scale + bias,
+//   (scale, bias) = (d*sc, -dmin*mn) for Q4_K/Q5_K, (d, m) for Q5_1,
+//   (d, 0) for Q5_0/Q8_0.
 //
 // The matrix core then accumulates the whole K extent in F32
 // (wmma_f32_16x16x16_f16). Activations are F16 rows.
@@ -35,7 +37,7 @@
 
 namespace moegg {
 
-constexpr int kQ4K = 12, kQ5K = 13, kQ51 = 7, kQ80 = 8;  // gguf::Type values
+constexpr int kQ4K = 12, kQ5K = 13, kQ50 = 6, kQ51 = 7, kQ80 = 8;  // gguf::Type values
 // IQ formats (UD-IQ4_XS GGUF): small-P GEMV only here; their WMMA path is the
 // LUT kernel family (27_kernels_moe_lut.inc, moe_ggx_up / moe_ggx_down).
 // Names differ from moelut::kIQ4NL/... (k_moe_lut uses both namespaces).
@@ -57,6 +59,7 @@ template <int T>
 __host__ __device__ constexpr size_t row_bytes(size_t k) {
   return T == kQ4K   ? (k / 256) * 144
        : T == kQ5K   ? (k / 256) * 176
+       : T == kQ50   ? (k / 32) * 22
        : T == kQ51   ? (k / 32) * 24
        : T == kIq4nl ? (k / 32) * 18
        : T == kIq4xs ? (k / 256) * 136
@@ -110,7 +113,8 @@ __launch_bounds__(256) __global__
   constexpr int BM = 128, BK = 2;
   static_assert(BN % 16 == 0 && BN <= 64, "BN must match the MoeTile size (<= 64)");
   constexpr int kTokTiles = BN / 16;
-  constexpr bool kQ5 = kType == kQ51;
+  constexpr bool kQ50t = kType == kQ50;
+  constexpr bool kQ5 = kQ50t || kType == kQ51;
   constexpr bool kQ5Kt = kType == kQ5K;
   constexpr bool kQ8 = kType == kQ80;
   static_assert(!kPair || kType == kQ4K || kType == kQ5K || kType == kQ80,
@@ -186,7 +190,13 @@ __launch_bounds__(256) __global__
   };
 
   const auto fetch_stage = [&](int kb0) {
-    if constexpr (kQ5) {
+    if constexpr (kQ50t) {
+      const uint8_t* blk = f_ptr + (kb0 + f_c) * 22;
+      f_dm = 0;
+      __builtin_memcpy(&f_dm, blk, 2);
+      __builtin_memcpy(&f_high, blk + 2, 4);
+      __builtin_memcpy(&f_codes, blk + 6, 16);
+    } else if constexpr (kQ5) {
       const int kb = kb0 + f_c;
       const auto* words = reinterpret_cast<const uint2*>(f_ptr) + kb * 3;
       const uint2 w0 = words[0], w1 = words[1], w2 = words[2];
@@ -279,7 +289,8 @@ __launch_bounds__(256) __global__
 #pragma unroll
   for (int j = 0; j < kTokTiles; ++j) acc[j] = v8f{0, 0, 0, 0, 0, 0, 0, 0};
 
-  const __half2 magic = __floats2half2_rn(kQ8 ? -1152.0f : -1024.0f, kQ8 ? -1152.0f : -1024.0f);
+  const float magic_f = kQ8 ? -1152.0f : kQ50t ? -1040.0f : -1024.0f;
+  const __half2 magic = __floats2half2_rn(magic_f, magic_f);
   const auto compute_stage = [&]() {
     const int row = wave_id * 16 + sub_lane;
     uint4 raw[BK];
@@ -497,7 +508,9 @@ static bool moe_gg_down(int type, const uint8_t* dn, const __half* hid, const Mo
                         hipStream_t st) {
   if (m % 128 || k % 64) return false;
   dim3 grid(m / 128, max_tiles);
-  if (type == moegg::kQ51)
+  if (type == moegg::kQ50)
+    k_moe_gg<moegg::kQ50, false><<<grid, 256, 0, st>>>(dn, nullptr, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
+  else if (type == moegg::kQ51)
     k_moe_gg<moegg::kQ51, false><<<grid, 256, 0, st>>>(dn, nullptr, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
   else if (type == moegg::kQ80)
     k_moe_gg<moegg::kQ80, false><<<grid, 256, 0, st>>>(dn, nullptr, hid, nullptr, tiles, ntiles, pairs, nullptr, m, k);
@@ -514,7 +527,7 @@ static bool moe_gg_down(int type, const uint8_t* dn, const __half* hid, const Mo
 // activations, no F16 rounding), one "unit" per lane step:
 //   Q4_K / Q5_K: 64 elements = sub-block pair j of a 256 super-block
 //                (low nibbles -> sub-block 2j, high nibbles -> 2j+1),
-//   Q5_1 / Q8_0: one 32-element block.
+//   Q5_0 / Q5_1 / Q8_0: one 32-element block.
 // gate/up: one wave per (token, slot, row m); lanes 0-15 walk the gate row,
 //   lanes 16-31 the up row; hid[tok*kpt+s][m] = up * silu(gate) (FP32).
 // down: LPR lanes per output row, all KPT expert partials kept in registers
@@ -672,6 +685,18 @@ template <> struct UnitW<kQ51> {
       }
     }
     return d * dq + mn * sx;
+  }
+};
+template <> struct UnitW<kQ50> : UnitW<kQ51> {
+  __device__ __forceinline__ void load(const uint8_t* __restrict__ row, int u) {
+    const uint8_t* blk = row + (size_t)u * 22;
+    uint16_t dh;
+    __builtin_memcpy(&dh, blk, 2);
+    this->d = __half2float(__ushort_as_half(dh));
+    this->mn = -16.0f * this->d;
+    __builtin_memcpy(&this->qh, blk + 2, 4);
+    __builtin_memcpy(this->qw, blk + 6, 16);
+    this->off = u * 32;
   }
 };
 template <> struct UnitW<kQ80> {  // 34-byte blocks are only 2-byte aligned
@@ -1269,7 +1294,7 @@ inline bool gemv_gu_ok(int t) {
   return t == kQ4K || t == kQ5K || t == kQ80 || t == kIq4xs || t == kIq3s || t == kQ20 ||
          t == kIq2xxs || t == kIq2xs || t == kIq3xxs || t == kIq2s;
 }
-inline bool gemv_dn_ok(int t) { return t == kQ51 || t == kQ80 || t == kIq4nl || t == kQ20; }
+inline bool gemv_dn_ok(int t) { return t == kQ50 || t == kQ51 || t == kQ80 || t == kIq4nl || t == kQ20; }
 // f(std::integral_constant<int, T>) for the runtime type t (one of the gemv_*_ok sets)
 template <class F>
 inline void with_gu_type(int t, F&& f) {
@@ -1289,6 +1314,7 @@ inline void with_gu_type(int t, F&& f) {
 template <class F>
 inline void with_dn_type(int t, F&& f) {
   switch (t) {
+    case kQ50: f(std::integral_constant<int, kQ50>{}); break;
     case kQ51: f(std::integral_constant<int, kQ51>{}); break;
     case kQ80: f(std::integral_constant<int, kQ80>{}); break;
     case kQ20: f(std::integral_constant<int, kQ20>{}); break;

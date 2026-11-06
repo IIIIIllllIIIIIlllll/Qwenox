@@ -1327,7 +1327,7 @@ __global__ void k_dense_tiles(MoeTile* __restrict__ tiles, int* __restrict__ nti
 }
 
 // --- GGUF routed experts, any supported block type (WMMA, P > gemv cap) -----
-// K-quant / Q5_1 / Q8_0 -> k_moe_gg (26); IQ4_NL / IQ4_XS / IQ3_S / Q2_0 -> k_moe_lut
+// K-quant / Q5_0 / Q5_1 / Q8_0 -> k_moe_gg (26); IQ4_NL / IQ4_XS / IQ3_S / Q2_0 -> k_moe_lut
 // on the raw expert-stacked GGUF tensors ([E][m][row bytes], gate and up are
 // separate tensors: up_off = 0). Same contracts as moe_gg_up / moe_gg_down.
 static bool ggx_is_lut(int type) {

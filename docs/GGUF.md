@@ -402,6 +402,27 @@ kernel 的运算顺序一致。这里按 v2 `k_ht_wmma` 的做法实现（f16 WM
 - Q8_0 MTP sidecar 可加载并启用草稿头：37.4 tok/s、commit/round 3.07。与普通 greedy 的前
   54 个生成 token 一致，之后因 verify/decode 数值路径差异分叉，不要求逐 bit 相同。
 
+## Q5_0 down（UD-IQ4_XS 四分片，2026-11-05）
+
+Unsloth `Qwen3.8-Flash-Next-UD-IQ4_XS` 四分片版本的 48 层 routed-expert down 中，33 层使用
+**Q5_0**，其余为 13 层 IQ4_NL 和 2 层 Q2_0。Q5_0 现已支持原生 GPU 加载，不需要离线重量化：
+CPU `gguf::dequant_row` 按 ggml 的 32 元素 / 22 B 块解码；小 P GEMV 复用 Q5_1 点积，以
+`mn=-16d` 表示 `d(q-16)`，普通与专家去重路径共用同一实现；大 P 走 `k_moe_gg` WMMA，
+直接解码 `(q-16)d`，不经过 LUT。22 B 块的非对齐读取严格限制在实际块内。
+
+真实权重与 CPU 参考对拍结果：
+
+- `tools/gguf_dequant_ref_check.cpp`：Q5_0 的 4096 个随机块、131072 个输出与 llama.cpp
+  原函数逐位相同；IQ2_XXS/IQ2_XS/IQ3_S/Q6_K 回归也全部零 mismatch。
+- 第 0 层（IQ3_XXS/Q5_0）P=1/4/48 GEMV 均 PASS，out 最大 rel-L2 为 3.783e-7；
+  P=4/48 的 dedup 与普通路径 hid/out 均逐位相同。
+- 第 0 层与第 47 层（IQ4_XS/Q5_0）P=2048 WMMA 均 PASS，Q5_0 down 最大 rel-L2 为
+  2.009e-4（门槛 1e-2），hid/pairs 非有限值均为 0。
+- 第 7/8 层 IQ4_NL/Q2_0 down 与 Q8_0 MTP sidecar 的 GEMV/WMMA 回归均 PASS。
+- 完整四分片纯 GGUF（禁用 MTP、KVSNAP 和 RAM 检查点）已成功加载并生成 128 token：
+  权重 60.6 GiB，device arena 70.20 GiB；2048-token prefill 为 711.2 tok/s，普通 decode
+  为 28.8 tok/s，进程正常退出。
+
 ## 验证脚本
 
 - `tools/g2_verify.sh` — G2（专家）
@@ -422,7 +443,7 @@ kernel 的运算顺序一致。这里按 v2 `k_ht_wmma` 的做法实现（f16 WM
 - `tools/q8_wmma_test.cu`（`bash tools/ht_wmma_test.sh q8`）— `k_q8g32_wmma` 精度 / 行无关 / 切片 / 速度
 - `tools/iq4xs_conc_win.sh` — UD-IQ4_XS（Windows）：并发（conc_verify 单路 vs 8 路 + 控制面）、生产配置显存、prefill 分段
 - `tools/iq4xs_verify_win.sh` — UD-IQ4_XS（Windows）：kernel 对拍、v2 逐位不变、PPL 一致性/质量、服务端到端、速度
-- `tools/gguf_dequant_ref_check.cpp` — gguf.h CPU 解码（IQ2_XXS、IQ2_XS、IQ3_S、Q6_K）vs ggml 原函数逐位
+- `tools/gguf_dequant_ref_check.cpp` — gguf.h CPU 解码（Q5_0、IQ2_XXS、IQ2_XS、IQ3_S、Q6_K）vs ggml 原函数逐位
 - `tools/moe_gguf_test.cu` — MoE kernel（含 IQ 类型，经 `moe_ggx_*`）vs CPU 参考
 - `tools/moe_gguf_gemv_test.cu` — 小 P 专家 GEMV（含去重路径逐位对照）vs CPU 参考
 - `tools/q8g32_gemv_bench.cu` — q8g32 dense GEMV 各变体（P=1 与 P=4）

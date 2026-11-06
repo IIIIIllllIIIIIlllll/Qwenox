@@ -432,6 +432,21 @@ inline void dequant_row(uint32_t t, const uint8_t* src, float* y, uint64_t k) {
     }
     return;
   }
+  if (t == Q5_0) {
+    for (uint64_t b = 0; b < k / 32; b++, src += 22) {
+      uint16_t dh; memcpy(&dh, src, 2);
+      uint32_t qh; memcpy(&qh, src + 2, 4);
+      float d = h2f(dh);
+      const uint8_t* qs = src + 6;
+      for (int j = 0; j < 16; j++) {
+        int x0 = (qs[j] & 0xF) | (((qh >> j) & 1) << 4);
+        int x1 = (qs[j] >> 4) | (((qh >> (j + 16)) & 1) << 4);
+        y[b * 32 + j] = (x0 - 16) * d;
+        y[b * 32 + j + 16] = (x1 - 16) * d;
+      }
+    }
+    return;
+  }
   if (t == Q5_1) {
     for (uint64_t b = 0; b < k / 32; b++, src += 24) {
       uint16_t dh, mh; memcpy(&dh, src, 2); memcpy(&mh, src + 2, 2);
