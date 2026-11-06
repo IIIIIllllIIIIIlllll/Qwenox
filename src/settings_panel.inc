@@ -1426,6 +1426,7 @@ bool panel_browse(HWND edit) {
     ofn.lpstrFilter = g_lang_en
                            ? L"hgn weights (*.hgn)\0*.hgn\0GGUF weights (*.gguf)\0*.gguf\0All files (*.*)\0*.*\0"
                            : L"hgn 权重 (*.hgn)\0*.hgn\0GGUF 权重 (*.gguf)\0*.gguf\0所有文件 (*.*)\0*.*\0";
+    ofn.nFilterIndex = g_weights_ver == kVerGguf ? 2 : 1;
     ofn.lpstrFile = buf;
     ofn.nMaxFile = MAX_PATH;
     ofn.lpstrInitialDir = initdir.c_str();
