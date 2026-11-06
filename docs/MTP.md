@@ -50,9 +50,15 @@ grep -E 'decode-live:|spec(-sample)?:|depth acc:|spec(-sample)? time:' logs/*/en
 
 | 开关 | 作用 |
 |---|---|
-| `QWENOX_SMS_GPU=0` | 关闭 GPU 采样准备（bias/penalty 修正 + top-k 在 GPU 上做，只拷回候选；top_k 为 1..64 时生效，否则自动回退 host 全词表路径）。输出分布不变，同 seed 的具体 token 可能不同 |
+| `QWENOX_SMS_GPU=0` | 关闭 GPU 采样准备（bias、legacy presence/frequency、llama repeat 修正 + top-k 在 GPU 上做，只拷回候选；top_k 为 1..64 时生效，否则自动回退 host 全词表路径）。输出分布不变，同 seed 的具体 token 可能不同 |
 | `QWENOX_DRAFT_LM_Q4=0` | draft 改回用生产 lm_head（默认用 base 文件的 4-bit 副本，只影响草稿，不影响提交的 token；多占约 350 MB 显存） |
 | `QWENOX_ARGMAX_OLD=1` | 改回单 block argmax（只在完全并列时结果不同） |
+
+llama `REPEAT` 在 MTP/chain 采样中也使用 GPU 稀疏路径：draft 共享基础窗口，verify 逐行模拟完整窗口，
+包括重复 token、满窗口淘汰和 rollback。单条逐行窗口超过 1024 个有效 ID，以及 DFlash2 + active llama，
+仍回退 host 全词表路径。`repeat_penalty_test` 覆盖窗口计划，`tg_kernels_test` 覆盖 repeat=1/1.03/0.8
+的 GPU 位级校正；真实模型小窗口自检 224 行 `sms-check bad=0`，不同 repeat 参数的并发 rendezvous
+与串行生成 IDs 一致。32K 四分片 IQ4 + Q8_0 MTP 的生产采样对照为 31.8 → 36.2 tok/s（2026-11-06）。
 
 离线复现 API 的 decode 路径（`--spec-gen N`，或 `tools/pp_prod.sh <tok> LABEL SPEC=256 ...`）：
 

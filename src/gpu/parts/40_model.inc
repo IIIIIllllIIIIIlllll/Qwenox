@@ -1,3 +1,5 @@
+#include "../penalty_state.h"
+
 // Concurrent serve (QWENOX_PARALLEL > 1): thrown by kv_reserve / kv_cow when the
 // shared KV pool cannot back this sequence's rows (the later request loses),
 // and by the serve yield hook when another request aborted this one. Always
@@ -875,7 +877,7 @@ struct GpuModel {
   // top-k scratch and per-row candidate blocks. Rows are capped at 65 (ngram
   // <= 64 + 1); the dense path stays as fallback (top_k unset/>64, candidate
   // overflow, QWENOX_SMS_GPU=0).
-  static constexpr int SMS_ROWS = 65, SMS_TCAP = 512, SMS_PCAP = 64;
+  static constexpr int SMS_ROWS = 65, SMS_TCAP = 512, SMS_PCAP = 64, SMS_LCAP = 1024;
   static constexpr int SMS_BIAS_CAP = 20480, SMS_HIST_CAP = 120000;
   int* d_sm_ctrl = nullptr;        // [SMS_ROWS][8]
   unsigned* d_sm_hist = nullptr;   // [SMS_ROWS][4096]
@@ -887,10 +889,12 @@ struct GpuModel {
   int* d_sm_hids = nullptr;        // penalty list from sampler hist (shared)
   float* d_sm_hvals = nullptr;
   int* d_sm_pids = nullptr;        // per-row draft-prefix penalties
-  float* d_sm_pvals = nullptr;     // [SMS_ROWS][SMS_PCAP]
+  float* d_sm_pvals = nullptr;     // [SMS_ROWS][SMS_LCAP]
   int* d_sm_pn = nullptr;          // [SMS_ROWS]
   float* d_sm_scratch = nullptr;   // corrected-logits copy (lazy, corr only)
   int sm_nb = 0, sm_nh = 0;        // uploaded shared correction counts
+  int sm_pcap = SMS_PCAP;          // legacy prefix / llama full-window stride
+  float sm_repeat = 1.0f;          // llama repeat for shared/per-row lists
   std::vector<int> h_sm_ids;       // D2H landing + host truncation staging
   std::vector<float> h_sm_vals;
   std::vector<int> h_sm_ci;        // shared-correction upload staging
@@ -1403,8 +1407,8 @@ struct GpuModel {
     DALLOC(&d_sm_bvals, SMS_BIAS_CAP * sizeof(float));
     DALLOC(&d_sm_hids, SMS_HIST_CAP * sizeof(int));
     DALLOC(&d_sm_hvals, SMS_HIST_CAP * sizeof(float));
-    DALLOC(&d_sm_pids, (size_t)SMS_ROWS * SMS_PCAP * sizeof(int));
-    DALLOC(&d_sm_pvals, (size_t)SMS_ROWS * SMS_PCAP * sizeof(float));
+    DALLOC(&d_sm_pids, (size_t)SMS_ROWS * SMS_LCAP * sizeof(int));
+    DALLOC(&d_sm_pvals, (size_t)SMS_ROWS * SMS_LCAP * sizeof(float));
     DALLOC(&d_sm_pn, SMS_ROWS * sizeof(int));
     h_sm_ids.resize((size_t)SMS_ROWS * SMS_TCAP);
     h_sm_vals.resize((size_t)SMS_ROWS * SMS_TCAP);
@@ -9251,9 +9255,6 @@ struct GpuModel {
     static const bool off =
         getenv("QWENOX_SMS_GPU") && atoi(getenv("QWENOX_SMS_GPU")) == 0;
     if (off) return false;
-    // Shared/prefix GPU corrections are additive; llama repeat needs one
-    // sign-dependent multiplicative correction over the merged window.
-    if (s.llama_penalties) return false;
     if (s.top_k <= 0 || s.top_k > 64 || s.top_k >= g_cfg.vocab) return false;
     if ((int)s.bias.size() > SMS_BIAS_CAP) return false;
     if (s.bias.size() > 1) {
@@ -9270,7 +9271,7 @@ struct GpuModel {
   }
 
   // Upload the round-shared correction lists (bias, then hist penalties).
-  // False when the hist overflows the buffer: caller uses the dense path.
+  // False when the active penalty window overflows the buffer: dense fallback.
   template <typename Sampler>
   bool sms_round_shared(const Sampler& s) {
     if ((int)sms_out_ids.size() < SMS_ROWS * s.top_k) {
@@ -9279,8 +9280,16 @@ struct GpuModel {
     }
     sm_nb = (int)s.bias.size();
     sm_nh = 0;
-    const bool pen = (s.presence != 0.0f || s.frequency != 0.0f);
-    if (pen) {
+    sm_pcap = SMS_PCAP;
+    sm_repeat = 1.0f;
+    const bool llama = s.llama_penalties && s.llama.active();
+    if (s.llama_penalties) {
+      if (llama) {
+        if ((int)s.llama.counts.size() > SMS_HIST_CAP) return false;
+        sm_nh = (int)s.llama.counts.size();
+        sm_repeat = s.llama.repeat;
+      }
+    } else if (s.presence != 0.0f || s.frequency != 0.0f) {
       if ((int)s.hist.size() > SMS_HIST_CAP) return false;
       sm_nh = (int)s.hist.size();
     }
@@ -9298,9 +9307,16 @@ struct GpuModel {
                         hipMemcpyHostToDevice, g_str));
     }
     if (sm_nh) {
-      for (auto& h : s.hist) {
-        h_sm_ci.push_back(h.first);
-        h_sm_cv.push_back(s.presence + s.frequency * (float)h.second);
+      if (llama) {
+        for (const auto& h : s.llama.counts) {
+          h_sm_ci.push_back(h.first);
+          h_sm_cv.push_back((float)h.second * s.llama.frequency + s.llama.presence);
+        }
+      } else {
+        for (auto& h : s.hist) {
+          h_sm_ci.push_back(h.first);
+          h_sm_cv.push_back(s.presence + s.frequency * (float)h.second);
+        }
       }
       CK(hipMemcpyAsync(d_sm_hids, h_sm_ci.data() + sm_nb, sm_nh * 4,
                         hipMemcpyHostToDevice, g_str));
@@ -9310,19 +9326,37 @@ struct GpuModel {
     return true;
   }
 
-  // Per-row draft-prefix penalties. Walk row a (flat draft index base_off+a)
-  // is only prepared when drafts[0..base_off+a) were all drawn before it, so
-  // its penalty hist counts include exactly those. An id already in the base
-  // hist gains only frequency * extra (presence came with the shared list);
-  // a new id costs presence + frequency * count. The shared+prefix split
-  // rounds differently from prepare()'s single merged subtraction by ~1 ulp;
-  // the sampling path is distribution-gated, not bit-gated.
-  // Returns whether any prefix list is nonempty.
+  // Per-row penalties. Llama rows use a full hypothetical window so eviction,
+  // shared draft ids and rollback match LlamaPenaltyState::apply exactly.
+  // Return -1 for dense fallback, 0 for no prefix, 1 for an uploaded prefix.
   template <typename Sampler>
-  bool sms_prefix_upload(const Sampler& s, const int* drafts, int base_off,
-                         int rows) {
+  int sms_prefix_upload(const Sampler& s, const int* drafts, int base_off,
+                        int rows) {
+    if (s.llama_penalties) {
+      LlamaPenaltyRows plan;
+      if (!llama_penalty_rows(s.llama, drafts, base_off, rows, SMS_LCAP, plan))
+        return -1;
+      h_sm_pi = std::move(plan.ids);
+      h_sm_pv = std::move(plan.values);
+      std::vector<int>& pn = plan.counts;
+      bool any = false;
+      for (int n : pn) any |= n != 0;
+      sm_nh = 0;  // every llama row carries its complete window in the prefix
+      sm_pcap = SMS_LCAP;
+      if (!any) return 0;
+      CK(hipMemcpyAsync(d_sm_pids, h_sm_pi.data(), (size_t)rows * SMS_LCAP * 4,
+                        hipMemcpyHostToDevice, g_str));
+      CK(hipMemcpyAsync(d_sm_pvals, h_sm_pv.data(), (size_t)rows * SMS_LCAP * 4,
+                        hipMemcpyHostToDevice, g_str));
+      CK(hipMemcpyAsync(d_sm_pn, pn.data(), rows * 4, hipMemcpyHostToDevice,
+                        g_str));
+      return 1;
+    }
+
+    // Legacy additive draft-prefix penalties. An id already in the base hist
+    // gains only frequency * extra; a new id costs presence + frequency * count.
     const bool pen = (s.presence != 0.0f || s.frequency != 0.0f);
-    if (!pen) return false;
+    if (!pen) return 0;
     std::vector<int> pn(rows, 0);
     h_sm_pi.assign((size_t)rows * SMS_PCAP, 0);
     h_sm_pv.assign((size_t)rows * SMS_PCAP, 0.0f);
@@ -9347,14 +9381,14 @@ struct GpuModel {
       pn[a] = used;
       if (used) any = true;
     }
-    if (!any) return false;
+    if (!any) return 0;
     CK(hipMemcpyAsync(d_sm_pids, h_sm_pi.data(), (size_t)rows * SMS_PCAP * 4,
                       hipMemcpyHostToDevice, g_str));
     CK(hipMemcpyAsync(d_sm_pvals, h_sm_pv.data(), (size_t)rows * SMS_PCAP * 4,
                       hipMemcpyHostToDevice, g_str));
     CK(hipMemcpyAsync(d_sm_pn, pn.data(), rows * 4, hipMemcpyHostToDevice,
                       g_str));
-    return true;
+    return 1;
   }
 
   // Corrections + two-pass radix top-k + collect for `rows` logit rows
@@ -9375,7 +9409,7 @@ struct GpuModel {
       k_corr_apply<<<dim3(1, rows), 256, 0, g_str>>>(
           d_sm_scratch, stride, d_sm_bids, d_sm_bvals, sm_nb, d_sm_hids,
           d_sm_hvals, sm_nh, d_sm_pids, d_sm_pvals,
-          use_pfx ? d_sm_pn : nullptr, SMS_PCAP);
+          use_pfx ? d_sm_pn : nullptr, sm_pcap, sm_repeat);
       src = d_sm_scratch;
     }
     k_tk_init<<<rows, 32, 0, g_str>>>(d_sm_ctrl, k);
@@ -10686,10 +10720,12 @@ struct GpuModel {
       spec_snap = false;
       bool smg_v = false;
       if (smg) {
-        const bool pfx = sms_prefix_upload(sampler, drafts.data(), 0, g + 1);
-        batch_logits_device(g + 1);
-        smg_v = sms_topk_rows(d_logits_b, g_cfg.vocab, g + 1, sampler.top_k,
-                              pfx, sms_out_ids.data(), sms_out_vals.data());
+        const int pfx = sms_prefix_upload(sampler, drafts.data(), 0, g + 1);
+        if (pfx >= 0) {
+          batch_logits_device(g + 1);
+          smg_v = sms_topk_rows(d_logits_b, g_cfg.vocab, g + 1, sampler.top_k,
+                                pfx > 0, sms_out_ids.data(), sms_out_vals.data());
+        }
       }
       if (!smg_v) batch_logits(g + 1, verify_logits);
       const int smk = sampler.top_k;
@@ -11002,10 +11038,12 @@ struct GpuModel {
         const int ngP = (int)tokens.size();
         bool smg_v = false;
         if (smg) {
-          const bool pfx = sms_prefix_upload(sampler, draft.data(), 0, ngP);
-          batch_logits_device(ngP);
-          smg_v = sms_topk_rows(d_logits_b, g_cfg.vocab, ngP, sampler.top_k,
-                                pfx, sms_out_ids.data(), sms_out_vals.data());
+          const int pfx = sms_prefix_upload(sampler, draft.data(), 0, ngP);
+          if (pfx >= 0) {
+            batch_logits_device(ngP);
+            smg_v = sms_topk_rows(d_logits_b, g_cfg.vocab, ngP, sampler.top_k,
+                                  pfx > 0, sms_out_ids.data(), sms_out_vals.data());
+          }
         }
         if (!smg_v) batch_logits(ngP, verify_logits);
         const int smk = sampler.top_k;
@@ -11127,11 +11165,13 @@ struct GpuModel {
           if (smg) {
             // Row a of this chunk is prepared with draft[0..di+a) in the
             // penalty history (the walk only reaches it via matching draws).
-            const bool pfx = sms_prefix_upload(sampler, draft.data(), di, ngP);
-            batch_logits_device(ngP);
-            smg_v =
-                sms_topk_rows(d_logits_b, g_cfg.vocab, ngP, sampler.top_k,
-                              pfx, sms_out_ids.data(), sms_out_vals.data());
+            const int pfx = sms_prefix_upload(sampler, draft.data(), di, ngP);
+            if (pfx >= 0) {
+              batch_logits_device(ngP);
+              smg_v =
+                  sms_topk_rows(d_logits_b, g_cfg.vocab, ngP, sampler.top_k,
+                                pfx > 0, sms_out_ids.data(), sms_out_vals.data());
+            }
           }
           if (!smg_v) batch_logits(ngP, verify_logits);
           const int smk = sampler.top_k;
@@ -11351,11 +11391,13 @@ struct GpuModel {
             float* rows = d_logits_b + (size_t)r0 * g_cfg.vocab;
             cb_smg = false;
             if (smg && sms_round_shared(sampler)) {
-              const bool pfx = sms_prefix_upload(sampler, drafts.data(), 0, g + 1);
-              pool_ids.resize((size_t)(g + 1) * sampler.top_k);
-              pool_vals.resize((size_t)(g + 1) * sampler.top_k);
-              cb_smg = sms_topk_rows(rows, g_cfg.vocab, g + 1, sampler.top_k, pfx,
-                                     pool_ids.data(), pool_vals.data());
+              const int pfx = sms_prefix_upload(sampler, drafts.data(), 0, g + 1);
+              if (pfx >= 0) {
+                pool_ids.resize((size_t)(g + 1) * sampler.top_k);
+                pool_vals.resize((size_t)(g + 1) * sampler.top_k);
+                cb_smg = sms_topk_rows(rows, g_cfg.vocab, g + 1, sampler.top_k, pfx > 0,
+                                       pool_ids.data(), pool_vals.data());
+              }
             }
             if (!cb_smg) {
               verify_logits.resize((size_t)(g + 1) * g_cfg.vocab);
@@ -11382,10 +11424,12 @@ struct GpuModel {
           vsnap_row0_ = 0;
           prefill_batch(vt, q + 1, true, true);
           if (smg) {
-            const bool pfx = sms_prefix_upload(sampler, drafts.data(), 0, g + 1);
-            batch_logits_device(g + 1);
-            smg_v = sms_topk_rows(d_logits_b, g_cfg.vocab, g + 1, sampler.top_k,
-                                  pfx, sms_out_ids.data(), sms_out_vals.data());
+            const int pfx = sms_prefix_upload(sampler, drafts.data(), 0, g + 1);
+            if (pfx >= 0) {
+              batch_logits_device(g + 1);
+              smg_v = sms_topk_rows(d_logits_b, g_cfg.vocab, g + 1, sampler.top_k,
+                                    pfx > 0, sms_out_ids.data(), sms_out_vals.data());
+            }
           }
           if (!smg_v) batch_logits(g + 1, verify_logits);
         }

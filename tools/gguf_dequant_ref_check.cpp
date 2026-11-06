@@ -1,5 +1,5 @@
 // gguf_dequant_ref_check.cpp — bit-exact check of gguf::dequant_row
-// (IQ2_XXS, IQ2_XS, IQ3_S, Q6_K) against llama.cpp ggml-quants.c reference
+// (Q5_0, IQ2_XXS, IQ2_XS, IQ3_S, Q6_K) against llama.cpp ggml-quants.c reference
 // functions copied verbatim below
 // (llama.cpp commit 85c5522, MIT License, Copyright (c) 2023-2026 The ggml authors).
 // Build: g++ -O1 -std=c++17 -I src tools/gguf_dequant_ref_check.cpp -o /tmp/gdrc && /tmp/gdrc
@@ -164,26 +164,63 @@ void dequantize_row_q6_K(const block_q6_K * GGML_RESTRICT x, float * GGML_RESTRI
         }
     }
 }
+#define QK5_0 32
+typedef struct {
+    ggml_half d;
+    uint8_t qh[4];
+    uint8_t qs[QK5_0/2];
+} block_q5_0;
+static_assert(sizeof(block_q5_0) == 22, "wrong q5_0 block size/padding");
+void dequantize_row_q5_0(const block_q5_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK5_0;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        uint32_t qh;
+        memcpy(&qh, x[i].qh, sizeof(qh));
+
+        for (int j = 0; j < qk/2; ++j) {
+            const uint8_t xh_0 = ((qh >> (j +  0)) << 4) & 0x10;
+            const uint8_t xh_1 = ((qh >> (j + 12))     ) & 0x10;
+
+            const int32_t x0 = ((x[i].qs[j] & 0x0F) | xh_0) - 16;
+            const int32_t x1 = ((x[i].qs[j] >>   4) | xh_1) - 16;
+
+            y[i*qk + j + 0   ] = x0*d;
+            y[i*qk + j + qk/2] = x1*d;
+        }
+    }
+}
+
 int main() {
   using RefFn = void (*)(const uint8_t*, float*, int64_t);
   struct TestCase {
     const char* name;
     uint32_t type;
+    int be;
     int bs;
     int d_off;
     RefFn ref;
   };
   const TestCase tests[] = {
-    {"IQ2_XXS", gguf::IQ2_XXS, 66, 0, [](const uint8_t* p, float* y, int64_t k) {
+    {"Q5_0", gguf::Q5_0, 32, 22, 0, [](const uint8_t* p, float* y, int64_t k) {
+      dequantize_row_q5_0((const block_q5_0*)p, y, k);
+    }},
+    {"IQ2_XXS", gguf::IQ2_XXS, 256, 66, 0, [](const uint8_t* p, float* y, int64_t k) {
       dequantize_row_iq2_xxs((const block_iq2_xxs*)p, y, k);
     }},
-    {"IQ2_XS", gguf::IQ2_XS, 74, 0, [](const uint8_t* p, float* y, int64_t k) {
+    {"IQ2_XS", gguf::IQ2_XS, 256, 74, 0, [](const uint8_t* p, float* y, int64_t k) {
       dequantize_row_iq2_xs((const block_iq2_xs*)p, y, k);
     }},
-    {"IQ3_S", gguf::IQ3_S, 110, 0, [](const uint8_t* p, float* y, int64_t k) {
+    {"IQ3_S", gguf::IQ3_S, 256, 110, 0, [](const uint8_t* p, float* y, int64_t k) {
       dequantize_row_iq3_s((const block_iq3_s*)p, y, k);
     }},
-    {"Q6_K", gguf::Q6_K, 210, 208, [](const uint8_t* p, float* y, int64_t k) {
+    {"Q6_K", gguf::Q6_K, 256, 210, 208, [](const uint8_t* p, float* y, int64_t k) {
       dequantize_row_q6_K((const block_q6_K*)p, y, k);
     }},
   };
@@ -198,15 +235,15 @@ int main() {
       uint16_t h = (uint16_t)(((5 + rng() % 4) << 10) | (rng() & 0x3ff)) | (rng() & 1 ? 0x8000 : 0);
       memcpy(&buf[i * tc.bs + tc.d_off], &h, 2);
     }
-    std::vector<float> a(256 * nb), b(256 * nb);
-    tc.ref(buf.data(), a.data(), 256 * nb);
-    gguf::dequant_row(tc.type, buf.data(), b.data(), 256 * nb);
+    std::vector<float> a(tc.be * nb), b(tc.be * nb);
+    tc.ref(buf.data(), a.data(), tc.be * nb);
+    gguf::dequant_row(tc.type, buf.data(), b.data(), tc.be * nb);
 
     long bad = 0;
     uint32_t be, bb;
     gguf::block_info(tc.type, be, bb);
-    if (be != 256 || bb != (uint32_t)tc.bs) {
-      printf("%s layout: got {%u, %u}, expected {256, %d} -> FAIL\n", tc.name, be, bb, tc.bs);
+    if (be != (uint32_t)tc.be || bb != (uint32_t)tc.bs) {
+      printf("%s layout: got {%u, %u}, expected {%d, %d} -> FAIL\n", tc.name, be, bb, tc.be, tc.bs);
       bad++;
     }
     double mx = 0;

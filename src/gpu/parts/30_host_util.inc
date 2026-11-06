@@ -507,8 +507,8 @@ static void gguf_experts_open() {
         t[2]->ne[1] != D || t[2]->ne[2] != E)
       throw std::runtime_error("QWENOX_GGUF: unexpected expert shapes/types at layer " +
                                std::to_string(l));
-    // UD-Q4_K_XL: Q4_K/Q5_K gate+up, Q5_1/Q8_0 down; UD-IQ4_XS: IQ3_S/IQ4_XS
-    // gate+up, IQ4_NL/Q8_0 down (per-layer mix); MTP sidecar: Q8_0.
+    // UD-Q4_K_XL: Q4_K/Q5_K gate+up, Q5_1/Q8_0 down; UD-IQ4_XS: mixed IQ
+    // gate+up, Q5_0/IQ4_NL/Q8_0/Q2_0 down (per-layer mix); MTP sidecar: Q8_0.
     (void)mtp;
     const uint32_t tg = t[0]->type, td = t[2]->type;
     if (tg != gguf::Q4_K && tg != gguf::Q5_K && tg != gguf::Q8_0 && tg != gguf::IQ4_XS &&
@@ -516,7 +516,7 @@ static void gguf_experts_open() {
         tg != gguf::IQ3_XXS && tg != gguf::IQ2_S)
       throw std::runtime_error(std::string("QWENOX_GGUF: gate/up type ") +
                                gguf::type_name(t[0]->type) + " unsupported");
-    if (td != gguf::Q5_1 && td != gguf::Q8_0 && td != gguf::IQ4_NL && td != gguf::Q2_0)
+    if (td != gguf::Q5_0 && td != gguf::Q5_1 && td != gguf::Q8_0 && td != gguf::IQ4_NL && td != gguf::Q2_0)
       throw std::runtime_error(std::string("QWENOX_GGUF: down type ") +
                                gguf::type_name(t[2]->type) + " unsupported");
     for (auto* x : t) {

@@ -1925,13 +1925,16 @@ std::vector<int> GpuModel::df2_spec_loop_sample(
     df2.cap_mode = 0;
     prefill_batch(vt, q + 1, true, true);
     spec_snap = false;
-    const bool smg = sms_gpu_active(sampler) && sms_round_shared(sampler);
+    const bool smg = (!sampler.llama_penalties || !sampler.llama.active()) &&
+                     sms_gpu_active(sampler) && sms_round_shared(sampler);
     bool smg_v = false;
     if (smg) {
-      const bool pfx = sms_prefix_upload(sampler, drafts.data(), 0, g + 1);
-      batch_logits_device(g + 1);
-      smg_v = sms_topk_rows(d_logits_b, g_cfg.vocab, g + 1, sampler.top_k, pfx,
-                            sms_out_ids.data(), sms_out_vals.data());
+      const int pfx = sms_prefix_upload(sampler, drafts.data(), 0, g + 1);
+      if (pfx >= 0) {
+        batch_logits_device(g + 1);
+        smg_v = sms_topk_rows(d_logits_b, g_cfg.vocab, g + 1, sampler.top_k, pfx > 0,
+                              sms_out_ids.data(), sms_out_vals.data());
+      }
     }
     if (!smg_v) batch_logits(g + 1, verify_logits);
     Sampler target_view = sampler;
