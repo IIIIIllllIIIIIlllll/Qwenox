@@ -183,7 +183,7 @@ for f in build/rocblas/library/*"$GPU_ARCH"*; do
     cp -a "$f" "$OUT/build/rocblas/library/"
 done
 
-for f in start_win.exe settings_win.exe start_win.sh service.conf \
+for f in start_win.exe settings_win.exe start_win.sh start_win_stability.bat service.conf \
          README.md README_EN.md CHANGELOG.md LICENSE VERSION; do
     [[ -e "$f" ]] || die "缺少根目录文件：$f"
     cp -a "$f" "$OUT/"

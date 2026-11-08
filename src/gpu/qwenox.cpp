@@ -153,6 +153,7 @@
 #include "../crashdiag.h"  // 崩溃报告 / 飞行记录（CK 记录调用点，见 00_platform.inc）
 
 #include "parts/00_platform.inc"
+#include "../hip_watchdog.h"
 #include "parts/01_syncprof.inc"
 #include "parts/05_config.inc"
 #include "parts/06_memstats.inc"

@@ -5,7 +5,8 @@
 // (file:line + kind). A call that returns slowly is the host waiting for the
 // GPU (or the driver); summed against a round's wall time this splits the
 // fixed per-round cost into "host busy" and "host blocked" parts.
-// Off (default): one predictable branch per call, no clock reads.
+// Profiling off: no profiling clock reads. The independent runtime watchdog
+// still tracks these calls when QWENOX_HIP_TIMEOUT is enabled.
 // Note: D2H hipMemcpyAsync into pageable memory is synchronous; it shows up
 // here with the stream-drain time, which is exactly what we want to see.
 static const bool g_sp_on = [] {
@@ -80,10 +81,12 @@ struct SyncProf {
 static SyncProf g_sp;
 
 struct SpTimer {
+  hipwatch::Scope watchdog;
   const char* file;
   int line, kind;
   std::chrono::steady_clock::time_point t0;
-  SpTimer(const char* f, int l, int k) : file(f), line(l), kind(k) {
+  SpTimer(const char* f, int l, int k)
+      : watchdog(f, l, g_sp_kind_name[k]), file(f), line(l), kind(k) {
     if (g_sp_on) t0 = std::chrono::steady_clock::now();
   }
   ~SpTimer() {

@@ -2,6 +2,18 @@
 
 版本号记在根目录 `VERSION` 文件里，编译时写进程序。查看当前版本有三种方式：托盘菜单第一行、控制台总览页"版本"、`GET /health` 返回的 `version` 字段。引擎本身可以运行 `qwenox-engine-win.exe --version`。
 
+## v0.1.1-rc1 — 2026-11-08
+
+候选版本：Windows 整机冻结的根因尚未确认，不能视为已完成实机稳定性认证。
+
+- 健康检查 PING / SNAP / DIAG 不再调用 `hipSetDevice`；GPU 工作线程仍绑定所选设备，MEM 按需绑定。
+- Windows 服务模式新增 GPU 拷贝/同步调用超时保护，默认 120 秒。超时记录调用位置，以 124 退出引擎，不自动重启；诊断写入最多留 5 秒。Linux 默认关闭。`QWENOX_HIP_TIMEOUT=0` 可关闭，或设为 30–3600 秒。
+- 新增 `start_win_stability.bat` 临时低压力配置：64K 上下文、单槽、1024 prefill、关闭 SSD KV 快照。不修改原配置、驱动或 TDR 注册表。
+- 基于 v0.1.0 后主分支，包含既有 PLE IOCP 校验/超时恢复、KV 快照恢复、KV 分配防护和视觉请求显存排队修复。
+- 新增 CPU 故障注入测试，覆盖同步、拷贝、并发健康线程、空闲、异常退出作用域及关闭保护；无需让实机 GPU 卡死。
+
+详细范围与验证限制见 [Windows 稳定性说明](docs/WINDOWS_STABILITY.md)。
+
 ## v0.1.0 — 2026-10-30
 
 ### 新功能
