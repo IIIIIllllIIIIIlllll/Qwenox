@@ -2,6 +2,36 @@
 
 版本号记在根目录 `VERSION` 文件里，编译时写进程序。查看当前版本有三种方式：托盘菜单第一行、控制台总览页"版本"、`GET /health` 返回的 `version` 字段。引擎本身可以运行 `qwenox-engine-win.exe --version`。
 
+## v0.1.1 — 2026-11-08
+
+### 新功能
+
+- **llama.cpp 风格 repeat penalties**：chat / completions / responses / Anthropic Messages 请求支持 `repeat_last_n`（默认 64）和 `repeat_penalty`（默认 1.0）。请求显式包含任一字段时，repeat / presence / frequency 共用一个由 prompt + 已接受生成 token 组成的窗口；`repeat_last_n=0` 禁用整个 penalties 路径，`-1` 表示使用全部历史。控制台的服务端覆盖表也支持这两个字段。
+- **GGUF 扩展量化格式**：新增 IQ2_XXS / IQ2_XS 专家和 Q5_0 expert down 的原生 GPU 读取与解量化，外部混合量化模型无需离线重量化。
+- **Q4_K_M MTP sidecar**：Q4_K_M 草稿头里的 Q5_0 HC-up 在加载时转为 q8g32，可与 Q8_0 / shared-Q8_0 两个 sidecar 三选一。
+- **新增 faded 界面主题**。
+- **视觉请求显存排队**：带图片的请求在显存余量不足时保留 FIFO 位置等待，而不是直接失败；分配中途失败会清理部分分配并返回请求级错误，不再终止整个引擎。
+
+### 性能
+
+- **UD-IQ4_XS + MTP 解码提速**：GGUF 原生 Q6_K dense GEMV 在 NP≥6 时不再展开单元循环，避免 VGPR 溢出；38K 真实请求同 seed 实测 TG 44.4 → 53.7 tok/s，MTP 轮数/接受/回滚逐项相同。
+- **repeat penalties 移到 GPU**，采样侧不再逐 token 在 CPU 上做窗口修正。
+
+### 修复
+
+- **并发 prefill 取消隔离**：取消标志改为随 `prefill_batch` 调用走栈，不再存放在共享 model 上被其他槽位覆盖；一个请求断连不会误取消并发的 prefill。
+- **Windows PLE IOCP**：校验完成指针必须落在活动 OVERLAPPED 数组内，完成包的槽位记账、超时取消和排空流程一并加固。
+- **PLE / socket IO 停顿恢复**：PLE 读失败或短读改为从同一映射表补齐；Windows IOCP 默认 5 秒超时（`QWENOX_PLE_IO_TIMEOUT_MS`，0 = 无限），超时先取消并排空再回退。引擎对停止读取响应的客户端启用发送超时（`QWENOX_SEND_TIMEOUT`，默认 30 秒），不再永久卡住生成线程。
+- **KV 快照与 PLE IO 恢复加固**：KVSNAP 的索引更新、临时文件清理和日志路径改为不抛异常，内存紧张时不再中断索引更新或留下半写入文件。
+- **KV 池与 fork-cut**：分页 KV 在首次 COW/尾页映射前先回收，异常时回滚设备页表；fork-cut 的显存估算补上 in-pass cut 的 `d_cR` / `d_cmiraw` 缓冲，避免估算偏小导致分配失败。
+- **设置面板**：权重选择对话框按当前权重类型（hgn / GGUF）默认选中对应的文件过滤器。
+
+### 其他
+
+- 新增 PLE IOCP、prefill 取消、KV 页分配、视觉显存压力等测试脚本。
+- `build_win.sh` 新增 `QWENOX_ENGINE_OUT`，可以在服务运行中把引擎编到另一路径（与 `QWENOX_API_OUT` 对称）。
+- 版本号 0.1.1。
+
 ## v0.1.0 — 2026-10-30
 
 ### 新功能

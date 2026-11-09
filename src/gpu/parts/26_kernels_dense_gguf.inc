@@ -248,6 +248,7 @@ void k_ggd_gemv(const uint8_t* __restrict__ w, uint64_t rb, const void* __restri
   constexpr int SEGB = kSegU / BU * BB;               // source bytes of a full segment
   constexpr int SEGL = (kSegU / BU * SL + 15) & ~15;  // LDS bytes per wave
   constexpr int NV = (SEGB / 4 + 31) / 32;            // dwords per lane
+  constexpr int kUnitUnroll = (T == kQ6K && NP >= 6) ? 1 : kSegU / 32;
   __shared__ __attribute__((aligned(16))) uint8_t lds[4][SEGL];
   const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int r = (int)blockIdx.x * 4 + wave;
@@ -285,7 +286,10 @@ void k_ggd_gemv(const uint8_t* __restrict__ w, uint64_t rb, const void* __restri
       }
     }
     __syncthreads();
-#pragma unroll
+    // Q6_K with NP >= 6: the unrolled unit loop keeps three decoded units live and
+    // spills (256 VGPRs, 51-70 spilled, occupancy 10 -> 5; NP = 8 took 3.4x NP = 5).
+    // Rolled, the same per-token arithmetic in the same order runs ~2x faster.
+#pragma unroll kUnitUnroll
     for (int k = 0; k < kSegU / 32; k++) {
       const int u = lane + 32 * k;
       if (u < nun) {
