@@ -26,6 +26,7 @@ struct GpuModel {
   int maxbatch_cap;
   int pos = 0;
   NgramMod ngram;
+  NgramMod jx_ngram{3};  // 联合起草的短窗表（QWENOX_JOINT_N；halogen PLD 的 N=3）
   // Adaptive ngram verify chunk rows, shared by both chain loops. Per slot
   // and reset per request (ng_reset, 10-12): a value carried over from other
   // requests (or concurrent peers) changes this request's round structure,
@@ -353,6 +354,15 @@ struct GpuModel {
   // is unchanged -- only the proposal distribution shifts slightly.
   WView w_dlm{};
   bool dlm_on = false;
+  // QWENOX_DRAFT_VOCAB_FILE（QDV1 子词表文件）：草稿头 lm_head 的紧凑 q4cp
+  // 子表。greedy 草稿专用（采样草稿需要完整分布，不受影响）；verify 不经过，
+  // 提交输出不变，只影响草稿质量 → 速度。与 QWENOX_DRAFT_VOCAB 前缀截断互斥
+  //（子词表优先），且不偏置任何语言（前缀截断把高 id 区的中文 token 排除在
+  // 草稿候选外，中文场景接受率崩溃——见 docs/SPEC-INVESTIGATION-20261109.md）。
+  WView w_dv{};
+  int* d_dv_ids = nullptr;  // 子表下标 -> 全局 token id（设备）
+  std::vector<int> h_dv_ids;
+  int n_dv = 0;
   // Paged QSA KV (memory model Phase A1). The trunk FP32 KV cache (d_kc/d_vc)
   // and indexer keys (d_ik) are addressed through a logical->physical page
   // table (KV_PAGE = 256 tokens = 64 indexer blocks; one table shared by all
@@ -951,7 +961,7 @@ struct GpuModel {
   // mrope_gen_ is NOT per slot: it is a global generation for the ropecs
   // cache key (bind also drops that cache).
 #define QWENOX_SLOT_FIELDS(X)                                                    \
-  X(pos) X(ple_ringpos) X(chist) X(ngram) X(ng_gate) X(ng_cs) X(mtp_pos)     \
+  X(pos) X(ple_ringpos) X(chist) X(ngram) X(jx_ngram) X(ng_gate) X(ng_cs) X(mtp_pos)     \
   X(kv_seq) X(d_ptab)                                                         \
   X(mrope_active_) X(rope_delta_) X(mrope_pos_) X(mrope_grids_) X(d_rdelta)   \
   X(img_inj) X(img_hash_) X(d_img_emb) X(img_emb_rows) X(img_emb_cap)         \
@@ -1714,6 +1724,138 @@ struct GpuModel {
   // Draft lm_head override: keep a private device copy of the BASE file's
   // q4cp lm_head when an overlay replaced it with a wider dtype. Drafting
   // reads it instead (~0.5x bytes per draft step); verify and serial decode
+  // host f32 -> f16（RNE；scale 为正且远离次正规区，异常路径截断即可）
+  static uint16_t f32_to_f16_host(float f) {
+    uint32_t x;
+    memcpy(&x, &f, 4);
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    int e = (int)((x >> 23) & 0xff) - 112;  // f16 域内的指数（127-15）
+    uint32_t m = x & 0x7fffffu;
+    if (e <= 0) return (uint16_t)sign;             // 次正规/零：截断
+    if (e >= 31) return (uint16_t)(sign | 0x7c00u);  // 上溢：inf
+    m += 0x1000u + ((m >> 13) & 1u);               // RNE
+    if (m & 0x800000u) { m = 0; e++; }
+    return (uint16_t)(sign | ((uint32_t)e << 10) | (m >> 13));
+  }
+
+  // QWENOX_DRAFT_VOCAB_FILE=<QDV1>：草稿头 lm_head 的子词表重打包。
+  // 文件：u32 magic 0x31564451('QDV1') + u32 n + n 个升序 u32 全局 id。
+  // 启动时把选中行从 ht 的 lm_head 解出（复用 k_ht_deq_bf16 的 tile 内核，
+  // 按 4096 行一块过 GPU），宿主机量化成 q4cp 紧凑表（codebook 取
+  // embed_tokens 的 64B 头），上传为 w_dv。只服务 greedy 草稿 argmax
+  //（采样草稿需要完整分布，host_logits/argmax_out=false 时不启用）；
+  // verify 不经过，提交输出不变——草稿弱一点只掉接受率。
+  void setup_draft_vocab_list() {
+    const char* path = getenv("QWENOX_DRAFT_VOCAB_FILE");
+    if (!path || !*path) return;
+    FILE* f = fopen(path, "rb");
+    if (!f)
+      throw std::runtime_error(std::string("draft vocab: cannot open ") + path);
+    uint32_t magic = 0, n = 0;
+    bool ok = fread(&magic, 4, 1, f) == 1 && magic == 0x31564451u &&
+              fread(&n, 4, 1, f) == 1 && n > 0 && n <= (uint32_t)g_cfg.vocab;
+    if (ok) {
+      h_dv_ids.resize(n);
+      ok = fread(h_dv_ids.data(), 4, n, f) == n;
+    }
+    fclose(f);
+    if (!ok) throw std::runtime_error("draft vocab: bad or truncated QDV1 file");
+    for (size_t i = 0; i < h_dv_ids.size(); i++) {
+      const int v = h_dv_ids[i];
+      if (v < 0 || v >= g_cfg.vocab || (i && v <= h_dv_ids[i - 1]))
+        throw std::runtime_error("draft vocab: ids must be sorted, unique, in range");
+    }
+    const Tensor& lm = ckpt.at("lm_head.weight");
+    if (lm.dtype != 16) {  // 非 ht（v1/GGUF）：暂不支持，静默退回全词表
+      fprintf(stderr, "draft vocab: lm_head dtype %d is not ht; feature off\n",
+              (int)lm.dtype);
+      h_dv_ids.clear();
+      return;
+    }
+    const Tensor& emb = ckpt.at("embed_tokens.weight");  // q4cp codebook 来源
+    if (emb.dtype != 5)
+      throw std::runtime_error("draft vocab: embed_tokens is not q4cp");
+    float cb[16];
+    memcpy(cb, emb.data, 64);
+    float cbmax = 0.f;
+    for (float v : cb) cbmax = std::max(cbmax, fabsf(v));
+    if (cbmax <= 0.f) throw std::runtime_error("draft vocab: empty codebook");
+
+    const WView wlm = wview(lm);
+    const int K = (int)g_cfg.d, ntx = K >> 7;
+    const int rowblk = g_cfg.vocab / 128;
+    const int RB = 32;  // 4096 行/chunk（21 MiB bf16）
+    uint16_t* d_bf = nullptr;
+    CK(hipMalloc(&d_bf, (size_t)RB * 128 * K * 2));  // 一次性 scratch：不用 arena
+                                                     //（arena 内指针不能 hipFree）
+    std::vector<uint16_t> h_bf((size_t)RB * 128 * K);
+    const int gs = K / 32;
+    std::vector<uint8_t> codes((size_t)n * K / 2);
+    std::vector<uint8_t> scales((size_t)n * gs * 2);
+    std::vector<float> wrow(K);
+    size_t out_r = 0, idi = 0;
+    for (int b0 = 0; b0 < rowblk; b0 += RB) {
+      const int nb = std::min(RB, rowblk - b0);
+      if (idi >= h_dv_ids.size() ||
+          (uint64_t)h_dv_ids[idi] >= (uint64_t)(b0 + nb) * 128)
+        continue;  // 本 chunk 无选中行
+      k_ht_deq_bf16<<<nb * ntx, 256, 0, g_str>>>(
+          wlm.data + (size_t)b0 * ntx * 8192, wlm.suh, wlm.svh + (size_t)b0 * 128,
+          d_bf, K);
+      CK(hipMemcpy(h_bf.data(), d_bf, (size_t)nb * 128 * K * 2,
+                   hipMemcpyDeviceToHost));
+      while (idi < h_dv_ids.size() &&
+             (uint64_t)h_dv_ids[idi] < (uint64_t)(b0 + nb) * 128) {
+        const uint16_t* row = h_bf.data() + (size_t)(h_dv_ids[idi] - b0 * 128) * K;
+        for (int c = 0; c < K; c++) wrow[c] = hgn::bf16_to_f32(row[c]);
+        uint8_t* crow = codes.data() + out_r * (K / 2);
+        uint16_t* srow = (uint16_t*)(scales.data() + out_r * gs * 2);
+        for (int g = 0; g < gs; g++) {
+          float mx = 0.f;
+          for (int c = 0; c < 32; c++) mx = std::max(mx, fabsf(wrow[g * 32 + c]));
+          const uint16_t sh = f32_to_f16_host(mx / cbmax);
+          const float scq = f16_to_f32_host(sh);
+          srow[g] = sh;
+          for (int c = 0; c < 32; c++) {
+            const float w = wrow[g * 32 + c];
+            int best = 0;
+            float bd = FLT_MAX;
+            if (scq > 0.f)
+              for (int j = 0; j < 16; j++) {
+                const float dd = fabsf(cb[j] * scq - w);
+                if (dd < bd) { bd = dd; best = j; }
+              }
+            uint8_t& byte = crow[(g * 32 + c) / 2];
+            if (c & 1) byte |= (uint8_t)(best << 4);
+            else byte = (uint8_t)best;
+          }
+        }
+        out_r++;
+        idi++;
+      }
+    }
+    CK(hipFree(d_bf));
+    if (out_r != n) throw std::runtime_error("draft vocab: row count mismatch");
+
+    const size_t total = 64 + codes.size() + scales.size();
+    uint8_t* p = nullptr;
+    DALLOC(&p, total);
+    CK(hipMemcpy(p, cb, 64, hipMemcpyHostToDevice));
+    CK(hipMemcpy(p + 64, codes.data(), codes.size(), hipMemcpyHostToDevice));
+    CK(hipMemcpy(p + 64 + codes.size(), scales.data(), scales.size(),
+                 hipMemcpyHostToDevice));
+    w_dv.dtype = 5;
+    w_dv.data = p;
+    w_dv.rows = n;
+    w_dv.cols = K;
+    w_dv.scale_stride = ((uint64_t)(gs * 2) + 15) & ~15ull;
+    CK(hipMalloc(&d_dv_ids, (size_t)n * 4));
+    CK(hipMemcpy(d_dv_ids, h_dv_ids.data(), (size_t)n * 4, hipMemcpyHostToDevice));
+    n_dv = (int)n;
+    fprintf(stderr, "draft vocab: %d ids (%.1f%% of vocab), q4cp table %.0f MiB\n",
+            n_dv, 100.0 * n / g_cfg.vocab, total / 1048576.0);
+  }
+
   // still use the production lm_head, so committed outputs are unchanged.
   void setup_draft_lmhead(const Tensor* base_lm) {
     if (env_zero("QWENOX_DRAFT_LM_Q4") || !base_lm || base_lm->dtype != 5) return;
@@ -8486,10 +8628,16 @@ struct GpuModel {
     mtp_gr_write("mtp.layers.0.mlp_hyper_connection", d_y);
     mtp_gr_read("mtp.hyper_connection_mixer", d_x);
     WView lm = dlm_on ? w_dlm : wview(ckpt.at("lm_head.weight"));
+    // 子词表草稿头（QDV1 文件）：只算选中行的 logits，argmax 后经 k_dv_map
+    // 映回全局 id。采样路径（host_logits / argmax_out=false）需要完整分布，
+    // 不走子表。
+    const bool dvl = n_dv > 0 && !host_logits && argmax_out;
     const int dvn =
-        (draft_vocab > 0 && !host_logits) ? std::min(draft_vocab, g_cfg.vocab)
-                                          : 0;
-    if (dvn)  // q4cp scales sit behind a codes region sized by lm.rows; nrows
+        (!dvl && draft_vocab > 0 && !host_logits) ? std::min(draft_vocab, g_cfg.vocab)
+                                                  : 0;
+    if (dvl)
+      gemv(w_dv, d_x, d_logits, 0, (uint64_t)n_dv);
+    else if (dvn)  // q4cp scales sit behind a codes region sized by lm.rows; nrows
       gemv(lm, d_x, d_logits, 0, (uint64_t)dvn);  // keeps that base intact
     else
       gemv(lm, d_x, d_logits);
@@ -8500,8 +8648,13 @@ struct GpuModel {
                    hipMemcpyDeviceToHost));
     } else if (argmax_out) {
       int* dst = d_amx_out ? d_amx_out : d_argmax;
-      argmax_rows(d_logits, dvn ? dvn : g_cfg.vocab, 1, d_amx_cand, dst,
-                  g_str);
+      if (dvl) {
+        argmax_rows(d_logits, n_dv, 1, d_amx_cand, dst, g_str);
+        k_dv_map<<<1, 1, 0, g_str>>>(d_dv_ids, dst);  // 子表下标 -> 全局 id
+      } else {
+        argmax_rows(d_logits, dvn ? dvn : g_cfg.vocab, 1, d_amx_cand, dst,
+                    g_str);
+      }
       if (!d_amx_out) CK(hipMemcpy(&id, d_argmax, 4, hipMemcpyDeviceToHost));
     }
     mtp_pos++;
@@ -9695,6 +9848,56 @@ struct GpuModel {
     }();
     return v;
   }
+  // QWENOX_GREEDY_CONF=θ（greedy MTP 轮；默认 0 = 关，γ 由 GammaCtl/固定值
+  // 决定）：halogen MTP_GATE_P 风格的置信度门控。草稿链在每个 draft 后看
+  // 草稿头自己分布的 top-1 概率，跌破 θ 即在该草稿后收链（该草稿仍被
+  // 验证）。greedy 下逐位接受只取决于前缀，截断尾部 verify 行不改变输出，
+  // 只改变速度。0.90 是 halogen 的默认阈值，从这里起步。
+  static float greedy_conf() {
+    static const float v = [] {
+      const char* e = getenv("QWENOX_GREEDY_CONF");
+      return e ? std::max(0.f, std::min(1.f, (float)atof(e))) : 0.f;
+    }();
+    return v;
+  }
+  // QWENOX_JOINT（默认开；0 = 关）：联合起草。ngram 表在轮首未命中时，
+  // 走 MTP 轮；MTP 草稿链定稿后，用"历史 + cur + 草稿"的扩展历史再查一次
+  // ngram 表，命中则把接续（至多 8-g 个，与 halogen 的 8 个 verify 行一致）
+  // 接在链尾，同一轮 verify。头草稿必须开链、接续只接链尾（halogen PLD
+  // 语义）；greedy 逐位接受只取决于前缀，输出与串行逐字节一致。
+  static bool joint_on() {
+    static const bool on = [] {
+      const char* e = getenv("QWENOX_JOINT");
+      return !(e && e[0] == '0');
+    }();
+    return on;
+  }
+  // QWENOX_JOINT_SAMPLED：采样路径的联合起草（默认随 QWENOX_JOINT；显式设
+  // 0/1 可独立开关）。halogen 的 PLD 只限 greedy；本引擎的采样 ngram 轮
+  // 本来就有"对齐抽中即提交"的无模型草稿验证语义，接续位置沿用同一规则。
+  static bool joint_sampled_on() {
+    static const bool on = [] {
+      const char* e = getenv("QWENOX_JOINT_SAMPLED");
+      if (e) return e[0] != '0';
+      return joint_on();
+    }();
+    return on;
+  }
+  // 每个 draft 步的 top-1 概率（stream 内序，至多 8 步）。静态 32 字节。
+  static float* conf_arr() {
+    static float* d_arr = nullptr;
+    if (!d_arr) CK(hipMalloc(&d_arr, 8 * sizeof(float)));
+    return d_arr;
+  }
+  // 读回逐步置信度，在第一个低于 θ 的草稿后收链（它仍被验证，返回 j+1）。
+  // 全程 ≥ θ 则返回原 g。gd = 本轮实际草稿步数（≥1）。
+  int conf_truncate(int g, int gd, float th, const float* d_arr) {
+    float ph[8];
+    CK(hipMemcpy(ph, d_arr, (size_t)gd * sizeof(float), hipMemcpyDeviceToHost));
+    for (int j = 0; j < gd - 1 && j < g - 1; j++)
+      if (ph[j] < th) return j + 1;
+    return g;
+  }
   // True when drafting should stop after step j (of g planned). sparse = the
   // prepared sparse probabilities, else dense = prepared full-vocab probs.
   static bool spec_conf_stop(int j, int g, const std::vector<float>* sparse,
@@ -10049,20 +10252,36 @@ struct GpuModel {
       if (!dr_done) {
       // draft 1 used the committed (h_q, cur): its indexer ring rows are
       // truth. Later drafts pollute the ring; save/restore around them.
+      // 置信度门控：每步草稿后把草稿分布的 top-1 概率流式写入 conf_arr，
+      // 草稿突发结束后一次读回收链（只截 verify 行数，输出逐位不变）。
+      const float gth = greedy_conf();
+      float* d_conf = gth > 0.f ? conf_arr() : nullptr;
+      const int dvn_conf = draft_vocab > 0
+                               ? std::min(draft_vocab, g_cfg.vocab)
+                               : g_cfg.vocab;
       if (draft_desync) {
         mtp_step(d_R, cur, nullptr, true, nullptr, d_argmax_arr);
+        if (d_conf) top1_prob_enq(d_logits, dvn_conf, d_conf, g_str);
         CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4, hipMemcpyDeviceToDevice,
                           g_str));
-        for (int j = 1; j < gd; j++)
+        for (int j = 1; j < gd; j++) {
           mtp_step(d_mR, 0, nullptr, true, d_argmax_arr + j - 1,
                    d_argmax_arr + j);
+          if (d_conf) top1_prob_enq(d_logits, dvn_conf, d_conf + j, g_str);
+        }
         CK(hipMemcpy(drafts.data(), d_argmax_arr, (size_t)gd * sizeof(int),
                      hipMemcpyDeviceToHost));
+        if (d_conf) g = conf_truncate(g, gd, gth, d_conf);
       } else {
         drafts[0] = mtp_step(d_R, cur);
+        if (d_conf) top1_prob_enq(d_logits, dvn_conf, d_conf, g_str);
         CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4, hipMemcpyDeviceToDevice,
                           g_str));
-        for (int j = 1; j < gd; j++) drafts[j] = mtp_step(d_mR, drafts[j - 1]);
+        for (int j = 1; j < gd; j++) {
+          drafts[j] = mtp_step(d_mR, drafts[j - 1]);
+          if (d_conf) top1_prob_enq(d_logits, dvn_conf, d_conf + j, g_str);
+        }
+        if (d_conf) g = conf_truncate(g, gd, gth, d_conf);
       }
       }
       auto t1 = std::chrono::steady_clock::now();
@@ -10314,6 +10533,7 @@ struct GpuModel {
         throw std::runtime_error(
             "chain: token history and trunk position disagree");
       ngram.observe(chist);
+      jx_ngram.observe(chist);  // 联合起草的短窗表同步学习
       // Same budget math as the pure-ngram loop: one slot stays for the
       // target-model continuation, never verify past gen or maxctx.
       int want = std::min({maxg, gen - (int)out.size() - 1, maxctx - pos - 1});
@@ -10510,21 +10730,51 @@ struct GpuModel {
             dr_on && dr_pool_fn(*this, DrSeg{bound_, gd, cur, drafts.data()});
         if (!dr_done) {
         // draft 1's indexer ring rows are truth; later drafts pollute them.
+        // 置信度门控：同 spec_loop，逐步写 top-1 概率，突发结束一次读回。
+        const float gth = greedy_conf();
+        float* d_conf = gth > 0.f ? conf_arr() : nullptr;
+        const int dvn_conf = draft_vocab > 0
+                                 ? std::min(draft_vocab, g_cfg.vocab)
+                                 : g_cfg.vocab;
         if (draft_desync) {
           mtp_step(d_R, cur, nullptr, true, nullptr, d_argmax_arr);
+          if (d_conf) top1_prob_enq(d_logits, dvn_conf, d_conf, g_str);
           CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4,
                             hipMemcpyDeviceToDevice, g_str));
-          for (int j = 1; j < gd; j++)
+          for (int j = 1; j < gd; j++) {
             mtp_step(d_mR, 0, nullptr, true, d_argmax_arr + j - 1,
                      d_argmax_arr + j);
+            if (d_conf) top1_prob_enq(d_logits, dvn_conf, d_conf + j, g_str);
+          }
           CK(hipMemcpy(drafts.data(), d_argmax_arr, (size_t)gd * sizeof(int),
                        hipMemcpyDeviceToHost));
+          if (d_conf) g = conf_truncate(g, gd, gth, d_conf);
         } else {
           drafts[0] = mtp_step(d_R, cur);
+          if (d_conf) top1_prob_enq(d_logits, dvn_conf, d_conf, g_str);
           CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4,
                             hipMemcpyDeviceToDevice, g_str));
-          for (int j = 1; j < gd; j++) drafts[j] = mtp_step(d_mR, drafts[j - 1]);
+          for (int j = 1; j < gd; j++) {
+            drafts[j] = mtp_step(d_mR, drafts[j - 1]);
+            if (d_conf) top1_prob_enq(d_logits, dvn_conf, d_conf + j, g_str);
+          }
+          if (d_conf) g = conf_truncate(g, gd, gth, d_conf);
         }
+        }
+        // 联合起草（QWENOX_JOINT）：MTP 链定稿后按扩展历史（chist + cur +
+        // 已草稿）再查一次 ngram 表，命中的接续接在链尾，同一轮 verify。
+        // 轮首表未命中不代表扩展后也不命中（草稿把窗口推回重复区）。总链长
+        // 仍封顶 8（kVSnapRows 9 行不变），输出与串行逐字节一致。
+        if (joint_on() && g >= 1 && g < 8 && ng_open && want > g) {
+          std::vector<int64_t> ext(chist.begin(), chist.end());
+          ext.push_back(cur);
+          for (int j = 0; j + 1 < g; j++) ext.push_back(drafts[j]);
+          std::vector<int> cont =
+              jx_ngram.draft(ext, drafts[g - 1], std::min(8 - g, want - g));
+          for (int t : cont) {
+            if (g >= 8) break;
+            drafts[g++] = t;
+          }
         }
         std::vector<int> vt;
         vt.reserve(g + 1);
@@ -10960,6 +11210,7 @@ struct GpuModel {
     int depth_hits[8] = {0}, depth_tot[8] = {0};
     int accepted = 0, ng_rounds = 0, mtp_rounds = 0, ng_roll = 0,
         mtp_roll = 0, fallback = 0, ng_keep = 0, ng_prop = 0;
+    int jx_rounds = 0, jx_tokens = 0;  // 联合起草：带接续的 MTP 轮数 / 接续 token 数
     double verify_ms = 0, replay_ms = 0, ng_ms = 0;
     // ngram verify chunking: same env semantics as the greedy chain; the
     // level lives in the shared Model member (see ng_chunk_init).
@@ -11038,6 +11289,7 @@ struct GpuModel {
         throw std::runtime_error(
             "chain-sample: token history and trunk position disagree");
       ngram.observe(chist);
+      jx_ngram.observe(chist);  // 联合起草的短窗表同步学习
       // Same budget math as the greedy chain: one slot stays for the
       // target-model continuation, never verify past gen or maxctx.
       int want = std::min({maxg, gen - (int)out.size() - 1, maxctx - pos - 1});
@@ -11406,6 +11658,24 @@ struct GpuModel {
           }
           if (!more) break;
         }
+        // 联合起草（采样路径）：MTP 草稿链定稿后按扩展历史再查 ngram 表，
+        // 命中的接续接在链尾同一轮 verify。g_mtp 是链内边界：[0, g_mtp) 是
+        // 头草稿（p/q 拒绝采样，q 来自草稿头）；[g_mtp, g) 是查表接续（无
+        // 模型提案，"对齐抽中即提交"，与采样 ngram 轮同规则）。每轮总链长
+        // 仍封顶 8（kVSnapRows 9 行不变）。
+        const int g_mtp = g;
+        if (joint_sampled_on() && g >= 1 && g < 8 && ng_open && want > g) {
+          std::vector<int64_t> ext(chist.begin(), chist.end());
+          ext.push_back(cur);
+          for (int j = 0; j + 1 < g; j++) ext.push_back(drafts[j]);
+          std::vector<int> cont =
+              jx_ngram.draft(ext, drafts[g - 1], std::min(8 - g, want - g));
+          for (int t : cont) {
+            if (g >= 8) break;
+            drafts[g++] = t;
+          }
+          if (g > g_mtp) { ++jx_rounds; jx_tokens += g - g_mtp; }
+        }
         rp_lap(RP_DRAFT);
         std::vector<int> vt;
         vt.reserve(g + 1);
@@ -11483,7 +11753,30 @@ struct GpuModel {
           }
           return q_rows[r];
         };
+        int jx_cont = -1;  // 查表接续位的错位修正（抽中的即是目标分布的一抽）
+        float jx_cont_lp = 0.0f;
+        bool jx_drew = false;  // 接续位在主码流上抽过（target_view 不可回卷）
         for (; a < g; a++) {
+          if (a >= g_mtp) {
+            // 查表接续位：无 q 的确定性提案，对齐抽中即提交（采样 ngram 轮
+            // 同规则）；未中时抽到的 token 就是修正，不走残差重采。
+            int s;
+            float lp_a = 0.0f;
+            if (smg_v) {
+              sms_prep(target_view, a, false, p_sd[a]);
+              s = target_view.draw_sparse(p_sd[a], &lp_a, false);
+            } else {
+              std::copy_n(verify_logits.data() + (size_t)a * g_cfg.vocab,
+                          g_cfg.vocab, p_row.data());
+              target_view.prepare(p_row);
+              s = target_view.draw_prepared(p_row, &lp_a, false);
+            }
+            jx_drew = true;
+            if (s != drafts[a]) { jx_cont = s; jx_cont_lp = lp_a; break; }
+            draft_lps[a] = lp_a;
+            target_view.remember(drafts[a]);
+            continue;
+          }
           float px, qx;
           const bool q_sp = q_sparse[a];
           if (smg_v && q_sp) {
@@ -11513,8 +11806,12 @@ struct GpuModel {
         if (smg_v) spec_dump_round(q, g, a, drafts, q_sd, p_sd);
         int next;
         float next_lp = 0.0f;
-        target_view.rng = sampler.rng;
-        if (a < g) {
+        if (!jx_drew)
+          target_view.rng = sampler.rng;  // 接续位已抽过主码流：不可回卷
+        if (jx_cont >= 0) {
+          next = jx_cont;  // 接续位错位：修正即目标分布的一抽，无残差
+          next_lp = jx_cont_lp;
+        } else if (a < g) {
           next = (smg_v && q_sparse[a])
                      ? target_view.sample_residual_sparse(p_sd[a], q_sd[a],
                                                           &next_lp)
@@ -11640,11 +11937,12 @@ struct GpuModel {
     fprintf(stderr,
             "%s chain-sample: %d tokens in %.2f s = %.1f tok/s | rounds=%d "
             "(ngram=%d mtp=%d serial=%d) commit/round=%.2f accepted=%d "
-            "proposed=%d rollbacks=%d\n",
+            "proposed=%d rollbacks=%d joint-ext=%d/%d\n",
             log_ts(), (int)out.size(), sec, sec > 0 ? out.size() / sec : 0.0,
             last_spec_rounds, ng_rounds, mtp_rounds, fallback,
             last_spec_rounds ? (double)out.size() / last_spec_rounds : 0.0,
-            accepted, last_spec_proposed, last_spec_rollbacks);
+            accepted, last_spec_proposed, last_spec_rollbacks, jx_tokens,
+            jx_rounds);
     if (ng_rounds)
       fprintf(stderr,
               "chain-sample ngram: rounds=%d accepted=%d proposed=%d "
@@ -12257,6 +12555,7 @@ struct GpuModel {
     const size_t sS = ngdn * 48 * 128 * 128 * 4, sC = ngdn * 3 * 10240 * 4,
                  sRing = (size_t)9 * 10240 * 4, sIraw = nqsa * 4 * 128 * 4;
     slots_.resize((size_t)n);
+    for (auto& s : slots_) s.jx_ngram.set_n(jx_ngram.n);  // 联合表窗口对齐主成员
     if (mtp_avail) {
       // S3c Stage 1: per-slot MTP 流（d_mR 加入 SLOT_FIELDS，bind 时换指针）。
       // 连续池 [n][rb] 而非分散分配：Stage 2 的跨槽合批 draft 按行直读本池。

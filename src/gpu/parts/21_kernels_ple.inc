@@ -502,3 +502,52 @@ __global__ void k_repeat4_b(const float* __restrict__ x, float* __restrict__ R, 
   R[base + 2 * d] = v;
   R[base + 3 * d] = v;
 }
+
+// --- Greedy draft confidence: top-1 softmax probability of a logits row ---
+// 1 / sum(exp(x - max)). One block, two grid-stride sweeps; x is not
+// modified. Block reduce follows k_argmax_p1 (wave width from warpSize).
+__global__ void k_top1_prob(const float* __restrict__ x, int n,
+                            float* __restrict__ out) {
+  __shared__ float wv[64];
+  const int lane = threadIdx.x % warpSize, w = threadIdx.x / warpSize;
+  const int nw = (blockDim.x + warpSize - 1) / warpSize;
+  float m = -INFINITY;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) m = fmaxf(m, x[i]);
+  for (int off = warpSize / 2; off > 0; off >>= 1)
+    m = fmaxf(m, __shfl_down_sync(~0ull, m, off));
+  if (lane == 0) wv[w] = m;
+  __syncthreads();
+  if (w == 0) {
+    m = lane < nw ? wv[lane] : -INFINITY;
+    for (int off = 16; off > 0; off >>= 1)
+      m = fmaxf(m, __shfl_down_sync(~0ull, m, off));
+    if (lane == 0) wv[0] = m;
+  }
+  __syncthreads();
+  const float mx = wv[0];
+  __syncthreads();  // wv is reused below
+  float s = 0.f;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) s += __expf(x[i] - mx);
+  for (int off = warpSize / 2; off > 0; off >>= 1)
+    s += __shfl_down_sync(~0ull, s, off);
+  if (lane == 0) wv[w] = s;
+  __syncthreads();
+  if (w == 0) {
+    s = lane < nw ? wv[lane] : 0.f;
+    for (int off = 16; off > 0; off >>= 1)
+      s += __shfl_down_sync(~0ull, s, off);
+    if (lane == 0) *out = 1.f / s;
+  }
+}
+
+// Enqueue-only top-1 probability: the result lands in out_dev (stream-ordered,
+// no host sync). Batched draft bursts read the whole array back at once.
+static void top1_prob_enq(const float* x, int n, float* out_dev,
+                          hipStream_t st) {
+  k_top1_prob<<<1, 256, 0, st>>>(x, n, out_dev);
+}
+
+// 草稿子词表回映射：子表 argmax 下标 -> 全局 token id（就地，单线程）。
+__global__ void k_dv_map(const int* __restrict__ ids, int* __restrict__ io) {
+  *io = ids[*io];
+}

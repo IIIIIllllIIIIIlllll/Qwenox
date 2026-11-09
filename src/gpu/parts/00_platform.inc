@@ -192,7 +192,24 @@ static const char* log_ts() {
 struct NgramMod {
   using token_t=int32_t; static constexpr token_t EMPTY=-1;
   int n=8,n_min=8,n_max=64; size_t learned=0; std::vector<token_t> table;
-  NgramMod(){ if(const char* e=getenv("QWENOX_NGRAM_MATCH")) n=std::max(4,std::min(64,atoi(e))); if(const char* e=getenv("QWENOX_NGRAM_MIN")) n_min=std::max(1,std::min(64,atoi(e))); if(const char* e=getenv("QWENOX_NGRAM_MAX")) n_max=std::max(1,std::min(64,atoi(e))); table.resize((size_t)4*1024*1024,EMPTY); }
+  NgramMod(){ init(0); }
+  // nn>0：联合起草的短窗表（绕开 QWENOX_NGRAM_MATCH 的 [4,64] 钳制；
+  // QWENOX_JOINT_N 可调，默认 3 = halogen PLD 的 N）。n_min=1：命中即放行，
+  // 链长由调用方的 want 封顶。
+  explicit NgramMod(int nn){ init(nn); }
+  void init(int nn){
+    if(nn>0){ n=nn; n_min=1; }
+    const char* em = getenv(nn>0?"QWENOX_JOINT_N":"QWENOX_NGRAM_MATCH");
+    if(em) n=std::max(nn>0?2:4,std::min(64,atoi(em)));
+    if(nn==0){
+      if(const char* e=getenv("QWENOX_NGRAM_MIN")) n_min=std::max(1,std::min(64,atoi(e)));
+      if(const char* e=getenv("QWENOX_NGRAM_MAX")) n_max=std::max(1,std::min(64,atoi(e)));
+    }
+    table.resize((size_t)4*1024*1024,EMPTY);
+  }
+  // 槽位条目默认构造后是主表窗口；slots_init 用它对齐联合表的窗口。
+  // 仅在表还空着时有效（学习后换窗口会让既有条目失址）。
+  void set_n(int nn){ if(learned==0) n=nn; }
   size_t slot(const std::vector<int64_t>&h,size_t off)const{uint64_t z=0;for(int i=0;i<n;i++) z=z*6364136223846793005ULL+(uint32_t)h[off+i];return(size_t)(z%table.size());}
   void reset(){std::fill(table.begin(),table.end(),EMPTY);learned=0;}
   void observe(const std::vector<int64_t>&h){if(h.size()<=(size_t)n)return;size_t lim=h.size()-n;if(learned>lim)learned=lim;for(size_t i=learned;i<lim;i++)table[slot(h,i)]=(token_t)h[i+n];learned=lim;}

@@ -542,6 +542,7 @@ int main(int argc, char** argv) {
     v2_init(ckpt);
     GpuModel m(ckpt, maxctx);
     m.setup_draft_lmhead(g_lmhead_base_ok ? &g_lmhead_base : nullptr);
+    m.setup_draft_vocab_list();
     gguf_dense_release(ckpt);
     m.ple_on = ple_on;
     m.build_graphs();
@@ -619,6 +620,7 @@ int main(int argc, char** argv) {
 
   GpuModel m(ckpt, maxctx);
   m.setup_draft_lmhead(g_lmhead_base_ok ? &g_lmhead_base : nullptr);
+  m.setup_draft_vocab_list();
   gguf_dense_release(ckpt);
   m.ple_on = ple_on;
   m.build_graphs();
