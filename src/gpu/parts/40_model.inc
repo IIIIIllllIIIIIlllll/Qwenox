@@ -10765,14 +10765,18 @@ struct GpuModel {
         // 已草稿）再查一次 ngram 表，命中的接续接在链尾，同一轮 verify。
         // 轮首表未命中不代表扩展后也不命中（草稿把窗口推回重复区）。总链长
         // 仍封顶 8（kVSnapRows 9 行不变），输出与串行逐字节一致。
-        if (joint_on() && g >= 1 && g < 8 && ng_open && want > g) {
+        // 与其他槽会合验证时每段至多 8 行（prefill_chunk_vseg 的 P≤8 守卫），
+        // 总链长封顶 7：一段 9 行会让整批退回逐段串行验证（MarkPC 11-09：
+        // C2 每轮 "batched verify refused"，聚合低于单路）。
+        const int jcap = (vseg_active_fn && vseg_active_fn() > 1) ? 7 : 8;
+        if (joint_on() && g >= 1 && g < jcap && ng_open && want > g) {
           std::vector<int64_t> ext(chist.begin(), chist.end());
           ext.push_back(cur);
           for (int j = 0; j + 1 < g; j++) ext.push_back(drafts[j]);
           std::vector<int> cont =
-              jx_ngram.draft(ext, drafts[g - 1], std::min(8 - g, want - g));
+              jx_ngram.draft(ext, drafts[g - 1], std::min(jcap - g, want - g));
           for (int t : cont) {
-            if (g >= 8) break;
+            if (g >= jcap) break;
             drafts[g++] = t;
           }
         }
@@ -11662,16 +11666,19 @@ struct GpuModel {
         // 命中的接续接在链尾同一轮 verify。g_mtp 是链内边界：[0, g_mtp) 是
         // 头草稿（p/q 拒绝采样，q 来自草稿头）；[g_mtp, g) 是查表接续（无
         // 模型提案，"对齐抽中即提交"，与采样 ngram 轮同规则）。每轮总链长
-        // 仍封顶 8（kVSnapRows 9 行不变）。
+        // 仍封顶 8（kVSnapRows 9 行不变）；与其他槽会合验证时封顶 7（同 greedy
+        // 路径：合批每段至多 8 行）。
         const int g_mtp = g;
-        if (joint_sampled_on() && g >= 1 && g < 8 && ng_open && want > g) {
+        const int jcap =
+            (vr_on && vseg_active_fn && vseg_active_fn() > 1) ? 7 : 8;
+        if (joint_sampled_on() && g >= 1 && g < jcap && ng_open && want > g) {
           std::vector<int64_t> ext(chist.begin(), chist.end());
           ext.push_back(cur);
           for (int j = 0; j + 1 < g; j++) ext.push_back(drafts[j]);
           std::vector<int> cont =
-              jx_ngram.draft(ext, drafts[g - 1], std::min(8 - g, want - g));
+              jx_ngram.draft(ext, drafts[g - 1], std::min(jcap - g, want - g));
           for (int t : cont) {
-            if (g >= 8) break;
+            if (g >= jcap) break;
             drafts[g++] = t;
           }
           if (g > g_mtp) { ++jx_rounds; jx_tokens += g - g_mtp; }
