@@ -111,3 +111,45 @@ set BENCH_SERIAL=1 && set QWENOX_PERF=1
 
 调查素材（本 workspace 之外的参考）：halogen 镜像 rootfs 与 gfx1151 GPU 代码对象、
 其 `docs/FLAGS.md`（全部投机参数的默认值与语义）在对标调查机上有完整留存。
+
+## 6. halogen 反汇编深读（gfx1151 代码对象，2026-11-09 下午）
+
+用 TheRock 的 llvm-objdump 反汇编了 halogen 镜像里的 gfx1151 GPU 代码对象
+（.hip_fatbin 内的 amdgcn ELF，21 MB .text，1789 个内核全部可读）。硬事实：
+
+1. **融合巨型内核**：`q4moe::k_q4moe<...>` 一族单个内核 100~270 KB（约 4 万条
+   指令），整个 MoE 专家通道（gate_up→silu→down）融合为一次启动。本引擎同路径
+   是 5 个串行小内核 ×48 层。
+2. **张量核打带宽仗**：98 个内核含 WMMA（`v_wmma_f32_16x16x16_bf16`）——融合
+   MoE 族 31 个、ht dense GEMV 族 56 个。融合内核内部是标准 GEMM 分级管线：
+   global（128 位宽加载）→ LDS → WMMA。带宽受限下张量核的价值是发射压力低、
+   在途加载多。
+3. **VOPD 双发射**：全二进制 357,574 条 `v_dual_*` 指令（gfx1151 的双发射
+   FP32 管道），编译器深度展开所有可并行的 FP32 对。
+4. **不用 HIP Graph**：`flash_serve` 无 hipGraph 符号，纯 hipLaunchKernel +
+   stream/event。Linux 启动延迟低 + 单内核更大更少，不需要图捕获（本引擎在
+   Windows 靠 decode 图填平 host 发射开销，实测值 ~6.5 ms/token）。
+5. verify 多行走**调优过的 hipBLASLt GEMM**（`flash-tune.plan` 为片上实测调优；
+   日志明写 "down experts need the GEMM path (hipBLASLt) at n > 1"）；接受/残差
+   采样全程 GPU 内核（`k_accept_prob_f32` / `k_resid_sample_f32`），零 host 往返。
+
+**散文 54 tok/s 的分解**：= 串行 37.6 × 投机倍率 1.436。倍率端靠低轮成本
+（GEMM 级 verify + GPU 端接受）+ `SPEC_ADAPT` 低接受率窗口自动关草稿头跑串行；
+串行端靠融合 WMMA 内核。**可追的单点：本引擎 decode/verify（P≤48）的专家路径
+仍是标量 FMA GEMV（`k_q4cp_gemv_gg`），而 prefill 已有 i4r LUT WMMA 路径——把
+验证轮的 MoE 路由到 WMMA 同时改善串行底子和投机轮成本。**（未开工，2026-11-09
+记录为下一步候选）
+
+## 7. gufo 口径核查（营销数字 vs 其自身文档）
+
+gufo（gufo-org/gufo，MIT）头条 "Flash-Next 最高 116.93 tg / 245.81 聚合 8 用户"
+出自其 `docs/models/qwen3.8-flash-next/BENCHMARKS.md` 的长上下文 sweep：**prompt
+是 20-token 模式的无限重复，模型逐字续写，MTP 接受率 ~100%**，其文档自己注明
+"the MTP column is an upper bound for repeated text, not chat or code"。同文档的
+诚实口径：聊天散文 MTP greedy **44.5~45.2 tok/s**（67% 接受）、串行 AR 35.2、
+现实并发（gufo-tp 文档，2K+128）4 路聚合 ~86。**三方现实文本口径对比：串行
+33.5(Qwenox)/35.2(gufo)/37.6(halogen)；散文投机 44.9/44.5-45.2/54；代码
+73.5-80.4(Qwenox 最高）；4 路聚合 82.4/~86/未公布。** 结论：剔除复读机口径后
+三方同档，halogen 的真实剩余优势是散文的串行底子（大半为 Linux/Windows 驱动差）。
+另注：gufo 的草稿词表是 "Latin draft vocabulary"——与本引擎 §2 记录的
+DRAFT_VOCAB 中文翻车是同一类偏置。
