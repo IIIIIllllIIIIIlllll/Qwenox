@@ -1477,6 +1477,16 @@ void handle_overrides_post(const http::Request& q, http::Response* r, http::Stre
 
 const char* kWeightsMarker = "# start_win: weights=";
 
+// 从磁盘重读 service.conf 刷新内存有效值（调用方须持 g_svc_conf_mtx）。
+// 设置面板（settings_win.exe）是独立进程、直接改文件，不经过 /admin/config
+// 保存后的那次刷新；引擎启动路径在复制 g_svc_conf 前调用本函数，保证托盘
+// 菜单和 HTTP 两种启动都拿到最新配置。文件读不到/没有任何键时沿用内存值。
+void reload_svc_conf_from_disk() {
+    svcconf::Conf fresh;
+    svcconf::load_conf(g_conf_path, &fresh);
+    if (!fresh.empty()) g_svc_conf = std::move(fresh);
+}
+
 std::string eff_engine_host() {
     std::lock_guard<std::mutex> lk(g_svc_conf_mtx);
     return svcconf::cfg(g_svc_conf, "ENGINE_HOST", "127.0.0.1");
@@ -1737,6 +1747,7 @@ void handle_engine_start(const http::Request& q, http::Response* r, http::Stream
     svcconf::Conf conf;
     {
         std::lock_guard<std::mutex> lk(g_svc_conf_mtx);
+        reload_svc_conf_from_disk();  // 拾起设置面板等外部改动（不重启本进程）
         conf = g_svc_conf;
     }
     conf[enginesup::kWeightsVerKey] = svcconf::conf_marker(g_conf_path, kWeightsMarker);
@@ -4992,7 +5003,8 @@ int main(int argc, char** argv) {
     }
     // 请求日志：REQLOG / REQLOG_DIR / REQLOG_LEVEL 只从 service.conf 读
     // （QWENOX_REQLOG* 环境变量优先，便于独立运行/测试）。刻意不加入
-    // svcconf::kManagedKeys：设置面板和网页不显示、也不能改，只能手改配置。
+    // svcconf::kManagedKeys：网页 /admin/config 不显示、也不能改；设置面板
+    // 自己管理这三个键（settings_panel.inc，不经 kManagedKeys 直接写 conf）。
     // 与大多数 conf 项一样，改动在下次启动 API 时生效。
     {
         auto eff = [](const char* env_key, const char* conf_key, const char* dflt) {
@@ -5238,6 +5250,7 @@ int main(int argc, char** argv) {
         hooks.api_log = g_api_log_abs;
         hooks.conf_snapshot = [] {
             std::lock_guard<std::mutex> lk(g_svc_conf_mtx);
+            reload_svc_conf_from_disk();  // 拾起设置面板等外部改动（不重启本进程）
             svcconf::Conf c = g_svc_conf;
             c[enginesup::kWeightsVerKey] = svcconf::conf_marker(g_conf_path, kWeightsMarker);
             return c;

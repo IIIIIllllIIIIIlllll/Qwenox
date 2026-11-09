@@ -12,12 +12,18 @@
 //   第 2 页 推理设置：MAX_CONTEXT / PARALLEL / 并发总池（KV_POOL_TOKENS）/
 //          KV_PAGED / PREFILL_CHUNK / QSA_INDEXER_BUDGET（默认 2048，可选 4096）/
 //          KV 快照（KVSNAP_MAX_GB + KVSNAP_DIR）/ YaRN 勾选（ROPE_FACTOR 自动推导）/
-//          处理器亲和性三态（不限制 / CCD 0 / CCD 1，落盘 AFFINITY ""/lower-half/upper-half）。
+//          处理器亲和性三态（不限制 / CCD 0 / CCD 1，落盘 AFFINITY ""/lower-half/upper-half）/
+//          MAX_IMAGES（单请求图片数上限 1–256，API 启动时读取，重启生效）。
 //          GGUF 仅保存（本机服务由 start_win.exe 启动，只支持 hgn；GGUF 配置供 Linux
 //          bash start_gguf.sh 使用）。
 //          ROPE_ORIGINAL_CTX 不做 UI 行（用户不该改）：校验仍从 g_conf/环境读，
 //          也不在 kManagedKeys 里，save_conf 永远不会改写 conf 中的该行。
-//   第 3 页 端口与监听：ENGINE_HOST / ENGINE_PORT / API_HOST / API_PORT。
+//   第 3 页 端口与日志：ENGINE_HOST / ENGINE_PORT / API_HOST / API_PORT /
+//          VIZ（运行时可视化勾选）/ 请求日志（REQLOG 勾选 + REQLOG_DIR + REQLOG_LEVEL）。
+//   MAX_IMAGES / VIZ / REQLOG* 不在 svcconf::kManagedKeys 里（网页 /admin/config
+//          仍拒绝写入）：面板直接经 save_conf 的 vals 写盘，env 覆盖提示走面板
+//          自己的表（覆盖变量名与 conf 键不同名：QWENOX_API_MAX_IMAGES /
+//          QWENOX_REQLOG*；VIZ 的覆盖变量就是同名环境变量）。
 //   第 4 页 显存检查：HIP 可用显存、权重合计、并发总池/工作区/并发估算、
 //          合计对照结论，以及其它页的失败汇总；"重新检查"按钮在本页。
 // 每页底部有独立的多行只读检查区（[通过]/[失败]/[警告]/[提示] 前缀）。
@@ -134,6 +140,8 @@ void panel_lang_resolve() {
 // 面板管理的 conf 键（也是环境变量覆盖提示的范围）与可选文件键：
 // 定义在 service_conf.h（svcconf 命名空间，与 gdec-api 共享）。
 // ROPE_ORIGINAL_CTX 刻意不在其中：面板不做它的 UI 行，save_conf 也不改写它。
+// MAX_IMAGES / VIZ / REQLOG* 同样不在其中（网页 /admin/config 保持拒绝写入），
+// 面板经 panel_vals_to_conf 直接写盘，env 覆盖提示见 panel_checks 的 kPanelOnlyEnv。
 using svcconf::kManagedKeys;
 using svcconf::is_optional_file_key;
 
@@ -385,6 +393,11 @@ struct PanelVals {
     std::string moe_a4 = "0";  // MOE_A4：0 关，1–3 开（只对 V2 生效）
     std::string qsa_indexer_budget = "0";  // 0 = 2048；4096 = 扩大 QSA 检索预算
     std::string affinity;
+    std::string max_images;    // MAX_IMAGES：单请求图片数上限（1–256），重启生效
+    bool viz = false;          // VIZ：运行时可视化（GET /viz），重启生效
+    bool reqlog = false;       // REQLOG：请求日志（完整保存提示词/回复），重启生效
+    std::string reqlog_dir;    // REQLOG_DIR：空 = 保存时写默认 logs/reqlog
+    std::string reqlog_level;  // REQLOG_LEVEL：1–10，空 = 保存时写默认 6
     std::string engine_host, engine_port, api_host, api_port;
 };
 
@@ -424,6 +437,11 @@ PanelVals panel_vals_from_conf() {
     v.kvsnap_dir = cfg_optional("KVSNAP_DIR", "");
     v.moe_a4 = cfg("MOE_A4", "0");
     v.affinity = cfg("AFFINITY", "");
+    v.max_images = cfg("MAX_IMAGES", "8");
+    v.viz = cfg("VIZ", "0") == "1";
+    v.reqlog = cfg("REQLOG", "0") != "0";
+    v.reqlog_dir = cfg("REQLOG_DIR", "logs/reqlog");
+    v.reqlog_level = cfg("REQLOG_LEVEL", "6");
     v.engine_host = cfg("ENGINE_HOST", "127.0.0.1");
     v.engine_port = cfg("ENGINE_PORT", "8730");
     v.api_host = cfg("API_HOST", "0.0.0.0");
@@ -475,6 +493,14 @@ std::map<std::string, std::string> panel_vals_to_conf(const PanelVals& v) {
     m["KVSNAP_DIR"] = kdir;
     m["MOE_A4"] = v.moe_a4;
     m["AFFINITY"] = v.affinity;
+    m["MAX_IMAGES"] = v.max_images;
+    m["VIZ"] = v.viz ? "1" : "0";
+    m["REQLOG"] = v.reqlog ? "1" : "0";
+    // 空值落盘为默认：API 的 eff() 读到显式空串不会套内置默认（api/main.cpp）
+    std::string rdir = v.reqlog_dir;
+    while (!rdir.empty() && (rdir.back() == '\\' || rdir.back() == '/')) rdir.pop_back();
+    m["REQLOG_DIR"] = rdir.empty() ? "logs/reqlog" : rdir;
+    m["REQLOG_LEVEL"] = v.reqlog_level.empty() ? "6" : v.reqlog_level;
     m["ENGINE_HOST"] = v.engine_host;
     m["ENGINE_PORT"] = v.engine_port;
     m["API_HOST"] = v.api_host;
@@ -648,6 +674,10 @@ void check_context_page(CheckLines& c, const PanelVals& v) {
                  "· KV snapshot folder: empty = cache goes to data\\kvsnap inside the repo; a "
                  "path puts the cache in its qwenox-kvsnap subfolder (auto-created, safe to "
                  "delete wholesale).\r\n");
+    c.text += TR("· 单请求图片数上限：对整个 messages 历史累计计数，每张图约 1–2K token；"
+                 "改动重启服务后生效。\r\n",
+                 "· Images per request: counted across the whole messages history, ~1–2K tokens "
+                 "per image; a restart is required to apply.\r\n");
     long maxctx = 0, parallel = 1, kv_pool = 0, prefill = 0, rope_orig = 0;
     double factor = 1;
     bool nums_ok = true;
@@ -668,6 +698,8 @@ void check_context_page(CheckLines& c, const PanelVals& v) {
     need_int("PREFILL_CHUNK", v.prefill_chunk, 0, 1 << 20, &prefill);
     long kvsnap = 20;
     need_int("KVSNAP_MAX_GB", v.kvsnap_max_gb, 0, 1 << 16, &kvsnap);
+    long max_images = 8;
+    need_int("MAX_IMAGES", v.max_images, 1, 256, &max_images);
     // ROPE_ORIGINAL_CTX 无 UI 行，但校验照做（conf 里填坏时启动器同样会拒）
     need_int("ROPE_ORIGINAL_CTX", v.rope_original, 1, 1 << 30, &rope_orig);
     if (!pn_double(v.rope_factor, &factor) || factor < 1) {
@@ -771,7 +803,7 @@ void check_context_page(CheckLines& c, const PanelVals& v) {
     }
 }
 
-// 第 3 页：监听地址与端口。service_running 时占用检查降级为提示。
+// 第 3 页：监听地址与端口 + 运行时可视化/请求日志。service_running 时占用检查降级为提示。
 void check_ports_page(CheckLines& c, const PanelVals& v, bool service_running) {
     // 说明行（不参与判定，恒在列表最上方）
     c.text += TR("· 引擎是内部行协议，由 API 自动桥接，无需直连；浏览器/客户端连 API 端口。\r\n",
@@ -780,6 +812,9 @@ void check_ports_page(CheckLines& c, const PanelVals& v, bool service_running) {
     c.text += TR("· 监听地址：127.0.0.1 = 仅本机（引擎推荐），0.0.0.0 = 对外开放。\r\n",
                  "· Bind address: 127.0.0.1 = local only (recommended for the engine), "
                  "0.0.0.0 = open to the network.\r\n");
+    c.text += TR("· 运行时可视化随引擎启动生效；请求日志由 API 启动时读取，改动需重启服务。\r\n",
+                 "· Runtime visualization applies when the engine (re)starts; request logging "
+                 "is read at API startup and needs a service restart.\r\n");
     sockaddr_in tmp{};
     if (v.engine_host.empty() || !engine_net::address(v.engine_host, 1, &tmp))
         check_line(c, kLvFail,
@@ -828,6 +863,34 @@ void check_ports_page(CheckLines& c, const PanelVals& v, bool service_running) {
                 check_line(c, kLvPass, TR("端口 ", "Ports ") + std::to_string(eport) + "/" +
                                            std::to_string(aport) + TR(" 空闲", " are free"));
         }
+    }
+    if (v.viz)
+        check_line(c, kLvWarn,
+                   TR("运行时可视化已开启：能访问 API 端口的人都能看到正在生成的内容；"
+                      "decode 约慢 1%，多占约 6 MiB × 并发路数的锁页内存",
+                      "Runtime visualization is on: anyone with API access can watch the "
+                      "content being generated; decode is ~1% slower and ~6 MiB × streams of "
+                      "pinned memory is reserved"));
+    long reqlog_level = 6;
+    if (!v.reqlog_level.empty() &&
+        (!pn_int(v.reqlog_level, &reqlog_level) || reqlog_level < 1 || reqlog_level > 10)) {
+        check_line(c, kLvFail,
+                   TR("REQLOG_LEVEL 必须是 1-10 的整数（当前为 \"",
+                      "REQLOG_LEVEL must be an integer 1-10 (current: \"") +
+                       v.reqlog_level + TR("\"）", "\")"));
+    }
+    if (v.reqlog) {
+        check_line(c, kLvWarn,
+                   TR("请求日志已开启：每个 POST /v1/* 保存一个 ZIP（meta/请求体/响应体），"
+                      "完整记录提示词与回复，注意隐私与磁盘占用",
+                      "Request logging is on: every POST /v1/* is stored as a ZIP (meta, request "
+                      "and response bodies) — prompts and responses are recorded in full; mind "
+                      "privacy and disk usage"));
+        if (v.reqlog_dir.empty())
+            check_line(c, kLvHint,
+                       TR("请求日志目录留空：保存时写默认值 logs/reqlog",
+                          "Request log folder left empty: the default logs/reqlog is written "
+                          "on save"));
     }
     if (!c.fatal) check_line(c, kLvPass, TR("监听地址与端口合法", "Bind addresses and ports are valid"));
 }
@@ -1087,6 +1150,34 @@ AllChecks panel_checks(const PanelVals& v, bool service_running) {
                                      TR(" 正被环境变量覆盖（=\"", " is overridden by an environment variable (=\"") +
                                      e + TR("\"），面板改动不生效", "\"); panel changes will not take effect"));
     }
+    // 面板专属键（不在 kManagedKeys，网页 /admin/config 仍拒绝写入）：覆盖它们的
+    // 环境变量与 conf 键不同名——API 侧优先级是 QWENOX_* 环境变量 > 同名环境变量
+    // （svcconf::cfg 的 bash 语义）> conf；VIZ 没有 QWENOX_ 前缀的前置变量
+    // （engine_sup 用 svcconf::cfg 读 VIZ 后自行设置 QWENOX_VIZ）。
+    static const struct {
+        const char* conf_key;
+        const char* env_key;  // 与 conf_key 相同 = 只查同名环境变量
+        int page;             // 1 推理 / 2 端口
+    } kPanelOnlyEnv[] = {
+        {"MAX_IMAGES", "QWENOX_API_MAX_IMAGES", 1},
+        {"VIZ", "VIZ", 2},
+        {"REQLOG", "QWENOX_REQLOG", 2},
+        {"REQLOG_DIR", "QWENOX_REQLOG_DIR", 2},
+        {"REQLOG_LEVEL", "QWENOX_REQLOG_LEVEL", 2},
+    };
+    for (const auto& e : kPanelOnlyEnv) {
+        const char* v1 = getenv(e.conf_key);
+        const char* v2 = strcmp(e.conf_key, e.env_key) == 0 ? nullptr : getenv(e.env_key);
+        const bool use2 = v2 && *v2;
+        const char* val = use2 ? v2 : v1;
+        if (!val || !*val) continue;
+        CheckLines& dst = e.page == 1 ? a.context : a.ports;
+        check_line(dst, kLvWarn,
+                   std::string(e.conf_key) + TR(" 正被环境变量 ", " is overridden by ") +
+                       (use2 ? e.env_key : e.conf_key) +
+                       TR(" 覆盖（=\"", " (=\"") + val +
+                       TR("\"），面板改动不生效", "\"); panel changes will not take effect"));
+    }
     return a;
 }
 
@@ -1109,6 +1200,7 @@ enum PanelId : int {
     kEdEHost, kEdEPort, kEdAHost, kEdAPort,
     kEdOut1, kEdOut2, kEdOut3, kEdReport, kEdSummary, kBtnLang,
     kCkMoeA4, kCkQsaBudget,
+    kEdMaxImages, kCkViz, kCkReqlog, kEdReqlogDir, kBrReqlogDir, kEdReqlogLevel,
 };
 
 struct FileRow {
@@ -1129,6 +1221,10 @@ struct PanelCtl {
     HWND kvsnap = nullptr;
     HWND kvsnap_dir = nullptr, kvsnap_dir_br = nullptr;
     HWND affinity = nullptr;
+    HWND max_images = nullptr;
+    HWND viz = nullptr;
+    HWND reqlog = nullptr, reqlog_dir = nullptr, reqlog_dir_br = nullptr,
+         reqlog_level = nullptr;
     HWND ehost = nullptr, eport = nullptr, ahost = nullptr, aport = nullptr;
     HWND out1 = nullptr, out2 = nullptr, out3 = nullptr, report = nullptr, summary = nullptr;
 };
@@ -1154,16 +1250,16 @@ constexpr COLORREF kPanelBg = RGB(16, 20, 34);
 constexpr COLORREF kPanelFg = RGB(232, 236, 246);  // 深色背景上的浅色文字
 constexpr COLORREF kEditBg = RGB(24, 30, 50);      // 输入框卡片：比压暗层略亮
 
-// 布局常量：内容区 644×504（立绘加载成功时窗口左侧再加 g_art_w 宽的立绘条，
+// 布局常量：内容区 644×560（立绘加载成功时窗口左侧再加 g_art_w 宽的立绘条，
 // 所有控件经 add_ctrl 统一右移），内容右缘 636。
 // label 列要装下 "单请求上限 (token)"（高 DPI 下约 185px），故 kLblW=190。
-const int kCliW = 644, kCliH = 504;
+const int kCliW = 644, kCliH = 560;
 const int kLblX = 12, kLblW = 190, kEdX = 202;
 const int kOffW = 88;                 // "不使用" checkbox（勾选框 + 3 个汉字）
 const int kEdPlainW = 354;            // 无 checkbox 文件行的 EDIT 宽（202..556）
 const int kBrX = 564, kBrW = 72;      // 浏览按钮
 const int kHintX = 328, kHintW = 308; // 第 2 页行尾提示（edit 202+120=322 右侧）
-const int kListBottom = 452;          // 各页检查区下缘（底部按钮行在其下）
+const int kListBottom = 508;          // 各页检查区下缘（底部按钮行在其下）
 
 // ---- DPI ---------------------------------------------------------------------
 // 上面所有布局常量都按 96-DPI 像素书写；建窗口/控件、GDI+ 绘制时经 sc()
@@ -1284,6 +1380,14 @@ void set_optional_row_state(HWND off, HWND edit, HWND browse) {
     if (browse) EnableWindow(browse, !disabled);
 }
 
+// 请求日志勾选状态 → 目录/级别行可用性（第 3 页；g_pc 先于本文件控件段定义）
+void set_reqlog_row_state() {
+    const bool on = get_check(g_pc.reqlog);
+    EnableWindow(g_pc.reqlog_dir, on);
+    EnableWindow(g_pc.reqlog_dir_br, on);
+    EnableWindow(g_pc.reqlog_level, on);
+}
+
 // YaRN 勾选 → ROPE_FACTOR = max(2, ceil(单请求上限 / ROPE_ORIGINAL_CTX))；
 // 不勾 → 1。上限/原生值解析失败时按默认粗估（校验页会单独报 [失败]）。
 std::string derive_rope_factor(bool yarn_on, const std::string& max_context,
@@ -1339,6 +1443,11 @@ PanelVals panel_collect() {
     // 三态：不限制 / lower-half（CCD 0）/ upper-half（CCD 1）
     const int affinity_sel = static_cast<int>(SendMessageW(g_pc.affinity, CB_GETCURSEL, 0, 0));
     v.affinity = affinity_sel == 1 ? "lower-half" : affinity_sel == 2 ? "upper-half" : "";
+    v.max_images = get_edit(g_pc.max_images);
+    v.viz = get_check(g_pc.viz);
+    v.reqlog = get_check(g_pc.reqlog);
+    v.reqlog_dir = get_edit(g_pc.reqlog_dir);
+    v.reqlog_level = get_edit(g_pc.reqlog_level);
     v.engine_host = get_edit(g_pc.ehost);
     v.engine_port = get_edit(g_pc.eport);
     v.api_host = get_edit(g_pc.ahost);
@@ -1445,17 +1554,17 @@ bool panel_browse(HWND edit) {
     return true;
 }
 
-// 目录选择框（KV 快照目录用）：IFileOpenDialog + FOS_PICKFOLDERS，Win10 现代样式、
-// 可手输路径。CoInitializeEx 随每次选择配对；COM 已按其它线程模型初始化
-//（RPC_E_CHANGED_MODE）时照常继续、不负责 Uninitialize。取消/创建失败静默返回。
-bool panel_browse_dir(HWND edit) {
+// 目录选择框（KV 快照目录 / 请求日志目录用）：IFileOpenDialog + FOS_PICKFOLDERS，
+// Win10 现代样式、可手输路径。CoInitializeEx 随每次选择配对；COM 已按其它线程模型
+// 初始化（RPC_E_CHANGED_MODE）时照常继续、不负责 Uninitialize。取消/创建失败静默返回。
+bool panel_browse_dir(HWND edit, const wchar_t* title) {
     const HRESULT hr_init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     bool ok = false;
     IFileOpenDialog* dlg = nullptr;
     if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
                                    IID_IFileOpenDialog, reinterpret_cast<void**>(&dlg)))) {
         dlg->SetOptions(FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
-        dlg->SetTitle(TR(L"选择 KV 快照目录", L"Select KV snapshot folder"));
+        dlg->SetTitle(title);
         // 当前值作为初始目录（先规范成绝对路径；解析或转换失败就按默认目录开）
         const std::string cur = get_edit(edit);
         if (!cur.empty()) {
@@ -1916,7 +2025,14 @@ LRESULT CALLBACK panel_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 if (panel_browse(g_pc.row_gguf_vision.edit)) panel_recheck();
                 return 0;
             case kBrKvsnapDir:
-                if (panel_browse_dir(g_pc.kvsnap_dir)) panel_recheck();
+                if (panel_browse_dir(g_pc.kvsnap_dir,
+                                     TR(L"选择 KV 快照目录", L"Select KV snapshot folder")))
+                    panel_recheck();
+                return 0;
+            case kBrReqlogDir:
+                if (panel_browse_dir(g_pc.reqlog_dir,
+                                     TR(L"选择请求日志目录", L"Select request log folder")))
+                    panel_recheck();
                 return 0;
             case kOffOverlay:
                 set_optional_row_state(g_pc.row_overlay.off, g_pc.row_overlay.edit,
@@ -1945,6 +2061,11 @@ LRESULT CALLBACK panel_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             case kCkKvPaged: panel_recheck(); return 0;
             case kCkYarn: panel_recheck(); return 0;
             case kCkMoeA4: panel_recheck(); return 0;
+            case kCkViz: panel_recheck(); return 0;
+            case kCkReqlog:
+                set_reqlog_row_state();
+                panel_recheck();
+                return 0;
             case kCbAffinity: panel_recheck(); return 0;
             default: break;
         }
@@ -2062,7 +2183,7 @@ PanelResult panel_run() {
     // ---- 分页切换（恒可见）：BS_PUSHLIKE 单选按钮，不引入 comctl32
     const wchar_t* tab_names[4] = {TR(L"1 权重", L"1 Weights"),
                                    TR(L"2 推理设置", L"2 Inference"),
-                                   TR(L"3 端口与监听", L"3 Ports & listen"),
+                                   TR(L"3 端口与日志", L"3 Ports & logging"),
                                    TR(L"4 显存检查", L"4 VRAM check")};
     for (int i = 0; i < 4; ++i) {
         g_pc.tabs[i] = add_ctrl(h, L"Button",
@@ -2216,11 +2337,19 @@ PanelResult panel_run() {
     SendMessageW(g_pc.affinity, CB_SETCURSEL,
                  init.affinity.empty() ? 0 : init.affinity == "lower-half" ? 1 : 2, 0);
     y2 += 26;
+    plabel(1, h, kLblX, y2, TR(L"单请求图片数上限", L"Images per request"));
+    g_pc.max_images = pctl(1, h, L"Edit", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kEdX, y2,
+                           120, 22, L"", kEdMaxImages);
+    set_edit(g_pc.max_images, init.max_images);
+    plabel(1, h, kHintX, y2, TR(L"1–256，多轮累计计数；重启生效",
+                                L"1–256, counted over history; restart to apply"),
+           kHintW);
+    y2 += 26;
     g_pc.out2 = pctl(1, h, L"Edit",
                      WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL,
                      12, y2 + 10, 624, kListBottom - y2 - 10, L"", kEdOut2);
 
-    // ---- 第 3 页：端口与监听（行尾无 hint，说明在第 3 页检查列表顶部）
+    // ---- 第 3 页：端口与日志（行尾无 hint，说明在第 3 页检查列表顶部）
     int y3 = 46;
     plabel(2, h, kLblX, y3, TR(L"引擎监听地址", L"Engine bind address"));
     g_pc.ehost = pctl(2, h, L"Edit", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kEdX, y3, 140,
@@ -2242,6 +2371,33 @@ PanelResult panel_run() {
                       L"", kEdAPort);
     set_edit(g_pc.aport, init.api_port);
     y3 += 26;
+    g_pc.viz = pctl(2, h, L"Button", BS_AUTOCHECKBOX | WS_TABSTOP, kEdX, y3, 434, 20,
+                    TR(L"运行时可视化（GET /viz，能看到生成内容）",
+                       L"Runtime visualization (GET /viz; exposes generated content)"),
+                    kCkViz);
+    SendMessageW(g_pc.viz, BM_SETCHECK, init.viz ? BST_CHECKED : BST_UNCHECKED, 0);
+    y3 += 26;
+    g_pc.reqlog = pctl(2, h, L"Button", BS_AUTOCHECKBOX | WS_TABSTOP, kEdX, y3, 434, 20,
+                       TR(L"请求日志（完整保存提示词与回复，注意隐私）",
+                          L"Request logging (stores full prompts and responses)"),
+                       kCkReqlog);
+    SendMessageW(g_pc.reqlog, BM_SETCHECK, init.reqlog ? BST_CHECKED : BST_UNCHECKED, 0);
+    y3 += 26;
+    plabel(2, h, kLblX, y3, TR(L"请求日志目录", L"Request log folder"));
+    g_pc.reqlog_dir = pctl(2, h, L"Edit", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kEdX, y3,
+                           354, 22, L"", kEdReqlogDir);
+    set_edit(g_pc.reqlog_dir, init.reqlog_dir);
+    g_pc.reqlog_dir_br = pctl(2, h, L"Button", BS_PUSHBUTTON, kBrX, y3 - 1, kBrW, 24,
+                              TR(L"浏览…", L"Browse"), kBrReqlogDir);
+    y3 += 26;
+    plabel(2, h, kLblX, y3, TR(L"请求日志级别", L"Request log level"));
+    g_pc.reqlog_level = pctl(2, h, L"Edit", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kEdX, y3,
+                             120, 22, L"", kEdReqlogLevel);
+    set_edit(g_pc.reqlog_level, init.reqlog_level);
+    plabel(2, h, kHintX, y3, TR(L"1–10，默认 6；重启生效", L"1–10, default 6; restart to apply"),
+           kHintW);
+    y3 += 26;
+    set_reqlog_row_state();
     g_pc.out3 = pctl(2, h, L"Edit",
                      WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL,
                      12, y3 + 8, 624, kListBottom - y3 - 8, L"", kEdOut3);
@@ -2258,7 +2414,7 @@ PanelResult panel_run() {
                         12, 372, 624, kListBottom - 372, L"", kEdSummary);
 
     // ---- 底部按钮行（恒可见）
-    const int by = 462;
+    const int by = 518;
     add_ctrl(h, L"Button", BS_DEFPUSHBUTTON, 297, by, 110, 30, TR(L"保存", L"Save"), kBtnSave);
     add_ctrl(h, L"Button", BS_PUSHBUTTON, 417, by, 90, 30, TR(L"关闭", L"Close"), kBtnCancel);
     // 语言切换：写 lang 标记并返回 kPanelRelang（按钮文字显示目标语言）

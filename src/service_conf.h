@@ -21,8 +21,8 @@ using Conf = std::map<std::string, std::string>;
 
 // 面板/网页前端管理的 conf 键（也是环境变量覆盖提示的范围）。
 // ROPE_ORIGINAL_CTX 刻意不在其中：不做 UI 行，save_conf 也不改写它。
-// REQLOG/REQLOG_DIR/REQLOG_LEVEL 同理：请求体日志只能手改 service.conf，
-// 面板和网页不显示、/admin/config 也拒绝写入。
+// MAX_IMAGES / VIZ / REQLOG* 同样不在其中：网页 /admin/config 仍拒绝写入，
+// 由设置面板自己管理（settings_panel.inc 直接经 save_conf 的 vals 写盘）。
 inline const char* kManagedKeys[] = {
     "MODEL_FILE", "NGRAM_FILE", "OVERLAY_FILE", "MTP_FILE", "VISION_FILE",
     "GGUF_FILE", "GGUF_MTP_FILE", "GGUF_VISION_FILE",
