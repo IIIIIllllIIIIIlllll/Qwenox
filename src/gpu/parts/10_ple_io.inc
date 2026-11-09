@@ -110,6 +110,12 @@ struct PleUring {
   // irrelevant (distinct destinations). A failed or short row read is copied
   // from the same mapping after its CQE arrives; ring submission errors are
   // fatal because the accepted submission count is then unknown.
+  // In flight (submitted, not reaped) is capped at the SQ depth: each enter
+  // waits for only one completion while the kernel frees SQ slots at once,
+  // so on cold rows the in-flight count grew past the CQ (2x SQ). Overflowed
+  // CQEs need a kernel allocation charged to the engine's memory cgroup;
+  // when that failed the CQEs were dropped and io_uring_enter returned EBADR
+  // (abort on a 60K cold prompt, MarkPC 11-09).
   void run(const uint64_t* addrs, uint8_t* staging, uint64_t table_va,
            size_t n) {
     std::lock_guard<std::mutex> lk(run_mu);
@@ -118,6 +124,8 @@ struct PleUring {
     while (done < n) {
       unsigned shead = __atomic_load_n(sq_head, __ATOMIC_ACQUIRE);
       unsigned fill = 0, space = entries - (ltail - shead);
+      const size_t inflight = sub - done;
+      space = inflight >= entries ? 0 : std::min<size_t>(space, entries - inflight);
       while (sub < n && fill < space) {
         unsigned idx = ltail & *sq_mask;
         io_uring_sqe* s = &sqes[idx];
@@ -134,8 +142,12 @@ struct PleUring {
         fill++;
       }
       if (fill) __atomic_store_n(sq_tail, ltail, __ATOMIC_RELEASE);
-      if ((int)syscall(__NR_io_uring_enter, fd, fill, 1,
-                       IORING_ENTER_GETEVENTS, nullptr, 0) < 0) {
+      // Submit everything still in the SQ, including entries a previous
+      // short submit left behind.
+      const unsigned pending = ltail - __atomic_load_n(sq_head, __ATOMIC_ACQUIRE);
+      if ((int)syscall(__NR_io_uring_enter, fd, pending, 1,
+                       IORING_ENTER_GETEVENTS, nullptr, 0) < 0 &&
+          errno != EINTR) {
         fprintf(stderr, "ple_uring: io_uring_enter failed: %s\n",
                 strerror(errno));
         abort();
