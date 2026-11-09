@@ -354,6 +354,15 @@ struct GpuModel {
   // is unchanged -- only the proposal distribution shifts slightly.
   WView w_dlm{};
   bool dlm_on = false;
+  // QWENOX_DRAFT_VOCAB_FILE（QDV1 子词表文件）：草稿头 lm_head 的紧凑 q4cp
+  // 子表。greedy 草稿专用（采样草稿需要完整分布，不受影响）；verify 不经过，
+  // 提交输出不变，只影响草稿质量 → 速度。与 QWENOX_DRAFT_VOCAB 前缀截断互斥
+  //（子词表优先），且不偏置任何语言（前缀截断把高 id 区的中文 token 排除在
+  // 草稿候选外，中文场景接受率崩溃——见 docs/SPEC-INVESTIGATION-20261109.md）。
+  WView w_dv{};
+  int* d_dv_ids = nullptr;  // 子表下标 -> 全局 token id（设备）
+  std::vector<int> h_dv_ids;
+  int n_dv = 0;
   // Paged QSA KV (memory model Phase A1). The trunk FP32 KV cache (d_kc/d_vc)
   // and indexer keys (d_ik) are addressed through a logical->physical page
   // table (KV_PAGE = 256 tokens = 64 indexer blocks; one table shared by all
@@ -1715,6 +1724,138 @@ struct GpuModel {
   // Draft lm_head override: keep a private device copy of the BASE file's
   // q4cp lm_head when an overlay replaced it with a wider dtype. Drafting
   // reads it instead (~0.5x bytes per draft step); verify and serial decode
+  // host f32 -> f16（RNE；scale 为正且远离次正规区，异常路径截断即可）
+  static uint16_t f32_to_f16_host(float f) {
+    uint32_t x;
+    memcpy(&x, &f, 4);
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    int e = (int)((x >> 23) & 0xff) - 112;  // f16 域内的指数（127-15）
+    uint32_t m = x & 0x7fffffu;
+    if (e <= 0) return (uint16_t)sign;             // 次正规/零：截断
+    if (e >= 31) return (uint16_t)(sign | 0x7c00u);  // 上溢：inf
+    m += 0x1000u + ((m >> 13) & 1u);               // RNE
+    if (m & 0x800000u) { m = 0; e++; }
+    return (uint16_t)(sign | ((uint32_t)e << 10) | (m >> 13));
+  }
+
+  // QWENOX_DRAFT_VOCAB_FILE=<QDV1>：草稿头 lm_head 的子词表重打包。
+  // 文件：u32 magic 0x31564451('QDV1') + u32 n + n 个升序 u32 全局 id。
+  // 启动时把选中行从 ht 的 lm_head 解出（复用 k_ht_deq_bf16 的 tile 内核，
+  // 按 4096 行一块过 GPU），宿主机量化成 q4cp 紧凑表（codebook 取
+  // embed_tokens 的 64B 头），上传为 w_dv。只服务 greedy 草稿 argmax
+  //（采样草稿需要完整分布，host_logits/argmax_out=false 时不启用）；
+  // verify 不经过，提交输出不变——草稿弱一点只掉接受率。
+  void setup_draft_vocab_list() {
+    const char* path = getenv("QWENOX_DRAFT_VOCAB_FILE");
+    if (!path || !*path) return;
+    FILE* f = fopen(path, "rb");
+    if (!f)
+      throw std::runtime_error(std::string("draft vocab: cannot open ") + path);
+    uint32_t magic = 0, n = 0;
+    bool ok = fread(&magic, 4, 1, f) == 1 && magic == 0x31564451u &&
+              fread(&n, 4, 1, f) == 1 && n > 0 && n <= (uint32_t)g_cfg.vocab;
+    if (ok) {
+      h_dv_ids.resize(n);
+      ok = fread(h_dv_ids.data(), 4, n, f) == n;
+    }
+    fclose(f);
+    if (!ok) throw std::runtime_error("draft vocab: bad or truncated QDV1 file");
+    for (size_t i = 0; i < h_dv_ids.size(); i++) {
+      const int v = h_dv_ids[i];
+      if (v < 0 || v >= g_cfg.vocab || (i && v <= h_dv_ids[i - 1]))
+        throw std::runtime_error("draft vocab: ids must be sorted, unique, in range");
+    }
+    const Tensor& lm = ckpt.at("lm_head.weight");
+    if (lm.dtype != 16) {  // 非 ht（v1/GGUF）：暂不支持，静默退回全词表
+      fprintf(stderr, "draft vocab: lm_head dtype %d is not ht; feature off\n",
+              (int)lm.dtype);
+      h_dv_ids.clear();
+      return;
+    }
+    const Tensor& emb = ckpt.at("embed_tokens.weight");  // q4cp codebook 来源
+    if (emb.dtype != 5)
+      throw std::runtime_error("draft vocab: embed_tokens is not q4cp");
+    float cb[16];
+    memcpy(cb, emb.data, 64);
+    float cbmax = 0.f;
+    for (float v : cb) cbmax = std::max(cbmax, fabsf(v));
+    if (cbmax <= 0.f) throw std::runtime_error("draft vocab: empty codebook");
+
+    const WView wlm = wview(lm);
+    const int K = (int)g_cfg.d, ntx = K >> 7;
+    const int rowblk = g_cfg.vocab / 128;
+    const int RB = 32;  // 4096 行/chunk（21 MiB bf16）
+    uint16_t* d_bf = nullptr;
+    CK(hipMalloc(&d_bf, (size_t)RB * 128 * K * 2));  // 一次性 scratch：不用 arena
+                                                     //（arena 内指针不能 hipFree）
+    std::vector<uint16_t> h_bf((size_t)RB * 128 * K);
+    const int gs = K / 32;
+    std::vector<uint8_t> codes((size_t)n * K / 2);
+    std::vector<uint8_t> scales((size_t)n * gs * 2);
+    std::vector<float> wrow(K);
+    size_t out_r = 0, idi = 0;
+    for (int b0 = 0; b0 < rowblk; b0 += RB) {
+      const int nb = std::min(RB, rowblk - b0);
+      if (idi >= h_dv_ids.size() ||
+          (uint64_t)h_dv_ids[idi] >= (uint64_t)(b0 + nb) * 128)
+        continue;  // 本 chunk 无选中行
+      k_ht_deq_bf16<<<nb * ntx, 256, 0, g_str>>>(
+          wlm.data + (size_t)b0 * ntx * 8192, wlm.suh, wlm.svh + (size_t)b0 * 128,
+          d_bf, K);
+      CK(hipMemcpy(h_bf.data(), d_bf, (size_t)nb * 128 * K * 2,
+                   hipMemcpyDeviceToHost));
+      while (idi < h_dv_ids.size() &&
+             (uint64_t)h_dv_ids[idi] < (uint64_t)(b0 + nb) * 128) {
+        const uint16_t* row = h_bf.data() + (size_t)(h_dv_ids[idi] - b0 * 128) * K;
+        for (int c = 0; c < K; c++) wrow[c] = hgn::bf16_to_f32(row[c]);
+        uint8_t* crow = codes.data() + out_r * (K / 2);
+        uint16_t* srow = (uint16_t*)(scales.data() + out_r * gs * 2);
+        for (int g = 0; g < gs; g++) {
+          float mx = 0.f;
+          for (int c = 0; c < 32; c++) mx = std::max(mx, fabsf(wrow[g * 32 + c]));
+          const uint16_t sh = f32_to_f16_host(mx / cbmax);
+          const float scq = f16_to_f32_host(sh);
+          srow[g] = sh;
+          for (int c = 0; c < 32; c++) {
+            const float w = wrow[g * 32 + c];
+            int best = 0;
+            float bd = FLT_MAX;
+            if (scq > 0.f)
+              for (int j = 0; j < 16; j++) {
+                const float dd = fabsf(cb[j] * scq - w);
+                if (dd < bd) { bd = dd; best = j; }
+              }
+            uint8_t& byte = crow[(g * 32 + c) / 2];
+            if (c & 1) byte |= (uint8_t)(best << 4);
+            else byte = (uint8_t)best;
+          }
+        }
+        out_r++;
+        idi++;
+      }
+    }
+    CK(hipFree(d_bf));
+    if (out_r != n) throw std::runtime_error("draft vocab: row count mismatch");
+
+    const size_t total = 64 + codes.size() + scales.size();
+    uint8_t* p = nullptr;
+    DALLOC(&p, total);
+    CK(hipMemcpy(p, cb, 64, hipMemcpyHostToDevice));
+    CK(hipMemcpy(p + 64, codes.data(), codes.size(), hipMemcpyHostToDevice));
+    CK(hipMemcpy(p + 64 + codes.size(), scales.data(), scales.size(),
+                 hipMemcpyHostToDevice));
+    w_dv.dtype = 5;
+    w_dv.data = p;
+    w_dv.rows = n;
+    w_dv.cols = K;
+    w_dv.scale_stride = ((uint64_t)(gs * 2) + 15) & ~15ull;
+    CK(hipMalloc(&d_dv_ids, (size_t)n * 4));
+    CK(hipMemcpy(d_dv_ids, h_dv_ids.data(), (size_t)n * 4, hipMemcpyHostToDevice));
+    n_dv = (int)n;
+    fprintf(stderr, "draft vocab: %d ids (%.1f%% of vocab), q4cp table %.0f MiB\n",
+            n_dv, 100.0 * n / g_cfg.vocab, total / 1048576.0);
+  }
+
   // still use the production lm_head, so committed outputs are unchanged.
   void setup_draft_lmhead(const Tensor* base_lm) {
     if (env_zero("QWENOX_DRAFT_LM_Q4") || !base_lm || base_lm->dtype != 5) return;
@@ -8487,10 +8628,16 @@ struct GpuModel {
     mtp_gr_write("mtp.layers.0.mlp_hyper_connection", d_y);
     mtp_gr_read("mtp.hyper_connection_mixer", d_x);
     WView lm = dlm_on ? w_dlm : wview(ckpt.at("lm_head.weight"));
+    // 子词表草稿头（QDV1 文件）：只算选中行的 logits，argmax 后经 k_dv_map
+    // 映回全局 id。采样路径（host_logits / argmax_out=false）需要完整分布，
+    // 不走子表。
+    const bool dvl = n_dv > 0 && !host_logits && argmax_out;
     const int dvn =
-        (draft_vocab > 0 && !host_logits) ? std::min(draft_vocab, g_cfg.vocab)
-                                          : 0;
-    if (dvn)  // q4cp scales sit behind a codes region sized by lm.rows; nrows
+        (!dvl && draft_vocab > 0 && !host_logits) ? std::min(draft_vocab, g_cfg.vocab)
+                                                  : 0;
+    if (dvl)
+      gemv(w_dv, d_x, d_logits, 0, (uint64_t)n_dv);
+    else if (dvn)  // q4cp scales sit behind a codes region sized by lm.rows; nrows
       gemv(lm, d_x, d_logits, 0, (uint64_t)dvn);  // keeps that base intact
     else
       gemv(lm, d_x, d_logits);
@@ -8501,8 +8648,13 @@ struct GpuModel {
                    hipMemcpyDeviceToHost));
     } else if (argmax_out) {
       int* dst = d_amx_out ? d_amx_out : d_argmax;
-      argmax_rows(d_logits, dvn ? dvn : g_cfg.vocab, 1, d_amx_cand, dst,
-                  g_str);
+      if (dvl) {
+        argmax_rows(d_logits, n_dv, 1, d_amx_cand, dst, g_str);
+        k_dv_map<<<1, 1, 0, g_str>>>(d_dv_ids, dst);  // 子表下标 -> 全局 id
+      } else {
+        argmax_rows(d_logits, dvn ? dvn : g_cfg.vocab, 1, d_amx_cand, dst,
+                    g_str);
+      }
       if (!d_amx_out) CK(hipMemcpy(&id, d_argmax, 4, hipMemcpyDeviceToHost));
     }
     mtp_pos++;

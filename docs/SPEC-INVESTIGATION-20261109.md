@@ -153,3 +153,22 @@ gufo（gufo-org/gufo，MIT）头条 "Flash-Next 最高 116.93 tg / 245.81 聚合
 三方同档，halogen 的真实剩余优势是散文的串行底子（大半为 Linux/Windows 驱动差）。
 另注：gufo 的草稿词表是 "Latin draft vocabulary"——与本引擎 §2 记录的
 DRAFT_VOCAB 中文翻车是同一类偏置。
+
+## 8. 轮成本复测与草稿头子词表（2026-11-09 晚）
+
+**γ 扫描复测**（固定 γ，decode-only，spec_loop）：γ=1/2/4/6/8 → 44.8/51.0/48.8/
+45.5/39.9 tok/s，拟合 T(γ) ≈ 33.5 + 7.9·γ ms，与仓库历史拟合一致。固定成本的主体
+是 verify 前向的权重读取（~28 ms，带宽决定），不是启动开销。推论：**verify 轮
+MoE 换 WMMA 没有收益**——P≤9 的 verify 是带宽受限，且现有 gg 内核在该规模实测
+等效带宽已达 262 GB/s（L2 接住重复专家读）。halogen 的 WMMA 优势在 prefill
+（算力受限区），§6 的"verify 换 WMMA"候选据此作废。
+
+**草稿头子词表（QDV1，本轮落地）**：`QWENOX_DRAFT_VOCAB_FILE` 指定一个
+QDV1 文件（`tools/make_draft_vocab.py` 生成：前缀高频区 32k + 全部 CJK/假名/谚文
+token + 特殊 token，共 98407 ids ≈ 39.6% 词表）。启动时把选中行从 ht 的 lm_head
+经 GPU 反量化（复用 k_ht_deq_bf16 tile 内核）收拢并量化成 q4cp 紧凑表（135 MiB），
+greedy 草稿 argmax 走子表后经新增内核 `k_dv_map` 映回全局 id；采样路径需要完整
+分布，自动绕过。实测（chain 路径，八场景）：加权 61.5 tok/s（基线 60.1/61.4，
+噪声内略升），**中文场景不再受损**（zh-repeat 85.7、zh-code 79.7），修复了
+§2 记录的前缀截断偏置。注意：arena 内指针不能 hipFree（一次性 scratch 用
+hipMalloc/hipFree 成对出现）。

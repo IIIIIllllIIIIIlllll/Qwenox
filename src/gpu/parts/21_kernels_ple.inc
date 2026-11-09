@@ -546,3 +546,8 @@ static void top1_prob_enq(const float* x, int n, float* out_dev,
                           hipStream_t st) {
   k_top1_prob<<<1, 256, 0, st>>>(x, n, out_dev);
 }
+
+// 草稿子词表回映射：子表 argmax 下标 -> 全局 token id（就地，单线程）。
+__global__ void k_dv_map(const int* __restrict__ ids, int* __restrict__ io) {
+  *io = ids[*io];
+}

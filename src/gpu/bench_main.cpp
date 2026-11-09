@@ -407,6 +407,7 @@ static LoadedModel load_model(const ModelPaths& paths, int maxctx) {
   v2_init(checkpoint);  // hgn v2 sidecars / codebook (no-op for v1 and GGUF)
   loaded.model = std::make_unique<GpuModel>(checkpoint, maxctx);
   loaded.model->setup_draft_lmhead(g_lmhead_base_ok ? &g_lmhead_base : nullptr);
+  loaded.model->setup_draft_vocab_list();
   gguf_dense_release(checkpoint);
   loaded.model->ple_on = true;
   loaded.model->build_graphs();
@@ -768,8 +769,10 @@ int main(int argc, char** argv) {
     summary.model_path = paths.base.string();
     summary.maxctx = maxctx;
     printf("\nPrefill benchmark\n");
-    run_prefill(model, config, maxctx, summary);
-    run_increment(model, config, maxctx, summary);
+    if (config_int(config, "BENCH_PREFILL", 1)) {
+      run_prefill(model, config, maxctx, summary);
+      run_increment(model, config, maxctx, summary);
+    }
     const int decode_result = run_decode(model, config, maxctx, summary);
     print_summary(summary);
     if (decode_result != 0) return decode_result;
