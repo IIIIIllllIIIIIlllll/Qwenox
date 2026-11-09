@@ -951,7 +951,7 @@ __global__ void k_index_select(const float* scores, int stride, int* selected,
   constexpr int IdItems = IB / 256;
   using TopSort = rocprim::block_radix_sort<uint64_t, 256, Items>;
   using IdSort = rocprim::block_radix_sort<int, 256, IdItems>;
-  __shared__ union { typename TopSort::storage_type top; IdSort::storage_type ids; } storage;
+  __shared__ union { typename TopSort::storage_type top; typename IdSort::storage_type ids; } storage;
   __shared__ uint64_t best[IB];
   int q = blockIdx.x, t = pos ? *pos : first + q, n = (t + 1) / 4;
   int tid = threadIdx.x;
