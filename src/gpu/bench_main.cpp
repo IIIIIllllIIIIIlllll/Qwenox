@@ -620,13 +620,53 @@ static int run_decode(GpuModel& model, const BenchConfig& config, int maxctx,
       {"common-sense-qa", "Answer this common-sense question in two or three sentences: "
                          "Why should a person dry a wet floor before walking across it?"},
   };
+  // BENCH_CHAIN=1: 走 spec_loop_chain（serve 同款：ngram + MTP + 联合起草），
+  // 并追加一个"复述编辑"场景（答案大段逐字复述 prompt，文本查表的主场）。
+  const bool chain_mode = config_int(config, "BENCH_CHAIN", 0) != 0;
+  const DecodeCase repeat_case = {
+      "repeat-edit",
+      "Here is a Python module:\n\n```python\n"
+      "class RateLimiter:\n"
+      "    def __init__(self, max_calls: int, period_secs: float):\n"
+      "        self.max_calls = max_calls\n"
+      "        self.period_secs = period_secs\n"
+      "        self.calls = []\n\n"
+      "    def allow(self) -> bool:\n"
+      "        now = time.monotonic()\n"
+      "        self.calls = [t for t in self.calls if now - t < self.period_secs]\n"
+      "        if len(self.calls) >= self.max_calls:\n"
+      "            return False\n"
+      "        self.calls.append(now)\n"
+      "        return True\n\n"
+      "    def reset(self):\n"
+      "        self.calls = []\n"
+      "```\n\n"
+      "Output the same module with the method `allow` renamed to `acquire`. "
+      "Keep everything else byte-for-byte identical. Output only the code block."};
+  // 中文对照三场景（chain 模式下与英文场景一起跑）：代码、散文、复述编辑。
+  const DecodeCase zh_cases[] = {
+      {"zh-code", "写一个正确的 Python 函数：解析一个 CSV 文件，校验其中一列"
+                  "是否为整数，并按该列排序后返回所有行。简要说明时间复杂度。"},
+      {"zh-prose", "写一段原创科幻小故事：一位维修工程师在一场突如其来的太阳"
+                   "风暴中抢修一颗气象卫星。文字凝练而生动，两百字左右。"},
+      {"zh-repeat", "下面是一份会议室使用规定：\n\n"
+                    "《会议室使用规定》\n"
+                    "一、会议室使用前须提前一天在行政系统预约，预约成功后方可使用。\n"
+                    "二、会议室使用期间须保持室内整洁，不得在桌面粘贴任何物品。\n"
+                    "三、会议室使用结束后须关闭投影仪、空调与照明设备。\n"
+                    "四、会议室使用结束后须将桌椅归位，并带走全部个人物品。\n"
+                    "五、违反上述规定两次以上的部门，将被暂停预约资格一周。\n\n"
+                    "请把这份规定中所有的“一天”改成“两天”，其余内容逐字不变，"
+                    "完整输出修改后的全文。"},
+  };
   const int repeats = config_int(config, "BENCH_DECODE_REPEATS", 2);
   const int generated = config_int(config, "BENCH_DECODE_TOKENS", 128);
   if (repeats < 1 || generated < 1)
     throw std::runtime_error("BENCH_DECODE_REPEATS and BENCH_DECODE_TOKENS must be positive");
   int gamma = config_int(config, "MTP_GAMMA", 4);
-  if (gamma == 0) gamma = 4;
-  gamma = std::max(1, std::min(8, gamma));
+  if (gamma == 0) gamma = 4;           // 0/未配：稳定的固定基准档
+  else if (gamma > 8) gamma = 0;       // >8：自适应档（GammaCtl；配置解析不收负数）
+  gamma = std::max(0, std::min(8, gamma));
   summary.decode_ran = true;
   summary.decode_gamma = gamma;
   summary.decode_generated = generated;
@@ -635,7 +675,12 @@ static int run_decode(GpuModel& model, const BenchConfig& config, int maxctx,
          generated);
   printf("  %-18s %7s %10s %12s %14s\n", "scenario", "prompt", "decode", "MTP accept", "samples");
   double total_tokens = 0, total_seconds = 0, total_proposed = 0, total_accepted = 0;
-  for (const auto& test : cases) {
+  std::vector<DecodeCase> todo(cases, cases + 3);
+  if (chain_mode) {
+    todo.push_back(repeat_case);
+    for (const auto& c : zh_cases) todo.push_back(c);
+  }
+  for (const auto& test : todo) {
     const std::vector<int> prompt = encode_case(tokenizer, test.prompt);
     if ((int)prompt.size() + generated > maxctx)
       throw std::runtime_error(std::string("decode case exceeds MAX_CONTEXT: ") + test.name);
@@ -646,7 +691,9 @@ static int run_decode(GpuModel& model, const BenchConfig& config, int maxctx,
       const int first = model.prefill_batch(prompt, 0, true, /*quiet=*/true);
       CK(hipDeviceSynchronize());
       const auto start = Clock::now();
-      const std::vector<int> output = model.spec_loop(first, generated, gamma);
+      const std::vector<int> output =
+          chain_mode ? model.spec_loop_chain(first, generated, gamma)
+                     : model.spec_loop(first, generated, gamma);
       CK(hipDeviceSynchronize());
       elapsed += seconds_since(start);
       decoded += output.size();
@@ -667,6 +714,22 @@ static int run_decode(GpuModel& model, const BenchConfig& config, int maxctx,
   summary.decode_accept_avg = total_proposed > 0 ? total_accepted / total_proposed : 0;
   printf("TG average: %.1f tok/s; MTP acceptance average: %.1f%% (weighted)\n",
          summary.decode_avg, summary.decode_accept_avg * 100.0);
+  // BENCH_SERIAL=1: 纯串行 AR 解码（无投机），配合 QWENOX_PERF=1 输出
+  // embed/ple/attn/moe/head 五段 ms/token，用于屋顶分析。
+  if (config_int(config, "BENCH_SERIAL", 0)) {
+    const std::vector<int> prompt = encode_case(tokenizer, cases[0].prompt);
+    model.mtp_tap_capture = false;
+    model.reset_state();
+    int cur = model.prefill_batch(prompt, 0, true, /*quiet=*/true);
+    CK(hipDeviceSynchronize());
+    const auto t0 = Clock::now();
+    for (int i = 0; i < generated; i++) cur = model.forward(cur);
+    CK(hipDeviceSynchronize());
+    const double sec = seconds_since(t0);
+    printf("Serial decode: %.1f tok/s (%d tokens, %.2f s)\n", generated / sec,
+           generated, sec);
+    model.perf_report();
+  }
   return 0;
 }
 

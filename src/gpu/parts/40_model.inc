@@ -9695,6 +9695,45 @@ struct GpuModel {
     }();
     return v;
   }
+  // QWENOX_GREEDY_CONF=θ（greedy MTP 轮；默认 0 = 关，γ 由 GammaCtl/固定值
+  // 决定）：halogen MTP_GATE_P 风格的置信度门控。草稿链在每个 draft 后看
+  // 草稿头自己分布的 top-1 概率，跌破 θ 即在该草稿后收链（该草稿仍被
+  // 验证）。greedy 下逐位接受只取决于前缀，截断尾部 verify 行不改变输出，
+  // 只改变速度。0.90 是 halogen 的默认阈值，从这里起步。
+  static float greedy_conf() {
+    static const float v = [] {
+      const char* e = getenv("QWENOX_GREEDY_CONF");
+      return e ? std::max(0.f, std::min(1.f, (float)atof(e))) : 0.f;
+    }();
+    return v;
+  }
+  // QWENOX_JOINT（默认开；0 = 关）：联合起草。ngram 表在轮首未命中时，
+  // 走 MTP 轮；MTP 草稿链定稿后，用"历史 + cur + 草稿"的扩展历史再查一次
+  // ngram 表，命中则把接续（至多 8-g 个，与 halogen 的 8 个 verify 行一致）
+  // 接在链尾，同一轮 verify。头草稿必须开链、接续只接链尾（halogen PLD
+  // 语义）；greedy 逐位接受只取决于前缀，输出与串行逐字节一致。
+  static bool joint_on() {
+    static const bool on = [] {
+      const char* e = getenv("QWENOX_JOINT");
+      return !(e && e[0] == '0');
+    }();
+    return on;
+  }
+  // 每个 draft 步的 top-1 概率（stream 内序，至多 8 步）。静态 32 字节。
+  static float* conf_arr() {
+    static float* d_arr = nullptr;
+    if (!d_arr) CK(hipMalloc(&d_arr, 8 * sizeof(float)));
+    return d_arr;
+  }
+  // 读回逐步置信度，在第一个低于 θ 的草稿后收链（它仍被验证，返回 j+1）。
+  // 全程 ≥ θ 则返回原 g。gd = 本轮实际草稿步数（≥1）。
+  int conf_truncate(int g, int gd, float th, const float* d_arr) {
+    float ph[8];
+    CK(hipMemcpy(ph, d_arr, (size_t)gd * sizeof(float), hipMemcpyDeviceToHost));
+    for (int j = 0; j < gd - 1 && j < g - 1; j++)
+      if (ph[j] < th) return j + 1;
+    return g;
+  }
   // True when drafting should stop after step j (of g planned). sparse = the
   // prepared sparse probabilities, else dense = prepared full-vocab probs.
   static bool spec_conf_stop(int j, int g, const std::vector<float>* sparse,
@@ -10049,20 +10088,36 @@ struct GpuModel {
       if (!dr_done) {
       // draft 1 used the committed (h_q, cur): its indexer ring rows are
       // truth. Later drafts pollute the ring; save/restore around them.
+      // 置信度门控：每步草稿后把草稿分布的 top-1 概率流式写入 conf_arr，
+      // 草稿突发结束后一次读回收链（只截 verify 行数，输出逐位不变）。
+      const float gth = greedy_conf();
+      float* d_conf = gth > 0.f ? conf_arr() : nullptr;
+      const int dvn_conf = draft_vocab > 0
+                               ? std::min(draft_vocab, g_cfg.vocab)
+                               : g_cfg.vocab;
       if (draft_desync) {
         mtp_step(d_R, cur, nullptr, true, nullptr, d_argmax_arr);
+        if (d_conf) top1_prob_enq(d_logits, dvn_conf, d_conf, g_str);
         CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4, hipMemcpyDeviceToDevice,
                           g_str));
-        for (int j = 1; j < gd; j++)
+        for (int j = 1; j < gd; j++) {
           mtp_step(d_mR, 0, nullptr, true, d_argmax_arr + j - 1,
                    d_argmax_arr + j);
+          if (d_conf) top1_prob_enq(d_logits, dvn_conf, d_conf + j, g_str);
+        }
         CK(hipMemcpy(drafts.data(), d_argmax_arr, (size_t)gd * sizeof(int),
                      hipMemcpyDeviceToHost));
+        if (d_conf) g = conf_truncate(g, gd, gth, d_conf);
       } else {
         drafts[0] = mtp_step(d_R, cur);
+        if (d_conf) top1_prob_enq(d_logits, dvn_conf, d_conf, g_str);
         CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4, hipMemcpyDeviceToDevice,
                           g_str));
-        for (int j = 1; j < gd; j++) drafts[j] = mtp_step(d_mR, drafts[j - 1]);
+        for (int j = 1; j < gd; j++) {
+          drafts[j] = mtp_step(d_mR, drafts[j - 1]);
+          if (d_conf) top1_prob_enq(d_logits, dvn_conf, d_conf + j, g_str);
+        }
+        if (d_conf) g = conf_truncate(g, gd, gth, d_conf);
       }
       }
       auto t1 = std::chrono::steady_clock::now();
@@ -10510,21 +10565,51 @@ struct GpuModel {
             dr_on && dr_pool_fn(*this, DrSeg{bound_, gd, cur, drafts.data()});
         if (!dr_done) {
         // draft 1's indexer ring rows are truth; later drafts pollute them.
+        // 置信度门控：同 spec_loop，逐步写 top-1 概率，突发结束一次读回。
+        const float gth = greedy_conf();
+        float* d_conf = gth > 0.f ? conf_arr() : nullptr;
+        const int dvn_conf = draft_vocab > 0
+                                 ? std::min(draft_vocab, g_cfg.vocab)
+                                 : g_cfg.vocab;
         if (draft_desync) {
           mtp_step(d_R, cur, nullptr, true, nullptr, d_argmax_arr);
+          if (d_conf) top1_prob_enq(d_logits, dvn_conf, d_conf, g_str);
           CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4,
                             hipMemcpyDeviceToDevice, g_str));
-          for (int j = 1; j < gd; j++)
+          for (int j = 1; j < gd; j++) {
             mtp_step(d_mR, 0, nullptr, true, d_argmax_arr + j - 1,
                      d_argmax_arr + j);
+            if (d_conf) top1_prob_enq(d_logits, dvn_conf, d_conf + j, g_str);
+          }
           CK(hipMemcpy(drafts.data(), d_argmax_arr, (size_t)gd * sizeof(int),
                        hipMemcpyDeviceToHost));
+          if (d_conf) g = conf_truncate(g, gd, gth, d_conf);
         } else {
           drafts[0] = mtp_step(d_R, cur);
+          if (d_conf) top1_prob_enq(d_logits, dvn_conf, d_conf, g_str);
           CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4,
                             hipMemcpyDeviceToDevice, g_str));
-          for (int j = 1; j < gd; j++) drafts[j] = mtp_step(d_mR, drafts[j - 1]);
+          for (int j = 1; j < gd; j++) {
+            drafts[j] = mtp_step(d_mR, drafts[j - 1]);
+            if (d_conf) top1_prob_enq(d_logits, dvn_conf, d_conf + j, g_str);
+          }
+          if (d_conf) g = conf_truncate(g, gd, gth, d_conf);
         }
+        }
+        // 联合起草（QWENOX_JOINT）：MTP 链定稿后按扩展历史（chist + cur +
+        // 已草稿）再查一次 ngram 表，命中的接续接在链尾，同一轮 verify。
+        // 轮首表未命中不代表扩展后也不命中（草稿把窗口推回重复区）。总链长
+        // 仍封顶 8（kVSnapRows 9 行不变），输出与串行逐字节一致。
+        if (joint_on() && g >= 1 && g < 8 && ng_open && want > g) {
+          std::vector<int64_t> ext(chist.begin(), chist.end());
+          ext.push_back(cur);
+          for (int j = 0; j + 1 < g; j++) ext.push_back(drafts[j]);
+          std::vector<int> cont =
+              ngram.draft(ext, drafts[g - 1], std::min(8 - g, want - g));
+          for (int t : cont) {
+            if (g >= 8) break;
+            drafts[g++] = t;
+          }
         }
         std::vector<int> vt;
         vt.reserve(g + 1);
