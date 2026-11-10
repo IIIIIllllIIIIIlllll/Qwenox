@@ -733,6 +733,7 @@ struct GenOutcome {
     double decode_ms = 0.0;
     double ttft_ms = 0.0;
     int n_cached = 0, rounds = 0, commit = 0, proposed = 0;
+    int ng_rounds = 0, ng_proposed = 0, ng_accepted = 0;  // n-gram share
     int served_max_tokens = 0;
     int clamped_from = 0;
     std::vector<float> logprobs;
@@ -924,6 +925,9 @@ GenOutcome run_generation(GenSpec& spec,
     out.rounds = r.rounds;
     out.commit = r.commit;
     out.proposed = r.proposed;
+    out.ng_rounds = r.ng_rounds;
+    out.ng_proposed = r.ng_proposed;
+    out.ng_accepted = r.ng_accepted;
     out.logprobs = std::move(r.logprobs);
     out.tokens = std::move(r.tokens);
 
@@ -948,10 +952,20 @@ GenOutcome run_generation(GenSpec& spec,
             req_id, out.reason.c_str(), out.n_prompt, out.n_gen, out.ttft_ms,
             out.prefill_ms, out.decode_ms, out.n_cached,
             out.hit_stop ? " (stop)" : (out.client_gone ? " (client gone)" : ""));
-    if (out.rounds > 0)
-        fprintf(stderr, "REQ %lld mtp rounds=%d commit=%d proposed=%d acc=%.1f%%\n", req_id,
-                out.rounds, out.commit, out.proposed,
-                out.proposed ? 100.0 * (out.commit - out.rounds) / out.proposed : 0.0);
+    if (out.rounds > 0) {
+        // all = every drafter; mtp = the draft head alone (n-gram rounds out)
+        const int acc = std::max(0, out.commit - out.rounds);
+        const int mtp_p = out.proposed - out.ng_proposed;
+        const int mtp_a = std::max(0, acc - out.ng_accepted);
+        fprintf(stderr,
+                "REQ %lld spec rounds=%d commit=%d proposed=%d acc=%.1f%% | mtp %.1f%% "
+                "(%d/%d) | ngram %.1f%% (%d/%d, %d rounds)\n",
+                req_id, out.rounds, out.commit, out.proposed,
+                out.proposed ? 100.0 * acc / out.proposed : 0.0,
+                mtp_p > 0 ? 100.0 * mtp_a / mtp_p : 0.0, mtp_a, mtp_p,
+                out.ng_proposed ? 100.0 * out.ng_accepted / out.ng_proposed : 0.0,
+                out.ng_accepted, out.ng_proposed, out.ng_rounds);
+    }
     {
         auto us = [](double ms) -> uint32_t {
             double v = ms * 1000.0;
@@ -968,6 +982,9 @@ GenOutcome run_generation(GenSpec& spec,
         e.proposed = (uint32_t)out.proposed;
         e.commit = (uint32_t)out.commit;
         e.rounds = (uint32_t)out.rounds;
+        e.ng_rounds = (uint32_t)std::max(0, out.ng_rounds);
+        e.ng_proposed = (uint32_t)std::max(0, out.ng_proposed);
+        e.ng_accepted = (uint32_t)std::max(0, out.ng_accepted);
         e.prefill_us = us(out.prefill_ms);
         e.decode_us = us(out.decode_ms);
         e.ttft_us = us(out.ttft_ms);
@@ -2255,6 +2272,36 @@ const char* drafter_name(uint32_t d) {
     }
 }
 
+// Draft head (MTP) vs n-gram (prompt lookup) share of one record's drafts.
+// Version 2 records carry the n-gram counts; for older records only a pure
+// MTP request (all head) or a pure n-gram request (all lookup) is known.
+struct DraftSplit {
+    bool known = false;
+    uint32_t mtp_proposed = 0, mtp_accepted = 0;
+    uint32_t ng_rounds = 0, ng_proposed = 0, ng_accepted = 0;
+};
+DraftSplit draft_split(const reqstat::QEntry& e) {
+    DraftSplit d;
+    const uint32_t acc = e.commit >= e.rounds ? e.commit - e.rounds : 0;
+    const uint32_t drafter = (e.flags >> 4) & 0xF;  // 1 mtp, 3 ngram, 4 chain
+    if (e.split) {
+        d.known = true;
+        d.ng_rounds = e.ng_rounds;
+        d.ng_proposed = std::min(e.ng_proposed, e.proposed);
+        d.ng_accepted = std::min(e.ng_accepted, acc);
+    } else if (drafter == 1) {
+        d.known = true;
+    } else if (drafter == 3) {
+        d.known = true;
+        d.ng_rounds = e.rounds;
+        d.ng_proposed = e.proposed;
+        d.ng_accepted = acc;
+    }
+    d.mtp_proposed = e.proposed - d.ng_proposed;
+    d.mtp_accepted = acc - d.ng_accepted;
+    return d;
+}
+
 void handle_reqstat_summary(const http::Request& q, http::Response* r,
                             http::Stream*) {
     const auto qp = parse_query(q.query);
@@ -2273,6 +2320,9 @@ void handle_reqstat_summary(const http::Request& q, http::Response* r,
     std::map<std::string, uint64_t> finish;
     struct DStat {
         uint64_t requests = 0, accepted = 0, proposed = 0, gen = 0;
+        // draft head / n-gram apart, over requests whose split is known
+        uint64_t split_requests = 0, mtp_accepted = 0, mtp_proposed = 0;
+        uint64_t ng_rounds = 0, ng_accepted = 0, ng_proposed = 0;
         double decode_s = 0;
     };
     std::map<std::string, DStat> drafters;
@@ -2296,9 +2346,18 @@ void handle_reqstat_summary(const http::Request& q, http::Response* r,
                 s.gen += e.n_gen;
                 s.decode_s += e.decode_us / 1e6;
                 if (e.proposed > 0) {
+                    const uint32_t acc = e.commit >= e.rounds ? e.commit - e.rounds : 0;
                     s.proposed += e.proposed;
-                    s.accepted +=
-                        e.commit >= e.rounds ? e.commit - e.rounds : 0;
+                    s.accepted += acc;
+                    const DraftSplit d = draft_split(e);
+                    if (d.known) {
+                        s.split_requests++;
+                        s.mtp_proposed += d.mtp_proposed;
+                        s.mtp_accepted += d.mtp_accepted;
+                        s.ng_rounds += d.ng_rounds;
+                        s.ng_proposed += d.ng_proposed;
+                        s.ng_accepted += d.ng_accepted;
+                    }
                 }
                 return true;
             },
@@ -2340,6 +2399,18 @@ void handle_reqstat_summary(const http::Request& q, http::Response* r,
                     {"acceptance",
                      s.proposed ? json(s.accepted * 1.0 / s.proposed)
                                 : json(nullptr)},
+                    {"split_requests", s.split_requests},
+                    {"mtp_accepted", s.mtp_accepted},
+                    {"mtp_proposed", s.mtp_proposed},
+                    {"mtp_acceptance",
+                     s.mtp_proposed ? json(s.mtp_accepted * 1.0 / s.mtp_proposed)
+                                    : json(nullptr)},
+                    {"ngram_rounds", s.ng_rounds},
+                    {"ngram_accepted", s.ng_accepted},
+                    {"ngram_proposed", s.ng_proposed},
+                    {"ngram_acceptance",
+                     s.ng_proposed ? json(s.ng_accepted * 1.0 / s.ng_proposed)
+                                   : json(nullptr)},
                     {"decode_tok_per_s",
                      s.decode_s > 0 ? json(s.gen / s.decode_s)
                                     : json(nullptr)}};
@@ -2573,11 +2644,20 @@ json reqstat_record_json(const reqstat::QEntry& e) {
     o["proposed"] = e.proposed;
     o["commit"] = e.commit;
     o["rounds"] = e.rounds;
-    o["acceptance"] =
-        e.proposed
-            ? json((e.commit >= e.rounds ? e.commit - e.rounds : 0) * 1.0 /
-                   e.proposed)
-            : json(nullptr);
+    const uint32_t acc = e.commit >= e.rounds ? e.commit - e.rounds : 0;
+    o["acceptance"] = e.proposed ? json(acc * 1.0 / e.proposed) : json(nullptr);
+    // Draft head vs n-gram apart (null when an old record cannot tell).
+    const DraftSplit d = draft_split(e);
+    const auto opt = [&](uint32_t v) { return d.known ? json(v) : json(nullptr); };
+    o["mtp_proposed"] = opt(d.mtp_proposed);
+    o["mtp_accepted"] = opt(d.mtp_accepted);
+    o["mtp_acceptance"] =
+        d.known && d.mtp_proposed ? json(d.mtp_accepted * 1.0 / d.mtp_proposed) : json(nullptr);
+    o["ngram_rounds"] = opt(d.ng_rounds);
+    o["ngram_proposed"] = opt(d.ng_proposed);
+    o["ngram_accepted"] = opt(d.ng_accepted);
+    o["ngram_acceptance"] =
+        d.known && d.ng_proposed ? json(d.ng_accepted * 1.0 / d.ng_proposed) : json(nullptr);
     return o;
 }
 
@@ -3228,6 +3308,9 @@ GenOutcome run_generation_guarded(GenSpec& spec, const ThinkGuardCtx& g,
         out.rounds += rest.rounds;
         out.commit += rest.commit;
         out.proposed += rest.proposed;
+        out.ng_rounds += rest.ng_rounds;
+        out.ng_proposed += rest.ng_proposed;
+        out.ng_accepted += rest.ng_accepted;
         out.logprobs.insert(out.logprobs.end(), rest.logprobs.begin(), rest.logprobs.end());
         out.reason = rest.reason;
         out.hit_stop = rest.hit_stop;

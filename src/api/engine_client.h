@@ -66,6 +66,11 @@ struct GenResult {
     int commit = 0;
     int n_cached = 0;
     int proposed = 0;
+    // n-gram (prompt lookup) share of rounds / proposed / accepted drafts;
+    // 0 from an engine that predates the split (11-10).
+    int ng_rounds = 0;
+    int ng_proposed = 0;
+    int ng_accepted = 0;
 };
 
 // Called for every T line until cancellation. Return false to send `X <req>`

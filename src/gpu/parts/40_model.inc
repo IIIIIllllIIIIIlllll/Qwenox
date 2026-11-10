@@ -861,6 +861,11 @@ struct GpuModel {
   int last_spec_commit = 0;
   int last_spec_rollbacks = 0;
   int last_spec_proposed = 0;  // sum of drafts offered (D line trailing field)
+  // The n-gram (prompt lookup) rounds' share of the counters above, so the
+  // draft head's own acceptance can be reported apart (D line, 11-10).
+  int last_ng_rounds = 0;
+  int last_ng_proposed = 0;
+  int last_ng_accepted = 0;  // drafts committed by n-gram rounds
   // Live progress reporting (2026-09-13): 1s-cadence prefill/decode stats on
   // stderr. Prefill is armed by serve around the prompt ingest only (never
   // for spec-verify batches) and uses NON-BLOCKING event probes — no stream
@@ -969,7 +974,8 @@ struct GpuModel {
   X(cut_abs) X(cut_r_) X(cut_hit) X(cut_mtp_hit) X(d_mR)                      \
   X(prog_total) X(prog_base) X(prog_last_est) X(prog_req) X(prog_t0) X(pf_end) \
   X(prog_last) X(last_spec_rounds) X(last_spec_commit) X(last_spec_rollbacks) \
-  X(last_spec_proposed) X(live_spec_rounds) X(live_spec_commits)              \
+  X(last_spec_proposed) X(last_ng_rounds) X(last_ng_proposed)                \
+  X(last_ng_accepted) X(live_spec_rounds) X(live_spec_commits)                \
   X(live_spec_proposed) X(g1_exec) X(g2_exec)                                 \
   X(d_S) X(d_convst) X(d_ring) X(d_iraw) X(d_R) X(d_pos) X(d_ringpos)         \
   X(d_miraw) X(d_mpos) X(d_ckpt) X(d_mring_ckpt)
@@ -9684,6 +9690,7 @@ struct GpuModel {
   std::vector<int> spec_loop_ngram(int cur, int gen, int gamma,
       const std::function<bool(int)>& emit = nullptr) {
     last_spec_rounds = last_spec_commit = last_spec_rollbacks = last_spec_proposed = 0;
+    last_ng_rounds = last_ng_proposed = last_ng_accepted = 0;
     live_spec_rounds = live_spec_commits = live_spec_proposed = 0;
     std::vector<int> out;
     out.reserve(std::max(0, gen));
@@ -9766,6 +9773,9 @@ struct GpuModel {
       accepted += keep;
       ++last_spec_rounds;
       last_spec_proposed += draft.size();
+      ++last_ng_rounds;
+      last_ng_proposed += (int)draft.size();
+      last_ng_accepted += keep;
       live_spec_rounds = last_spec_rounds;
       live_spec_commits = accepted + last_spec_rounds;
       live_spec_proposed = last_spec_proposed;
@@ -10214,6 +10224,7 @@ struct GpuModel {
   std::vector<int> spec_loop(int cur, int gen, int gamma,
                              const std::function<bool(int)>& emit = nullptr) {
     last_spec_rounds = last_spec_commit = last_spec_rollbacks = 0;
+    last_ng_rounds = last_ng_proposed = last_ng_accepted = 0;
     live_spec_rounds = live_spec_commits = live_spec_proposed = 0;
     std::vector<int> out;
     out.reserve(gen + 1);
@@ -10463,6 +10474,7 @@ struct GpuModel {
       const std::function<bool(int)>& emit = nullptr) {
     last_spec_rounds = last_spec_commit = last_spec_rollbacks =
         last_spec_proposed = 0;
+    last_ng_rounds = last_ng_proposed = last_ng_accepted = 0;
     live_spec_rounds = live_spec_commits = live_spec_proposed = 0;
     std::vector<int> out;
     out.reserve(std::max(0, gen));
@@ -10597,6 +10609,9 @@ struct GpuModel {
         ++ng_rounds;
         ng_gate.update(keep, (int)draft.size());
         last_spec_proposed += (int)draft.size();
+        ++last_ng_rounds;
+        last_ng_proposed += (int)draft.size();
+        last_ng_accepted += keep;
         // Patch the MTP KV over committed positions base-1..base+keep-1: tap
         // row 0 = stashed h_{base-1} paired with cur; rows 1..keep = d_Rb
         // rows 0..keep-1 (the committed tokens' trunk streams — the replay
@@ -10705,6 +10720,9 @@ struct GpuModel {
         ++ng_rounds;
         ng_gate.update(keep_round, (int)draft.size());
         last_spec_proposed += (int)draft.size();
+        ++last_ng_rounds;
+        last_ng_proposed += (int)draft.size();
+        last_ng_accepted += keep_round;
         if (!ng_cs_fixed) {
           if (round_full && (int)draft.size() > ng_cs)
             ng_cs = std::min(64, ng_cs * 2);
@@ -10923,6 +10941,7 @@ struct GpuModel {
       int cur, int gen, int gamma, Sampler& sampler,
       const std::function<bool(int, float)>& emit = nullptr) {
     last_spec_rounds = last_spec_commit = last_spec_rollbacks = 0;
+    last_ng_rounds = last_ng_proposed = last_ng_accepted = 0;
     live_spec_rounds = live_spec_commits = live_spec_proposed = 0;
     std::vector<int> out;
     out.reserve(gen + 1);
@@ -11203,6 +11222,7 @@ struct GpuModel {
       const std::function<bool(int, float)>& emit = nullptr, bool seeded = false) {
     last_spec_rounds = last_spec_commit = last_spec_rollbacks =
         last_spec_proposed = 0;
+    last_ng_rounds = last_ng_proposed = last_ng_accepted = 0;
     live_spec_rounds = live_spec_commits = live_spec_proposed = 0;
     std::vector<int> out;
     out.reserve(std::max(0, gen));
@@ -11409,6 +11429,9 @@ struct GpuModel {
         ng_prop += (int)draft.size();
         ng_gate.update(keep, (int)draft.size());
         last_spec_proposed += (int)draft.size();
+        ++last_ng_rounds;
+        last_ng_proposed += (int)draft.size();
+        last_ng_accepted += keep;
         if (mtp_ok) {
           // Patch the MTP KV over committed positions (as spec_loop_chain):
           // tap row 0 = stashed h_{base-1} paired with cur; rows 1..keep the
@@ -11552,6 +11575,9 @@ struct GpuModel {
         ng_prop += (int)draft.size();
         ng_gate.update(keep_round, (int)draft.size());
         last_spec_proposed += (int)draft.size();
+        ++last_ng_rounds;
+        last_ng_proposed += (int)draft.size();
+        last_ng_accepted += keep_round;
         if (!ng_cs_fixed) {
           if (round_full && (int)draft.size() > ng_cs)
             ng_cs = std::min(64, ng_cs * 2);

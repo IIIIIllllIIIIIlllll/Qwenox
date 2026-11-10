@@ -3786,6 +3786,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       }
     }
     m.last_spec_rounds = m.last_spec_commit = m.last_spec_rollbacks = 0;
+    m.last_ng_rounds = m.last_ng_proposed = m.last_ng_accepted = 0;
     // Prompt ingest. A failure here (or a KvOverflow anywhere below) lands
     // in the catch at the end: the slot is reset, the client gets D error.
     if (use_spec || chain_mtp) {
@@ -4010,6 +4011,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     int pause_tok = -1;
     float pause_lp = 0.0f;
     int spec_r = 0, spec_c = 0, spec_p = 0;
+    int ng_r = 0, ng_p = 0, ng_a = 0;  // n-gram share, summed like spec_*
     // The one pause checkpoint per turn that also goes to the SSD tier (from
     // its RAM copy, at the end of the turn: kvsnap::capture_ram), so a
     // re-rendered reply still resumes inside it after a restart or RAM
@@ -4095,12 +4097,18 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
           spec_r += m.last_spec_rounds;
           spec_c += m.last_spec_commit;
           spec_p += m.last_spec_proposed;
+          ng_r += m.last_ng_rounds;
+          ng_p += m.last_ng_proposed;
+          ng_a += m.last_ng_accepted;
           if (pause_tok < 0 || dead || cancel || reason == "done") break;
           if (!ckpt_pause(chain)) break;
         }
         m.last_spec_rounds = spec_r;
         m.last_spec_commit = spec_c;
         m.last_spec_proposed = spec_p;
+        m.last_ng_rounds = ng_r;
+        m.last_ng_proposed = ng_p;
+        m.last_ng_accepted = ng_a;
       }
       hist.assign(m.chist.begin(), m.chist.end());
     } else if (use_df2) {
@@ -4253,13 +4261,15 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     else if ((use_spec || use_ngram || use_chain || use_df2) &&
              m.last_spec_rounds > 0)
       snprintf(db, sizeof db,
-               "D %lld %s %zu %d %.1f %.1f %d %d %d %d %d\n",
+               "D %lld %s %zu %d %.1f %.1f %d %d %d %d %d %d %d %d\n",
                (long long)g.req, reason.c_str(), g.ids.size(), ngen, pre_ms,
                ngen > 1 ? dec_ms : 0.0,
                use_chain ? (chain_mtp ? 4 : 3)
                          : (use_ngram ? 3 : (use_df2 ? 2 : 1)),
                m.last_spec_rounds,
-               m.last_spec_commit, n_cached, m.last_spec_proposed);
+               m.last_spec_commit, n_cached, m.last_spec_proposed,
+               // n-gram share of rounds / proposed / accepted (11-10)
+               m.last_ng_rounds, m.last_ng_proposed, m.last_ng_accepted);
     else
       // trailing "0 0 0 <n_cached> 0": drafter/rounds/commit placeholders
       // so n_cached lands in the protocol's cache column (parts[10]);
@@ -4295,6 +4305,17 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       crashdiag::note("req %lld done gen=%d (%s)", (long long)g.req, ngen,
                       cancel ? "cancel" : reason.c_str());
       if ((use_spec || use_ngram || use_chain) && m.last_spec_rounds > 0) {
+        // Request totals (summed across ckpt pauses): the draft head's own
+        // rate and the n-gram leg's, reported apart (11-10).
+        const int all_acc = std::max(0, m.last_spec_commit - m.last_spec_rounds);
+        const int mtp_p = m.last_spec_proposed - m.last_ng_proposed;
+        const int mtp_a = std::max(0, all_acc - m.last_ng_accepted);
+        fprintf(stderr,
+                "%s req %lld | draft split: mtp %.3f (%d/%d) | ngram %.3f (%d/%d, %d "
+                "rounds)\n",
+                log_ts(), (long long)g.req, mtp_p > 0 ? (double)mtp_a / mtp_p : 0.0, mtp_a,
+                mtp_p, m.last_ng_proposed > 0 ? (double)m.last_ng_accepted / m.last_ng_proposed : 0.0,
+                m.last_ng_accepted, m.last_ng_proposed, m.last_ng_rounds);
         int acc_n = m.live_spec_commits - m.live_spec_rounds;
         fprintf(stderr,
                 "%s req %lld | draft acceptance = %.3f (%d accepted / %d "

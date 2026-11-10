@@ -12,9 +12,10 @@ namespace {
 // On-disk constants — keep in sync with reqstat.cpp (the Python reader
 // tools/reqstat_dump.py carries the same copies).
 constexpr uint32_t kMagic = 0x47525153;  // "GRQS"
-constexpr uint16_t kVersion = 1;
 constexpr uint16_t kHeaderSize = 256;
-constexpr uint32_t kRecordSize = 64;
+// Record size per version (1: 64 B, crc over 56; 2: 80 B, crc over 72).
+constexpr uint32_t kRecordSizeV1 = 64, kRecordSizeV2 = 80;
+constexpr uint32_t kRecordSizeMax = kRecordSizeV2;
 
 uint16_t get16(const uint8_t* p) {
   uint16_t v;
@@ -52,36 +53,51 @@ bool seek64(FILE* f, uint64_t off) {
 struct ChainFile {
   std::string path;
   uint32_t seq = 0;
+  uint32_t recsz = kRecordSizeV2;  // from the header: 64 (v1) or 80 (v2)
   bool live = false;  // reqstat.bin (the file the writer appends to)
 };
 
-bool read_header(const std::string& path, uint32_t* seq) {
+bool read_header(const std::string& path, uint32_t* seq, uint32_t* recsz) {
   FILE* f = fopen(path.c_str(), "rb");
   if (!f) return false;
   uint8_t h[kHeaderSize];
-  const bool ok = fread(h, 1, sizeof h, f) == sizeof h &&
-                  get32(h + 0) == kMagic && get16(h + 4) == kVersion &&
-                  get16(h + 6) == kHeaderSize && get32(h + 8) == kRecordSize;
-  if (ok) *seq = get32(h + 12);
+  bool ok = fread(h, 1, sizeof h, f) == sizeof h && get32(h + 0) == kMagic &&
+            get16(h + 6) == kHeaderSize;
+  if (ok) {
+    const uint16_t ver = get16(h + 4);
+    const uint32_t rs = get32(h + 8);
+    ok = (ver == 1 && rs == kRecordSizeV1) || (ver == 2 && rs == kRecordSizeV2);
+    if (ok) {
+      *seq = get32(h + 12);
+      *recsz = rs;
+    }
+  }
   fclose(f);
   return ok;
 }
 
-uint64_t record_count(uint64_t file_size) {
-  return file_size < kHeaderSize ? 0 : (file_size - kHeaderSize) / kRecordSize;
+uint64_t record_count(uint64_t file_size, uint32_t recsz) {
+  return file_size < kHeaderSize ? 0 : (file_size - kHeaderSize) / recsz;
 }
 
 // ts_ms of the record at position index, false when it cannot be read.
-bool record_ts(FILE* f, uint64_t index, uint64_t* ts) {
+bool record_ts(FILE* f, uint64_t index, uint32_t recsz, uint64_t* ts) {
   uint8_t r[8];
-  if (!seek64(f, (uint64_t)kHeaderSize + index * kRecordSize)) return false;
+  if (!seek64(f, (uint64_t)kHeaderSize + index * recsz)) return false;
   if (fread(r, 1, sizeof r, f) != sizeof r) return false;
   *ts = get64(r);
   return true;
 }
 
-bool unpack(const uint8_t* r, QEntry* e) {
-  if (crc16(r, 56) != get16(r + 56)) return false;
+bool unpack(const uint8_t* r, uint32_t recsz, QEntry* e) {
+  const size_t crc_at = recsz == kRecordSizeV1 ? 56 : 72;
+  if (crc16(r, crc_at) != get16(r + crc_at)) return false;
+  e->split = recsz != kRecordSizeV1;
+  if (e->split) {
+    e->ng_rounds = get32(r + 56);
+    e->ng_proposed = get32(r + 60);
+    e->ng_accepted = get32(r + 64);
+  }
   e->ts_ms = get64(r + 0);
   e->req_seq = get64(r + 8);
   e->n_prompt = get32(r + 16);
@@ -120,7 +136,7 @@ std::vector<ChainFile> chain_files(const std::string& dir, ScanInfo* info,
     ChainFile cf;
     cf.path = de.path().string();
     cf.live = live;
-    if (!read_header(cf.path, &cf.seq)) continue;  // foreign or corrupt
+    if (!read_header(cf.path, &cf.seq, &cf.recsz)) continue;  // foreign or corrupt
     files.push_back(cf);
   }
   if (ec) *enum_ok = false;
@@ -136,12 +152,12 @@ std::vector<ChainFile> chain_files(const std::string& dir, ScanInfo* info,
 // stamps before taking its append lock), so callers retreat a margin and let
 // the linear pass do the final filtering — same trade-off as
 // tools/reqstat_dump.py.
-uint64_t lower_bound_ts(FILE* f, uint64_t count, uint64_t t0) {
+uint64_t lower_bound_ts(FILE* f, uint64_t count, uint32_t recsz, uint64_t t0) {
   uint64_t lo = 0, hi = count;
   while (lo < hi) {
     const uint64_t mid = lo + (hi - lo) / 2;
     uint64_t ts = 0;
-    if (!record_ts(f, mid, &ts)) {
+    if (!record_ts(f, mid, recsz, &ts)) {
       lo = mid + 1;
       continue;
     }
@@ -155,24 +171,24 @@ uint64_t lower_bound_ts(FILE* f, uint64_t count, uint64_t t0) {
 
 // Stream records [index, index+count) of one file (pass count ~0ULL for
 // "to EOF"); entries outside [t0, t1] are filtered, cb false stops early.
-void read_records(const std::string& path, uint64_t index, uint64_t count,
+void read_records(const std::string& path, uint32_t recsz, uint64_t index, uint64_t count,
                   uint64_t t0, uint64_t t1,
                   const std::function<bool(const QEntry&)>& cb,
                   ScanInfo* info) {
   FILE* f = fopen(path.c_str(), "rb");
   if (!f) return;
-  if (!seek64(f, (uint64_t)kHeaderSize + index * kRecordSize)) {
+  if (!seek64(f, (uint64_t)kHeaderSize + index * recsz)) {
     fclose(f);
     return;
   }
-  uint8_t buf[1024 * kRecordSize];
+  static thread_local uint8_t buf[1024 * kRecordSizeMax];
   uint32_t ahead = 0;  // consecutive records past t1; tolerated disorder
   while (count > 0) {
     const size_t want = (size_t)std::min<uint64_t>(count, 1024);
-    const size_t got = fread(buf, kRecordSize, want, f);
+    const size_t got = fread(buf, recsz, want, f);
     for (size_t i = 0; i < got; i++) {
       QEntry e;
-      if (!unpack(buf + i * kRecordSize, &e)) {
+      if (!unpack(buf + i * recsz, recsz, &e)) {
         if (info) info->bad_crc++;
         continue;
       }
@@ -216,21 +232,23 @@ bool scan(uint64_t t0, uint64_t t1,
   }
   for (const auto& cf : files) {
     std::error_code ec;
-    const uint64_t count = record_count(std::filesystem::file_size(cf.path, ec));
+    const uint64_t count =
+        record_count(std::filesystem::file_size(cf.path, ec), cf.recsz);
     if (ec || count == 0) continue;
     FILE* f = fopen(cf.path.c_str(), "rb");
     if (!f) continue;
     uint64_t first = 0, last = 0;
-    const bool probe = record_ts(f, 0, &first) && record_ts(f, count - 1, &last);
+    const bool probe = record_ts(f, 0, cf.recsz, &first) &&
+                       record_ts(f, count - 1, cf.recsz, &last);
     uint64_t start = 0;
     if (probe && first < t0) {
-      start = lower_bound_ts(f, count, t0);
+      start = lower_bound_ts(f, count, cf.recsz, t0);
       start = start > 64 ? start - 64 : 0;  // linear close-up margin
     }
     fclose(f);
     if (probe && (last < t0 || first > t1)) continue;  // whole file outside
     if (info) info->files_scanned++;
-    read_records(cf.path, start, ~(uint64_t)0, t0, t1, visit, info);
+    read_records(cf.path, cf.recsz, start, ~(uint64_t)0, t0, t1, visit, info);
   }
   return true;
 }
@@ -251,11 +269,11 @@ bool tail(uint32_t n, std::vector<QEntry>* out, ScanInfo* info,
   size_t gathered = 0;
   for (auto it = files.rbegin(); it != files.rend() && gathered < n; ++it) {
     std::error_code ec;
-    if (record_count(std::filesystem::file_size(it->path, ec)) == 0 || ec)
+    if (record_count(std::filesystem::file_size(it->path, ec), it->recsz) == 0 || ec)
       continue;
     if (info) info->files_scanned++;
     parts.emplace_back();
-    read_records(it->path, 0, ~(uint64_t)0, 0, ~(uint64_t)0,
+    read_records(it->path, it->recsz, 0, ~(uint64_t)0, 0, ~(uint64_t)0,
               [&](const QEntry& e) {
                 parts.back().push_back(e);
                 return true;
@@ -293,7 +311,7 @@ bool page(uint64_t offset, uint32_t limit, std::vector<QEntry>* out,
   for (const auto& cf : files) {
     std::error_code ec;
     const uint64_t count =
-        record_count(std::filesystem::file_size(cf.path, ec));
+        record_count(std::filesystem::file_size(cf.path, ec), cf.recsz);
     if (ec || count == 0) continue;
     slots.push_back({&cf, total, count});
     total += count;
@@ -307,7 +325,7 @@ bool page(uint64_t offset, uint32_t limit, std::vector<QEntry>* out,
     const uint64_t i0 = start > s.base ? start - s.base : 0;
     const uint64_t cnt = std::min(s.count - i0, end - (s.base + i0));
     if (info) info->files_scanned++;
-    read_records(s.cf->path, i0, cnt, 0, ~(uint64_t)0,
+    read_records(s.cf->path, s.cf->recsz, i0, cnt, 0, ~(uint64_t)0,
                  [&](const QEntry& e) {
                    out->push_back(e);
                    return true;

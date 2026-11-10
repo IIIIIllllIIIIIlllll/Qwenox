@@ -1467,6 +1467,7 @@ std::vector<int> GpuModel::df2_spec_loop(
     ~EndDump() { df2_ring_dump(m.df2, m.pos, "end"); }
   } end_dump{*this};
   last_spec_rounds = last_spec_commit = last_spec_rollbacks = 0;
+  last_ng_rounds = last_ng_proposed = last_ng_accepted = 0;
   live_spec_rounds = live_spec_commits = live_spec_proposed = 0;
   std::vector<int> out;
   out.reserve((size_t)std::max(0, gen) + 1);
@@ -1840,6 +1841,7 @@ std::vector<int> GpuModel::df2_spec_loop_sample(
     int cur, int gen, Sampler& sampler,
     const std::function<bool(int, float)>& emit) {
   last_spec_rounds = last_spec_commit = last_spec_rollbacks = 0;
+  last_ng_rounds = last_ng_proposed = last_ng_accepted = 0;
   live_spec_rounds = live_spec_commits = live_spec_proposed = 0;
   std::vector<int> out;
   out.reserve((size_t)std::max(0, gen) + 1);

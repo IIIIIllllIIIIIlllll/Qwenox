@@ -155,7 +155,7 @@
     <div class="grid" id="reqs-grid"></div>
     <div id="reqs-acc" style="margin-top:10px"></div>
     <table class="ovr" style="margin-top:12px">
-      <thead><tr><th>时间</th><th>结束原因</th><th>起草</th><th>prompt(命中)</th><th>prefill</th><th>输出</th><th>TTFT</th><th>decode</th><th>接受率</th></tr></thead>
+      <thead><tr><th>时间</th><th>结束原因</th><th>起草</th><th>prompt(命中)</th><th>prefill</th><th>输出</th><th>TTFT</th><th>decode</th><th>接受率 MTP / ngram</th></tr></thead>
       <tbody id="reqs-body"></tbody>
     </table>
     <div class="errmsg" id="reqs-err"></div>
@@ -760,7 +760,17 @@ function renderReqSummary(j) {
     if (!d) continue;
     let s = '<div><span style="color:var(--dim)">' + names[k] + '</span> <span class="mono">' +
             (d.decode_tok_per_s == null ? "-" : d.decode_tok_per_s.toFixed(1) + " tok/s") + "</span>";
-    if (d.proposed > 0)
+    if (d.proposed > 0 && d.split_requests > 0) {
+      s += ' <span style="color:var(--dim)">MTP</span> <span class="mono">' +
+           (d.mtp_proposed > 0 ? fmtPct(d.mtp_acceptance) : "-") + "</span>";
+      if (d.ngram_proposed > 0)
+        s += ' <span style="color:var(--dim)">ngram</span> <span class="mono">' +
+             fmtPct(d.ngram_acceptance) + '</span> <span style="color:var(--dim);font-size:12px">（' +
+             fmtTok(d.ngram_accepted) + "/" + fmtTok(d.ngram_proposed) + "）</span>";
+      s += ' <span style="color:var(--dim);font-size:12px">（合计 ' + fmtPct(d.acceptance) + "，" +
+           d.requests + " 请求" + (d.split_requests < d.requests ? "，" + d.split_requests + " 条可拆分" : "") +
+           "）</span>";
+    } else if (d.proposed > 0)
       s += ' <span style="color:var(--dim)">接受率</span> <span class="mono">' + fmtPct(d.acceptance) +
            '</span> <span style="color:var(--dim);font-size:12px">（' +
            fmtTok(d.accepted) + "/" + fmtTok(d.proposed) + "，" + d.requests + " 请求）</span>";
@@ -770,6 +780,14 @@ function renderReqSummary(j) {
   }
   $("reqs-acc").innerHTML = parts.join("") ||
     '<span style="color:var(--dim);font-size:12px">窗口内没有请求记录</span>';
+}
+
+// 接受率：草稿头（MTP）/ ngram 分开；旧记录不区分时显示合计。
+function accSplit(r) {
+  if (r.acceptance == null) return "-";
+  if (r.mtp_proposed == null && r.ngram_proposed == null) return fmtPct(r.acceptance) + " 合计";
+  return (r.mtp_proposed > 0 ? fmtPct(r.mtp_acceptance) : "-") + " / " +
+         (r.ngram_proposed > 0 ? fmtPct(r.ngram_acceptance) : "-");
 }
 
 function renderReqTable(j) {
@@ -800,7 +818,7 @@ function renderReqTable(j) {
       r.decode_ms > 0 && r.output_tokens > 1
         ? (r.output_tokens / (r.decode_ms / 1000)).toFixed(1) + " tok/s（" + fmtMs(r.decode_ms) + "）"
         : fmtMs(r.decode_ms),
-      fmtPct(r.acceptance),
+      accSplit(r),
     ];
     const tr = document.createElement("tr");
     for (const x of cells) {

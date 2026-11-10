@@ -472,6 +472,9 @@ GenResult EngineClient::generate(const GenParams& p, const TokenFn& on_token,
             out.commit = (int)num(7, 0);
             out.n_cached = (int)num(8, 0);
             out.proposed = (int)num(9, 0);
+            out.ng_rounds = (int)num(10, 0);
+            out.ng_proposed = (int)num(11, 0);
+            out.ng_accepted = (int)num(12, 0);
             return out;
         }
         // PONG / I / C / anything else: not ours, drop.

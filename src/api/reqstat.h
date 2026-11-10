@@ -1,16 +1,24 @@
-// reqstat: per-request statistics recorder. Appends fixed 64-byte records to
-// a single persistent file (default data/reqstat.bin) with a 256-byte header.
+// reqstat: per-request statistics recorder. Appends fixed-size records to a
+// single persistent file (default data/reqstat.bin) with a 256-byte header.
 //
 // File layout (all integers little-endian):
 //   header 256B: magic u32 "GRQS" | version u16 | header_size u16 |
 //     record_size u32 | file_seq u32 | record_count u64 | first_ts_ms u64 |
 //     last_ts_ms u64 | created_ts_ms u64 | rotate_bytes u64 | reserved 200B
-//   record 64B x N:
+//   record (version 2: 80B, version 1: 64B) x N:
 //     ts_ms u64 | req_seq u64 | n_prompt u32 | n_cached u32 | n_gen u32 |
 //     proposed u32 | commit u32 | rounds u32 | prefill_us u32 | decode_us u32 |
-//     ttft_us u32 | flags u32 | crc16 u16 | pad u16 | reserved u32
+//     ttft_us u32 | flags u32 |
+//     v2: ng_rounds u32 | ng_proposed u32 | ng_accepted u32 | reserved u32 |
+//         crc16 u16 (over bytes 0..71) | pad u16 | reserved u32
+//     v1: crc16 u16 (over bytes 0..55) | pad u16 | reserved u32
 //   flags: bits 0-3 finish (1 stop / 2 length / 3 cancel / 4 error),
 //          bits 4-7 drafter (0 serial / 1 mtp / 3 ngram / 4 chain), bit 8 vision.
+//   proposed / commit / rounds cover every drafter; ng_* are the n-gram
+//   (prompt lookup) rounds' share of them, so the draft head's own numbers are
+//   proposed - ng_proposed and (commit - rounds) - ng_accepted.
+//   Version 1 files (no ng_* split) are still read; the writer only appends
+//   version 2 and rotates a version 1 reqstat.bin away on open.
 //
 // Consistency rules: each record is written to disk and flushed together with
 // the updated header before record() returns, so a completed request survives
@@ -42,6 +50,9 @@ struct Entry {
   uint32_t decode_us = 0;
   uint32_t ttft_us = 0;
   uint32_t flags = 0;
+  uint32_t ng_rounds = 0;    // n-gram rounds (subset of rounds)
+  uint32_t ng_proposed = 0;  // drafts those rounds offered (subset of proposed)
+  uint32_t ng_accepted = 0;  // drafts they committed (subset of commit - rounds)
 };
 
 // Record one completed request. Thread-safe; never throws. The record is on

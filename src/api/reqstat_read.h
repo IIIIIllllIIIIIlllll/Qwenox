@@ -27,6 +27,12 @@ struct QEntry {
   uint32_t decode_us = 0;
   uint32_t ttft_us = 0;
   uint32_t flags = 0;
+  // n-gram share of proposed / accepted (record version >= 2; see reqstat.h).
+  // split = false: a version 1 record, the share is unknown (fields 0).
+  bool split = false;
+  uint32_t ng_rounds = 0;
+  uint32_t ng_proposed = 0;
+  uint32_t ng_accepted = 0;
 };
 
 struct ScanInfo {

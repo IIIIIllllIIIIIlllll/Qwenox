@@ -1,5 +1,6 @@
 #include "reqstat.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -12,9 +13,10 @@ namespace reqstat {
 namespace {
 
 constexpr uint32_t kMagic = 0x47525153;  // "GRQS"
-constexpr uint16_t kVersion = 1;
+constexpr uint16_t kVersion = 2;
 constexpr uint16_t kHeaderSize = 256;
-constexpr uint32_t kRecordSize = 64;
+constexpr uint32_t kRecordSize = 80;
+constexpr uint32_t kCrcBytes = 72;  // crc16 covers bytes [0, 72)
 
 void put16(uint8_t* p, uint16_t v) { memcpy(p, &v, 2); }
 void put32(uint8_t* p, uint32_t v) { memcpy(p, &v, 4); }
@@ -83,7 +85,10 @@ class Recorder {
     put32(r + 44, e.decode_us);
     put32(r + 48, e.ttft_us);
     put32(r + 52, e.flags);
-    put16(r + 56, crc16(r, 56));
+    put32(r + 56, e.ng_rounds);
+    put32(r + 60, e.ng_proposed);
+    put32(r + 64, e.ng_accepted);
+    put16(r + kCrcBytes, crc16(r, kCrcBytes));
   }
 
   void flush() {
@@ -122,7 +127,24 @@ class Recorder {
     std::filesystem::create_directories(dir, ec);
     path_ = dir + "/reqstat.bin";
     if (std::filesystem::exists(path_)) {
-      if (!open_existing()) {
+      uint32_t old_seq = 0;
+      if (older_version(&old_seq)) {
+        // A valid file of an older record version: keep it in the chain
+        // as a rotated file (readers handle both versions) and append the
+        // current version to a fresh reqstat.bin.
+        char name[64];
+        snprintf(name, sizeof name, "reqstat-%06u.bin", old_seq);
+        std::filesystem::rename(path_, dir + "/" + name, ec);
+        if (!ec) {
+          fprintf(stderr, "reqstat: older record version -> %s\n", name);
+          create_fresh(std::max(old_seq + 1, next_seq(dir)));
+        } else {
+          std::string bad =
+              dir + "/reqstat-corrupt-" + std::to_string(now_ms()) + ".bin";
+          std::filesystem::rename(path_, bad, ec);
+          create_fresh(next_seq(dir));
+        }
+      } else if (!open_existing()) {
         // Corrupt or foreign file: preserve it and start fresh.
         std::string bad =
             dir + "/reqstat-corrupt-" + std::to_string(now_ms()) + ".bin";
@@ -172,6 +194,24 @@ class Recorder {
     hdr_.file_seq = seq;
     f_ = fopen(path_.c_str(), "w+b");
     if (f_) write_header();
+  }
+
+  // reqstat.bin is a well-formed version 1 file (64-byte records).
+  bool older_version(uint32_t* seq) {
+    FILE* f = fopen(path_.c_str(), "rb");
+    if (!f) return false;
+    uint8_t h[kHeaderSize];
+    const bool got = fread(h, 1, sizeof h, f) == sizeof h;
+    fclose(f);
+    if (!got) return false;
+    uint32_t magic, recsz;
+    uint16_t ver, hsz;
+    memcpy(&magic, h + 0, 4);
+    memcpy(&ver, h + 4, 2);
+    memcpy(&hsz, h + 6, 2);
+    memcpy(&recsz, h + 8, 4);
+    memcpy(seq, h + 12, 4);
+    return magic == kMagic && ver == 1 && hsz == kHeaderSize && recsz == 64;
   }
 
   bool open_existing() {

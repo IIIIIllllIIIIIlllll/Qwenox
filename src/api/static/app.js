@@ -64,8 +64,9 @@ const I18N = {
     "usage.empty": "范围内没有请求记录",
     "usage.note": "数据来自 /reqstat/usage 的全历史小时聚合（后端进程内缓存，已结束的小时只扫描一次），按本地日期汇总显示。",
     "req.from": "起", "req.to": "止", "req.size": "每页", "req.clear": "清除筛选",
-    "req.time": "时间", "req.cache": "缓存", "req.accept": "接受率",
+    "req.time": "时间", "req.cache": "缓存", "req.accept": "接受率 MTP / ngram",
     "req.avg": "均值",
+    "req.accept_all": "合计", "req.accept_rounds": "轮",
     "req.prev_page": "上一页", "req.next_page": "下一页",
     "req.note_server": "服务端分页（/reqstat/page），可翻阅全部历史；日期与 finish/drafter 为前端过滤（过滤时仅覆盖最近 1000 条）。",
     "req.note_filtered": "已设筛选：后端不支持按条件检索，仅在 /reqstat/tail 最近 1000 条内过滤分页。",
@@ -182,8 +183,9 @@ const I18N = {
     "usage.empty": "no requests in range",
     "usage.note": "Full-history hourly aggregates via /reqstat/usage (in-process cache; ended hours are scanned once), grouped into local days.",
     "req.from": "From", "req.to": "To", "req.size": "Per page", "req.clear": "Clear filters",
-    "req.time": "Time", "req.cache": "Cache", "req.accept": "Acceptance",
+    "req.time": "Time", "req.cache": "Cache", "req.accept": "Acceptance MTP / ngram",
     "req.avg": "avg",
+    "req.accept_all": "all", "req.accept_rounds": "rounds",
     "req.prev_page": "Prev", "req.next_page": "Next",
     "req.note_server": "Server-side paging (/reqstat/page) over the full history; date and finish/drafter filters are client-side (newest 1000 records only).",
     "req.note_filtered": "Filters active: the backend has no conditional search, so filtering covers only the newest 1000 records from /reqstat/tail.",
@@ -1280,6 +1282,30 @@ function filteredRequests() {
     (!fin || r.finish === fin) && (!dr || r.drafter === dr));
 }
 
+// 接受率：草稿头（MTP）与 ngram（prompt lookup）分开算，"MTP / ngram"。
+// 旧记录（11-10 前写入）不区分时退回合计值，标 "合计"。
+const pct1 = (v) => (v * 100).toFixed(1) + "%";
+function acceptCell(r) {
+  if (r.acceptance == null) return "—";
+  if (r.mtp_acceptance === undefined || (r.mtp_proposed == null && r.ngram_proposed == null))
+    return pct1(r.acceptance) + " " + t("req.accept_all");
+  const m = r.mtp_proposed > 0 ? pct1(r.mtp_acceptance) : "—";
+  const n = r.ngram_proposed > 0 ? pct1(r.ngram_acceptance) : "—";
+  return m + " / " + n;
+}
+function acceptTitle(r) {
+  if (r.acceptance == null) return "";
+  const parts = [];
+  if (r.mtp_proposed != null)
+    parts.push("MTP " + fmtInt(r.mtp_accepted) + "/" + fmtInt(r.mtp_proposed));
+  if (r.ngram_proposed != null)
+    parts.push("ngram " + fmtInt(r.ngram_accepted) + "/" + fmtInt(r.ngram_proposed) +
+               " (" + fmtInt(r.ngram_rounds) + " " + t("req.accept_rounds") + ")");
+  parts.push(t("req.accept_all") + " " + pct1(r.acceptance) + " (" +
+             fmtInt(Math.max(0, r.commit - r.rounds)) + "/" + fmtInt(r.proposed) + ")");
+  return parts.join(" · ");
+}
+
 function fillRequestRows(rows) {
   const tbody = document.querySelector("#req-table tbody");
   tbody.textContent = "";
@@ -1291,12 +1317,13 @@ function fillRequestRows(rows) {
       tokPerS(r.prompt_tokens - r.cached_tokens, r.prefill_ms),
       tokPerS(r.output_tokens, r.decode_ms),
       r.drafter, r.finish,
-      r.acceptance == null ? "—" : (r.acceptance * 100).toFixed(1) + "%",
+      acceptCell(r),
     ];
     cells.forEach((v, i) => {
       const td = document.createElement("td");
       if (i > 0 && i !== 9 && i !== 10) td.className = "r";
       td.textContent = String(v);
+      if (i === cells.length - 1) td.title = acceptTitle(r);
       tr.appendChild(td);
     });
     tbody.appendChild(tr);

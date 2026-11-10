@@ -14,9 +14,15 @@ import struct
 import sys
 
 MAGIC = 0x47525153  # "GRQS"
-HSZ, RSZ = 256, 64
-REC = struct.Struct("<QQ10IHHI")
-assert REC.size == RSZ
+HSZ = 256
+# 记录版本：1 = 64B（crc 覆盖 0..55）；2 = 80B，多 ng_rounds/ng_proposed/ng_accepted
+# （ngram 轮在 proposed / commit-rounds 里的份额，crc 覆盖 0..71）。
+REC_V = {
+    1: (64, 56, struct.Struct("<QQ10IHHI")),
+    2: (80, 72, struct.Struct("<QQ10I3IIHHI")),
+}
+for _v, (_sz, _crc, _st) in REC_V.items():
+    assert _st.size == _sz
 
 FINISH = {1: "stop", 2: "length", 3: "cancel", 4: "error"}
 DRAFTER = {0: "serial", 1: "mtp", 3: "ngram", 4: "chain"}
@@ -38,31 +44,40 @@ class StatFile:
             h = f.read(HSZ)
             if len(h) < HSZ or struct.unpack_from("<I", h, 0)[0] != MAGIC:
                 raise ValueError(f"{path}: 不是 reqstat 文件")
+            ver, _hsz, rsz = struct.unpack_from("<HHI", h, 4)
+            if ver not in REC_V or REC_V[ver][0] != rsz:
+                raise ValueError(f"{path}: 未知记录版本 {ver}/{rsz}B")
+            self.ver = ver
+            self.rsz, self.crc_at, self.rec = REC_V[ver]
             self.seq = struct.unpack_from("<I", h, 12)[0]
             self.hdr_count = struct.unpack_from("<Q", h, 16)[0]
             self.data = f.read()
         # 真相是文件大小：头部 count 只是提示
-        self.count = len(self.data) // RSZ
+        self.count = len(self.data) // self.rsz
         self.bad_crc = 0
 
     def record(self, i):
-        raw = self.data[i * RSZ : (i + 1) * RSZ]
-        if crc16(raw[:56]) != struct.unpack_from("<H", raw, 56)[0]:
+        raw = self.data[i * self.rsz : (i + 1) * self.rsz]
+        if crc16(raw[: self.crc_at]) != struct.unpack_from("<H", raw, self.crc_at)[0]:
             self.bad_crc += 1
             return None
-        f = REC.unpack(raw)
-        return {
+        f = self.rec.unpack(raw)
+        r = {
             "ts": f[0], "seq": f[1], "prompt": f[2], "cached": f[3],
             "gen": f[4], "proposed": f[5], "commit": f[6], "rounds": f[7],
             "prefill_us": f[8], "decode_us": f[9], "ttft_us": f[10],
-            "flags": f[11],
+            "flags": f[11], "split": self.ver >= 2,
+            "ng_rounds": 0, "ng_proposed": 0, "ng_accepted": 0,
         }
+        if self.ver >= 2:
+            r["ng_rounds"], r["ng_proposed"], r["ng_accepted"] = f[12], f[13], f[14]
+        return r
 
     def lower_bound(self, ts_ms):
         lo, hi = 0, self.count  # 第一条 ts >= ts_ms（近似，调用方线性收口）
         while lo < hi:
             mid = (lo + hi) // 2
-            ts = struct.unpack_from("<Q", self.data, mid * RSZ)[0]
+            ts = struct.unpack_from("<Q", self.data, mid * self.rsz)[0]
             if ts < ts_ms:
                 lo = mid + 1
             else:
@@ -97,7 +112,7 @@ def iter_range(files, t0, t1):
         if sf.count == 0:
             continue
         first = struct.unpack_from("<Q", sf.data, 0)[0]
-        last = struct.unpack_from("<Q", sf.data, (sf.count - 1) * RSZ)[0]
+        last = struct.unpack_from("<Q", sf.data, (sf.count - 1) * sf.rsz)[0]
         if last < t0 or first > t1:
             continue
         # 二分近似定位，前后各退 64 条线性收口（ts 允许局部乱序）
@@ -151,8 +166,19 @@ def summarize(recs, label):
             continue
         prop = sum(r["proposed"] for r in sub)
         acc = sum(r["commit"] - r["rounds"] for r in sub)
-        print(f"  {dname}: {len(sub)} 请求，接受率 {100.0 * acc / prop:.1f}%"
-              f"（{acc:,}/{prop:,}）")
+        line = (f"  {dname}: {len(sub)} 请求，接受率 {100.0 * acc / prop:.1f}%"
+                f"（{acc:,}/{prop:,}）")
+        sp = [r for r in sub if r["split"]]
+        if sp:  # 草稿头 / ngram 分开（v2 记录）
+            ngp = sum(r["ng_proposed"] for r in sp)
+            nga = sum(r["ng_accepted"] for r in sp)
+            mp = sum(r["proposed"] for r in sp) - ngp
+            ma = sum(r["commit"] - r["rounds"] for r in sp) - nga
+            line += (f"；MTP {100.0 * ma / mp:.1f}%（{ma:,}/{mp:,}）" if mp else "；MTP -")
+            line += (f" ngram {100.0 * nga / ngp:.1f}%（{nga:,}/{ngp:,}）" if ngp else " ngram -")
+            if len(sp) < len(sub):
+                line += f"（拆分基于 {len(sp)} 条 v2 记录）"
+        print(line)
 
 
 def main():
@@ -167,7 +193,7 @@ def main():
     files = open_chain(a.dir)
     if a.cmd == "files":
         for sf in files:
-            print(f"seq={sf.seq:<6} records={sf.count:<9} hdr_count={sf.hdr_count:<9} {sf.path}")
+            print(f"seq={sf.seq:<6} v{sf.ver} records={sf.count:<9} hdr_count={sf.hdr_count:<9} {sf.path}")
         return
 
     if a.cmd == "tail":
@@ -185,6 +211,12 @@ def main():
                 f" acc={100.0 * (r['commit'] - r['rounds']) / r['proposed']:.0f}%"
                 if r["proposed"] else ""
             )
+            if r["proposed"] and r["split"]:
+                mp = r["proposed"] - r["ng_proposed"]
+                ma = r["commit"] - r["rounds"] - r["ng_accepted"]
+                acc += f" mtp={100.0 * ma / mp:.0f}%" if mp else " mtp=-"
+                acc += (f" ngram={100.0 * r['ng_accepted'] / r['ng_proposed']:.0f}%"
+                        f"({r['ng_accepted']}/{r['ng_proposed']})" if r["ng_proposed"] else "")
             print(
                 f"{t:%Y-%m-%d %H:%M:%S} req={r['seq']} {fin:6s} {dr:6s} "
                 f"prompt={r['prompt']}(命中{r['cached']}) gen={r['gen']} "
