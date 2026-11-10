@@ -250,7 +250,13 @@ int main(int argc, char** argv) {
   if (is_gguf_path(base)) gguf_base_setup(base);
   for (; argi < argc; argi++) {
     std::string a = argv[argi];
-    auto next = [&]() { return argv[++argi]; };
+    auto next = [&]() -> const char* {
+      if (argi + 1 >= argc) {
+        fprintf(stderr, "%s requires a value\n", a.c_str());
+        exit(2);
+      }
+      return argv[++argi];
+    };
     if (a == "--tokens") {
       char* s = strdup(next());
       for (char* p = strtok(s, ","); p; p = strtok(nullptr, ",")) tokens.push_back(atoi(p));
