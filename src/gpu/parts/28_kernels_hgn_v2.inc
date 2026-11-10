@@ -389,7 +389,7 @@ __global__ __launch_bounds__(256) void k_ht_gemv(const uint8_t* __restrict__ cod
 // f16 (the only new rounding: ht_val is exactly f16 already), f32 accumulate.
 // Row invariance (concurrent == single-run bit for bit): every output element
 // (p, o) is the WMMA chain over (tile t, 16-col group g) in fixed order, its
-// A row is row p's own x^ (rows >= P are zero), the split-K count ks is a
+// A row is row p's own x^ (rows >= P are never stored), the split-K count ks is a
 // function of the shape only (host ht_wmma_ks), and the K-slice partials are
 // summed in kz order. Nothing depends on P or on the row's position in the
 // batch (tests/ht_wmma_test.cu checks shifted / reversed batches bitwise).
@@ -399,9 +399,15 @@ __global__ __launch_bounds__(256) void k_ht_gemv(const uint8_t* __restrict__ cod
 // (gfx1151 B(k,c): lane c and lane 16+c both hold col c) -> one permlanex16
 // swap completes it. A(r,k) (r<8: lane 2r, r>=8: lane 17+2(r-8)) is read
 // from the f16 x^ chunk in LDS. C(r,c) = lane c + 16*(r>=8), elem r%8.
+// NPT == 1 (P <= 16): every A lane loads (rows >= P read row P-1, then select
+// zero), so the loop body has no exec branch per column group: one basic
+// block per tile for the scheduler, 3-5% faster at P <= 8 than a guarded
+// load (11-10 ht2 test). Built as a vector + select; plain clamped loads
+// without the select, or A registers kept across groups, scheduled worse.
 // LDS: max(P*(tpc*128+8) f16 x^ chunk, P*128 f32 z).
 typedef _Float16 htw_v16h __attribute__((ext_vector_type(16)));
 typedef float htw_v8f __attribute__((ext_vector_type(8)));
+typedef uint32_t htw_v8u __attribute__((ext_vector_type(8)));  // A operand bits
 namespace hv2 {
 // packed f16 pair of ht_val2 (same bits, no f32 round trip)
 __device__ __forceinline__ uint32_t ht_h2(uint32_t a0, uint32_t a1) {
@@ -456,6 +462,9 @@ __global__ __launch_bounds__(256) void k_ht_wmma(const uint8_t* __restrict__ cod
   const int b_ = lane >> 1;
   const int qrowA = (lane & 1) ? ((lane & 16) ? b_ : ((b_ + 4) & 7))
                                : ((lane & 16) ? 8 + ((b_ + 4) & 7) : b_);
+  int arow[NPT];  // A row loaded by this lane: its own row, clamped to P-1
+#pragma unroll
+  for (int pt = 0; pt < NPT; pt++) arow[pt] = min(pt * 16 + qrowA, P - 1);
   htw_v8f acc[NPT];
 #pragma unroll
   for (int i = 0; i < NPT; i++)
@@ -495,7 +504,6 @@ __global__ __launch_bounds__(256) void k_ht_wmma(const uint8_t* __restrict__ cod
 #pragma unroll
       for (int g = 0; g < 8; g++) nxt[g] = *(const uint32_t*)(tb + g * 1024);
     }
-    const __half* xa = xh + (size_t)qrowA * RS + tc * 128;
 #pragma unroll
     for (int g = 0; g < 8; g++) {
       const uint32_t cur = cw[g];
@@ -524,15 +532,21 @@ __global__ __launch_bounds__(256) void k_ht_wmma(const uint8_t* __restrict__ cod
       memcpy(&bf, bw, 32);
 #pragma unroll
       for (int pt = 0; pt < NPT; pt++) {
-        uint4 a2[2] = {make_uint4(0, 0, 0, 0), make_uint4(0, 0, 0, 0)};  // rows >= P: zero
-        if (pt * 16 + qrowA < P) {
-          const __half* ap = xa + (size_t)pt * 16 * RS + g * 16;
-          a2[0] = *(const uint4*)ap;
-          a2[1] = *(const uint4*)(ap + 8);
+        htw_v8u av;
+        if constexpr (NPT == 1) {  // P <= 16: branch-free (see header)
+          const __half* ap = xh + (size_t)arow[pt] * RS + tc * 128 + g * 16;
+          const uint4 lo = *(const uint4*)ap, hi = *(const uint4*)(ap + 8);
+          av = (htw_v8u){lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+          if (pt * 16 + qrowA >= P) av = (htw_v8u)(0u);  // rows >= P: zero
+        } else {  // larger batches: the guarded load is faster (3 selects per group)
+          av = (htw_v8u)(0u);
+          if (pt * 16 + qrowA < P) {
+            const __half* ap = xh + (size_t)arow[pt] * RS + tc * 128 + g * 16;
+            const uint4 lo = *(const uint4*)ap, hi = *(const uint4*)(ap + 8);
+            av = (htw_v8u){lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+          }
         }
-        htw_v16h af;
-        memcpy(&af, a2, 32);
-        acc[pt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, bf, acc[pt]);
+        acc[pt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32((htw_v16h)av, bf, acc[pt]);
       }
     }
   }
