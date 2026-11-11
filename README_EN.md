@@ -179,10 +179,13 @@ Requirements: ROCm (HIP 7.x or newer), a gfx1151 GPU, ≥ 100 GiB available memo
 rocBLAS, hipBLASLt, rocPRIM; the API front end also needs libpng, libjpeg, libwebp.
 
 ```bash
-bash build.sh        # builds engine, API front end, benchmark into build/
+bash build.sh        # builds engine, API front end, benchmark into build/, and the TUI settings tool at the root
 bash start_hgn.sh    # start with hgn weights
 bash start_gguf.sh   # or with GGUF weights
 ```
+
+Run `./qwenox-settings` for the cross-platform terminal settings UI instead of editing `service.conf` directly.
+`bash build.sh settings` builds just that tool. See [SETTINGS-TUI.md](docs/SETTINGS-TUI.md) for keys and check scope.
 
 The two launchers differ only in which weights they read: they load the engine, then start the API once it is
 ready. They run in the foreground and Ctrl+C stops both; over SSH, run them inside tmux. If anything is
@@ -209,7 +212,9 @@ For daily use, double-click `start_win.exe` in the project root. It puts an icon
 console window and does not load the model by itself. Double-click the tray icon to open the web console; on
 the `#/engine` page choose the weights (hgn or GGUF), edit the configuration and start the engine. The
 right-click menu can also start/stop the engine, copy the API address and open logs. Logs are in `logs\`. If
-you prefer the command line, `bash start_win.sh` in Git Bash behaves like the Linux launchers.
+you prefer the command line, `bash start_win.sh` in Git Bash behaves like the Linux launchers. For a terminal
+settings UI, run `qwenox-settings.exe` at the project root in Windows Terminal, PowerShell, or CMD; it edits only
+`service.conf` and never starts the service. See [SETTINGS-TUI.md](docs/SETTINGS-TUI.md).
 
 Copying the built `build/` and `start_win.exe` together with `models/` to another gfx1151 Windows machine is
 enough to run there; that machine needs neither Git nor TheRock. Porting details are in

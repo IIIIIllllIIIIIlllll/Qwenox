@@ -167,10 +167,13 @@ GGUF_VISION_FILE="${GGUF_VISION_FILE-$MODEL_DIR/qwen38-flash-next-vision.hgn}"
 rocPRIM，API 前端另需 libpng、libjpeg、libwebp。
 
 ```bash
-bash build.sh        # 编译引擎、API 前端、benchmark,输出在 build/
+bash build.sh        # 编译引擎、API 前端、benchmark 到 build/，TUI 设置工具到根目录
 bash start_hgn.sh    # 用 hgn 权重启动
 bash start_gguf.sh   # 或用 GGUF 权重启动
 ```
+
+不想直接编辑 `service.conf` 时，可以运行 `./qwenox-settings` 使用跨平台终端设置界面；也可以只运行
+`bash build.sh settings` 单独编译它。按键和检查范围见 [SETTINGS-TUI.md](docs/SETTINGS-TUI.md)。
 
 两个启动器只是读的权重不同：先加载引擎，就绪后再启动 API。它们在前台运行，Ctrl+C 同时停止两者；
 远程登录时放在 tmux 里。缺文件时列出全部缺失项并退出，加 `--check` 只检查配置、不启动。
@@ -195,7 +198,9 @@ bash build_win.sh    # 引擎、benchmark、API 托盘程序、根目录入口 s
 日常运行双击根目录的 `start_win.exe`。它在任务栏右下角放一个托盘图标，不开控制台窗口，也不会
 自动加载模型。双击托盘图标打开控制台网页，在 `#/engine` 页选择权重（hgn 或 GGUF）、修改配置，
 再启动引擎；右键菜单里也能启停引擎、复制 API 地址、查看日志。日志在 `logs\`。习惯命令行的话，
-在 Git Bash 里运行 `bash start_win.sh` 也可以，行为和 Linux 启动器相同。
+在 Git Bash 里运行 `bash start_win.sh` 也可以，行为和 Linux 启动器相同。习惯终端设置界面的话，
+在 Windows Terminal / PowerShell / CMD 中运行根目录的 `qwenox-settings.exe`；它只编辑 `service.conf`，
+不启动服务，使用说明见 [SETTINGS-TUI.md](docs/SETTINGS-TUI.md)。
 
 编好的 `build/`、`start_win.exe` 连同 `models/` 拷到另一台 gfx1151 Windows 机器上可以直接运行，
 那台机器不需要装 Git 或 TheRock。移植细节见 [PORTING-WINDOWS.md](docs/PORTING-WINDOWS.md)。

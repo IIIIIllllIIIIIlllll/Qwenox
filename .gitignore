@@ -8,6 +8,8 @@ hipfire-master/
 *.tmp.*
 start_win.exe
 settings_win.exe
+qwenox-settings
+qwenox-settings.exe
 dist/
 service.conf.bak
 __pycache__/

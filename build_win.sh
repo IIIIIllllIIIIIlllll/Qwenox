@@ -7,7 +7,8 @@
 #   bash build_win.sh api        # OpenAI HTTP 前端 → build/qwenox-win.exe
 #                                #   （GUI 托盘程序：API 服务 + 控制台网页 + 引擎启停）
 #   bash build_win.sh launcher   # 根目录最小入口 → ./start_win.exe（双击拉起 API）
-#   bash build_win.sh settings   # 根目录设置工具 → ./settings_win.exe（双击配置/检查，不启动服务）
+#   bash build_win.sh settings   # 根目录 GUI 设置工具 → ./settings_win.exe（双击配置/检查，不启动服务）
+#   bash build_win.sh settings-tui # 跨平台终端设置工具 → ./qwenox-settings.exe
 #   bash build_win.sh test       # 编 build/ktest-win.exe 并运行 kernel 单测
 #   bash build_win.sh vision-test # 纯 CPU 图片解码回归，不加载模型
 #   QWENOX_ENGINE_OUT=build/qwenox-engine-candidate.exe bash build_win.sh engine
@@ -47,7 +48,7 @@ export HIP_PATH="$TR_WIN"
 unset ROCM_PATH HIP_PATH_64 HIP_PATH_71 HIP_PATH_72
 GPU_ARCH="${GPU_ARCH:-gfx1151}"
 TARGET="${1:-all}"
-[[ "$TARGET" == all || "$TARGET" == engine || "$TARGET" == bench || "$TARGET" == api || "$TARGET" == launcher || "$TARGET" == settings || "$TARGET" == test || "$TARGET" == vision-test || "$TARGET" == npu ]] || { sed -n '2,17p' "$0" >&2; exit 2; }
+[[ "$TARGET" == all || "$TARGET" == engine || "$TARGET" == bench || "$TARGET" == api || "$TARGET" == launcher || "$TARGET" == settings || "$TARGET" == settings-tui || "$TARGET" == test || "$TARGET" == vision-test || "$TARGET" == npu ]] || { sed -n '2,18p' "$0" >&2; exit 2; }
 
 # HIP 工具链/winlibs/kernel db 只服务 engine/bench/test；api 与 launcher 是纯主机 C++，
 # 在没有本机 gfx 分片 kernel db 的机器上（如只部署 API 的机器）也应能编译。
@@ -414,6 +415,20 @@ build_settings() {
     fi
 }
 
+build_settings_tui() {
+    # 与 Linux 共用 src/settings_tui.cpp；控制台子系统，无 ncurses/HIP 依赖。
+    # 纯主机工具可用 CXX=... 覆盖，未指定时才使用 TheRock 的 clang++。
+    if [[ -z "${CXX:-}" ]]; then
+      CXX="$TR/lib/llvm/bin/clang++.exe"
+      [[ -x "$CXX" ]] || CXX="$TR/bin/clang++.exe"
+    fi
+    [[ -x "$CXX" ]] || { echo "找不到 C++ 编译器：设 CXX=/path/to/clang++（或配置 THEROCK）" >&2; exit 1; }
+    echo "[编译] qwenox-settings.exe"
+    "$CXX" -O2 -std=c++17 -D_CRT_SECURE_NO_WARNINGS -D_CRT_NONSTDC_NO_DEPRECATE \
+      src/settings_tui.cpp -o qwenox-settings.exe.tmp \
+      && mv -f qwenox-settings.exe.tmp qwenox-settings.exe
+}
+
 build_test() {
     python tools/kv_admission_test.py --cxx "$TR/lib/llvm/bin/clang++.exe"
     python tools/kv_page_test.py --cxx "$TR/lib/llvm/bin/clang++.exe"
@@ -472,15 +487,16 @@ build_npu() {
 
 case "$TARGET" in
   all)
-    run_parallel build_engine build_bench build_api build_launcher build_settings
+    run_parallel build_engine build_bench build_api build_launcher build_settings build_settings_tui
     ;;
   engine) build_engine ;;
   bench) build_bench ;;
   api) build_api ;;
   launcher) build_launcher ;;
   settings) build_settings ;;
+  settings-tui) build_settings_tui ;;
   test) build_test ;;
   vision-test) build_vision_test ;;
   npu) build_npu ;;
 esac
-echo '[完成] 编译输出位于 build/；启动服务用 ./start_win.exe（或 bash start_win.sh），改配置用 ./settings_win.exe'
+echo '[完成] 编译输出位于 build/；启动服务用 ./start_win.exe（或 bash start_win.sh），GUI 配置用 ./settings_win.exe，终端配置用 ./qwenox-settings.exe'

@@ -7,6 +7,7 @@
 #   bash build.sh engine [名字]   # 只编引擎 → build/<名字>(默认 qwenox-engine)
 #   bash build.sh bench           # 编译独立性能测试工具 → build/qwenox-bench
 #   bash build.sh api             # 只编 API 服务器 + CLI 工具
+#   bash build.sh settings        # 只编跨平台 TUI 设置工具 → ./qwenox-settings
 #   bash build.sh test            # 编 ktest 并运行
 #
 # 产物:
@@ -43,7 +44,7 @@ set -- "${POSITIONAL[@]}"
 TARGET="${1:-all}"
 ENGINE_NAME="${2:-qwenox-engine}"
 case "$TARGET" in
-  all|engine|api|bench|test) ;;
+  all|engine|api|bench|settings|test) ;;
   *) usage >&2; exit 2 ;;
 esac
 command -v flock >/dev/null || { echo '缺少 flock，请安装 util-linux' >&2; exit 1; }
@@ -58,7 +59,7 @@ exec 8>"${XDG_RUNTIME_DIR:-/run/user/$UID}/hgn-work.lock"
 flock -n 8 || { echo '另一个 Qwenox 编译或启动任务正在运行' >&2; exit 1; }
 
 GPU_ARCH="${GPU_ARCH:-gfx1151}"
-if [[ "$TARGET" != api ]]; then
+if [[ "$TARGET" != api && "$TARGET" != settings ]]; then
   if [[ -z "${HIPCC:-}" ]]; then
     HIPCC="$(command -v hipcc || true)"
     HIPCC="${HIPCC:-/opt/rocm/bin/hipcc}"
@@ -125,7 +126,7 @@ gen_npu_bins() {  # $1=资产目录（含 xclbin 与 insts）
     echo "static const unsigned int kInstsLen = sizeof kInsts;"
   } > "$INC"
 }
-if [[ "$TARGET" != api && "${QWENOX_BUILD_NPU:-1}" != 0 ]]; then
+if [[ "$TARGET" != api && "$TARGET" != settings && "${QWENOX_BUILD_NPU:-1}" != 0 ]]; then
   XRT_DIR="${XRT_DIR:-/opt/xilinx/xrt}"
   NA="${NPUASSETS:-$ROOT/tools/npu}"
   if [[ -f "$XRT_DIR/include/xrt/xrt_bo.h" &&
@@ -341,6 +342,12 @@ build_api() {
     -lpng -ljpeg -lwebp -lpthread || return 1
 }
 
+build_settings() {
+  # 跨平台终端设置工具：只编辑 service.conf，不依赖 HIP/ROCm 或 ncurses。
+  compile qwenox-settings 1 60 "$CXX" -O2 -std=c++17 \
+    -Wall -Wextra -Wpedantic -Werror src/settings_tui.cpp -pthread
+}
+
 build_test() {
   run 8 180 python3 tools/kv_admission_test.py --cxx "$CXX" || return 1
   run 8 180 python3 tools/kv_page_test.py --cxx "$CXX" || return 1
@@ -362,6 +369,9 @@ case "$TARGET" in
     build_api
     (( ! BUNDLE_RUNTIME )) || bundle_api_runtime build/qwenox-api
     ;;
+  settings)
+    build_settings
+    ;;
   test)
     build_test
     if (( BUNDLE_RUNTIME )); then
@@ -380,6 +390,7 @@ case "$TARGET" in
     build_engine & pids+=($!)
     build_bench  & pids+=($!)
     build_api    & pids+=($!)
+    build_settings & pids+=($!)
     fail=0
     for p in "${pids[@]}"; do wait "$p" || fail=1; done
     [[ "$fail" == 0 ]] || { echo '[失败] 见上方编译输出' >&2; exit 1; }
