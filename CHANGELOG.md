@@ -2,6 +2,37 @@
 
 版本号记在根目录 `VERSION` 文件里，编译时写进程序。查看当前版本有三种方式：托盘菜单第一行、控制台总览页"版本"、`GET /health` 返回的 `version` 字段。引擎本身可以运行 `qwenox-engine-win.exe --version`。
 
+## v0.1.2 — 2026-11-12
+
+### 新功能
+
+- **投机解码联合起草**：`QWENOX_JOINT` 用 MTP 开链、ngram 接续补满草稿链，同轮 verify；greedy 支持置信度门控（`QWENOX_GREEDY_CONF`），采样路径默认随 `QWENOX_JOINT` 启用（`QWENOX_JOINT_SAMPLED`），接续位用「对齐抽中即提交」保持确定性。
+- **草稿头子词表 QDV1**（`QWENOX_DRAFT_VOCAB_FILE`）：启动时从 GPU 反量化选中的 ht 行，生成宿主侧 q4cp 紧凑子表（135 MiB），草稿 argmax 走子表再映回全局 id；修复词表前缀截断造成的中文偏置。采样路径自动绕过。
+- **Windows TUI 配置工具 `qwenox-settings.exe`**：与 Linux 共用 `src/settings_tui.cpp`，六页（参数五页 + 语言页）、静态检查、Tab 路径补全；中英双语，语言按 `lang` 标记 > `UI_LANG` > 系统界面语言解析，帮助与 `--check` 输出同样随语言。
+- **采样页命名方案管理**：新增 `/admin/presets`、`/admin/presets/delete`、`/admin/presets/apply`，方案持久化到 `data/api-presets.json`（tmp+rename 原子写）；内置不可删「默认」方案，选中为预览，应用/保存并生效。
+- **接受率按 MTP / ngram 拆分**：引擎 D 行追加 ngram 轮份额字段，REQ 日志拆分，reqstat 升到 v2（兼容读 v1，旧文件按正常轮转保留），`/reqstat/tail`、`/reqstat/summary` 与控制台请求日志分开展示草稿头与 ngram 接受率；合计字段保留，tok/s 口径不变。
+- **设置面板开放 `REQLOG` / `VIZ` / `MAX_IMAGES`**：第 2 页新增图片数量上限，第 3 页改名「端口与日志」，含日志目录浏览与级别；增加范围校验及隐私/性能警告。
+
+### 性能
+
+- **联合起草实测**（gfx1151 / Windows / hgn v2）：八场景加权 48.3 → 61.7 tok/s（+28%），代码 73.5 / 80.4（zh），复述编辑 77.7 / 83.6；采样 temp 0.7 单流复述 64.3 → 67.6、中文代码 48.4 → 50.7、中文散文 36.3 → 37.4 tok/s。短窗接续表 `jx_ngram` 默认 `QWENOX_JOINT_N=3`（halogen PLD 语义）。
+- **QDV1 子词表实测**：八场景加权 61.5 tok/s（基线 60.1），中文场景满速（zh-repeat 85.7 / zh-code 79.7）。
+- **k_ht_wmma 小 P 无分支 A 加载**：P≤16 时所有 lane 从 LDS 加载并夹行号，超出批次的行置零；P≤8 稠密 ht GEMV 快 3–5%，gdn.qkv 10240×2560 P=1 80.4 → 77.0 us。8 种 v2 ht 形状 × P=1..48 对冻结原核逐位对拍一致。
+
+### 修复
+
+- **联合起草并发会合退化**：MTP+ngram 链补满至 8 会让跨槽合批 verify 的 P=9 超过每段上限，2 路并发每轮拒绝合批、退回串行。`vseg_active_fn() > 1` 时接续封顶 7（单路仍 8），greedy 输出逐位不变；code-en + code-zh 各 512 tok 聚合 greedy 45.4 → 89.8、采样 52.5 → 81.9 tok/s。
+- **Linux PLE io_uring CQ 溢出**：在途读请求封顶 SQ 深度，`io_uring_enter` 一次提交 SQ 内全部待交项，EINTR 不再当致命错误；修 61K 冷 prompt 在 prefill 39% 处 SIGABRT（修后 1671 tok/s）。Windows IOCP 路径自带槽位上限，不受影响。
+- **引擎参数解析边界**：`next()` 补 argc 检查，修 `--tokens` 等带值选项末尾缺值时的 `strdup(NULL)` 段错误（#51）。
+- **设置面板配置生效路径**：托盘快照与 `POST /admin/engine/start` 在引擎启动前重读 `service.conf`，独立进程改的配置不再等 API 重启；`VIZ` 改为重启引擎即生效。
+- **Linux 编译**：`k_index_select` 补 `typename`，修 `IdSort::storage_type` 依赖类型报错。
+
+### 其他
+
+- 新增 `docs/SPEC-INVESTIGATION-20261109.md`：联合起草、halogen 对标与反汇编/口径核查记录。
+- bench：自适应 γ 档、串行测量、中英文场景；`BENCH_PREFILL=0` 快测档。
+- 版本号 0.1.2。
+
 ## v0.1.1 — 2026-11-08
 
 ### 新功能

@@ -183,7 +183,7 @@ for f in build/rocblas/library/*"$GPU_ARCH"*; do
     cp -a "$f" "$OUT/build/rocblas/library/"
 done
 
-for f in start_win.exe settings_win.exe start_win.sh service.conf \
+for f in start_win.exe settings_win.exe qwenox-settings.exe start_win.sh service.conf \
          README.md README_EN.md CHANGELOG.md LICENSE VERSION; do
     [[ -e "$f" ]] || die "缺少根目录文件：$f"
     cp -a "$f" "$OUT/"
@@ -336,6 +336,7 @@ weights=$WEIGHTS（默认启动权重）
 --------
 start_win.exe             托盘入口：双击启动 API 与控制台网页，不自动加载模型
 settings_win.exe          配置工具：编辑 service.conf、环境检查（不启动服务）
+qwenox-settings.exe       终端配置工具：TUI 编辑 service.conf、静态检查（中英双语）
 start_win.sh              Git Bash 命令行启动（行为同 Linux 启动器，可选）
 service.conf              部署配置（同上表；环境变量可临时覆盖）
 build\                    引擎 qwenox-engine-win.exe、API qwenox-win.exe、
@@ -373,7 +374,7 @@ if command -v sha256sum >/dev/null 2>&1; then
     (
         cd "$OUT"
         files=(build/qwenox-engine-win.exe build/qwenox-win.exe build/qwenox-bench.exe
-               start_win.exe settings_win.exe service.conf
+               start_win.exe settings_win.exe qwenox-settings.exe service.conf
                data/tokenizer/tokenizer.json BUILD-INFO.txt)
         for f in build/*.pdb; do [[ -f "$f" ]] && files+=("$f"); done
         for f in data/qsa-oracle/*.tokens; do [[ -f "$f" ]] && files+=("$f"); done
@@ -385,7 +386,7 @@ fi
 
 # ---- 完整性检查 -------------------------------------------------------------
 miss=0
-for f in start_win.exe settings_win.exe service.conf BUILD-INFO.txt \
+for f in start_win.exe settings_win.exe qwenox-settings.exe service.conf BUILD-INFO.txt \
          build/qwenox-engine-win.exe build/qwenox-win.exe build/qwenox-bench.exe \
          build/amdhip64_7.dll build/rocm_kpack.dll build/amd_comgr.dll \
          build/rocblas.dll build/libhipblaslt.dll build/origami.dll \
