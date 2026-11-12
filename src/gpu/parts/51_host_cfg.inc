@@ -4397,7 +4397,10 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
 
 // Connection reader: control verbs inline, GEN handed to a worker thread.
 static void conn_main(GpuModel& m, sockfd_t cfd, const kvsnap::Cfg& kvs) {
-  hip_use_selected_device();
+  // PING/SNAP/DIAG and cancellation must remain independent of the GPU
+  // driver. Binding every short-lived health probe can hang more threads
+  // behind a stuck driver and overwrite the useful HIP call history.
+  // gen_one binds its own worker; only MEM needs HIP on this reader.
   Conn c;
   c.fd = cfd;
   c.id = ++g_conn_id;
@@ -4448,6 +4451,7 @@ static void conn_main(GpuModel& m, sockfd_t cfd, const kvsnap::Cfg& kvs) {
                kv_pool_tokens);
       alive = c.send(ib);
     } else if (verb == "MEM") {
+      hip_use_selected_device();
       EngineMemStats ms = memstats_snapshot();
       char mb[512];
       // M version device_cur device_peak registered_cur pinned_cur
@@ -4635,6 +4639,49 @@ static void conn_main(GpuModel& m, sockfd_t cfd, const kvsnap::Cfg& kvs) {
 }
 
 static int run(GpuModel& m, const std::string& host, int port) {
+  int hip_timeout =
+#ifdef _WIN32
+      120;
+#else
+      0;
+#endif
+  if (const char* e = getenv("QWENOX_HIP_TIMEOUT")) {
+    char* end = nullptr;
+    const long n = strtol(e, &end, 10);
+    if (!*e || !end || *end || (n != 0 && (n < 30 || n > 3600))) {
+      fprintf(stderr, "QWENOX_HIP_TIMEOUT must be 0 or 30..3600 seconds\n");
+      return 2;
+    }
+    hip_timeout = (int)n;
+  }
+  hipwatch::instance().start(std::chrono::seconds(hip_timeout), [](const hipwatch::Call& call) {
+    // Do not reset/synchronize/free HIP resources here: the driver is stuck.
+    // Report generation can also block (stdio, minidump, driver locks). A
+    // separate hard-exit timer bounds that attempt without touching HIP.
+    std::thread([] {
+      std::this_thread::sleep_for(std::chrono::seconds(5));
+#ifdef _WIN32
+      TerminateProcess(GetCurrentProcess(), 124);
+#else
+      std::_Exit(124);
+#endif
+    }).detach();
+    char message[512];
+    snprintf(message, sizeof message, "HIP watchdog: %s at %s:%d has not returned; "
+             "stopping engine (exit 124), no automatic restart", call.kind, call.file, call.line);
+    fprintf(stderr, "%s\n", message);
+    fflush(stderr);
+    crashdiag::note("%s", message);
+    crashdiag::report_fatal("hip-timeout", message);
+#ifdef _WIN32
+    TerminateProcess(GetCurrentProcess(), 124);
+#else
+    std::_Exit(124);
+#endif
+  });
+  if (hip_timeout)
+    fprintf(stderr, "HIP watchdog: %ds per copy/synchronization call (QWENOX_HIP_TIMEOUT)\n",
+            hip_timeout);
   if (!kv_admission_decode_cap(getenv("QWENOX_KV_RESERVE_DECODE"), g_reserve_decode)) {
     fprintf(stderr, "serve: QWENOX_KV_RESERVE_DECODE must be an integer from 0 to %d\n",
             INT_MAX);

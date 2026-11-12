@@ -587,6 +587,7 @@ std::string exit_code_text(unsigned long c) {
         case 1: return "fatal error (1): HIP error / KV pool / startup failure - see the last lines of the engine log and crash/*.txt";
         case 2: return "usage / argument error (2)";
         case 3: return "abort() or std::terminate (3)";
+        case 124: return "HIP watchdog timeout (124): GPU copy/synchronization did not return; engine stopped without automatic restart - see crash/*.txt and engine.log";
         case 0xC0000005: return "STATUS_ACCESS_VIOLATION: invalid memory access (see crash/*.txt: fault/pc lines)";
         case 0xC0000409: return "STATUS_STACK_BUFFER_OVERRUN / __fastfail: bypasses in-process handlers; see events.txt (Application Error 1000)";
         case 0xC0000374: return "STATUS_HEAP_CORRUPTION";
