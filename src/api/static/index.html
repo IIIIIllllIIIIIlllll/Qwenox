@@ -192,6 +192,14 @@
     <div class="card" data-seq="SMPL0010">
       <h2 data-i18n="ovr.title">采样 / 思考参数（服务端覆盖）</h2>
       <p class="note muted ovr-hint" data-i18n="ovr.hint"></p>
+      <div class="head-tools ovr-preset-bar">
+        <label for="ovr-preset" data-i18n="ovr.preset_label">方案</label>
+        <select id="ovr-preset"></select>
+        <button class="btn" id="ovr-preset-apply" data-i18n="ovr.preset_apply">应用方案</button>
+        <button class="btn" id="ovr-preset-save" data-i18n="ovr.preset_save">另存为方案…</button>
+        <button class="btn" id="ovr-preset-del" data-i18n="ovr.preset_del">删除方案</button>
+        <span class="muted small" id="ovr-preset-meta"></span>
+      </div>
       <div class="table-wrap">
       <table class="table" id="ovr-table">
         <thead><tr>

@@ -89,6 +89,9 @@ struct Config {
     // Server-side sampling/thinking overrides (see apply_overrides). Relative
     // to the working directory, which every launcher sets to the repo root.
     std::string overrides_path = "data/api-overrides.json";
+    // Named sampling presets (see the presets section below); "" disables
+    // persistence. Same working-directory rule as overrides_path.
+    std::string presets_path = "data/api-presets.json";
     std::string admin_key;  // env QWENOX_API_ADMIN_KEY; empty = POST open (LAN)
     // service.conf 路径：--service-conf > QWENOX_SERVICE_CONF > 自动探测
     //（CWD 的 service.conf，否则 exe 上一级的 service.conf——build/ 里的
@@ -1286,6 +1289,19 @@ const OverrideField kOverrideFields[] = {
 std::mutex g_ovr_mtx;
 json g_overrides = json::object();
 
+// Named sampling presets (see the presets section after the overrides
+// handlers): name -> validated override table, plus which preset the live
+// table last came from. Empty active = manual / unknown state.
+std::mutex g_preset_mtx;
+json g_presets = json::object();
+std::string g_presets_active;
+bool save_presets(std::string* err);  // defined in the presets section below
+
+// The built-in default preset: a normal stored preset whose only privilege
+// is that it cannot be deleted. Materialized with an empty table (every
+// field follows the client) when the presets file doesn't carry it.
+const char* kDefaultPreset = "默认";
+
 // Checks a posted table and returns its canonical form (mode "client" and
 // null entries dropped, effort aliases resolved like the request path does).
 json validate_overrides(const json& in) {
@@ -1473,11 +1489,238 @@ void handle_overrides_post(const http::Request& q, http::Response* r, http::Stre
         g_overrides = table;
     }
     const bool saved = save_overrides(table, &err);
+    // Manual edits that diverge from the active preset drop its marker, so
+    // the UI never claims a preset is live when the table no longer matches.
+    bool clear_active = false;
+    {
+        std::lock_guard<std::mutex> lk(g_preset_mtx);
+        if (!g_presets_active.empty()) {
+            const json cur = g_presets.value(g_presets_active, json());
+            if (cur.is_null() || cur != table) {
+                g_presets_active.clear();
+                clear_active = true;
+            }
+        }
+    }
+    if (clear_active) {
+        std::string perr;
+        save_presets(&perr);  // best-effort; failure only loses the marker
+    }
     fprintf(stderr, "qwenox-api: overrides set by %s: %s%s\n", q.remote.c_str(),
             table.dump().c_str(), saved ? "" : (" (NOT persisted: " + err + ")").c_str());
     json j = overrides_state();
     j["saved"] = saved;
     if (!saved) j["save_error"] = err;
+    r->body = json_py::dumps(j, /*spaced=*/false);
+}
+
+// ------------------------------------------------------ sampling presets --
+// Named override tables persisted to g_cfg.presets_path so the operator can
+// switch scenarios (model / task) without re-editing every field. Applying a
+// preset copies its table into g_overrides (persisted via save_overrides), so
+// the request path is untouched; "active" is bookkeeping for the dashboard.
+// File format: {"active": <name|null>, "presets": {<name>: <override table>}}.
+
+// Preset names are labels inside the JSON file (never a path), so they only
+// need to be non-empty and reasonably short.
+std::string check_preset_name(const json& body) {
+    if (!body.contains("name") || !body["name"].is_string())
+        http::fail(400, "name must be a string");
+    const std::string name = body["name"].get<std::string>();
+    if (name.empty() || name.size() > 64)
+        http::fail(400, "name must be 1..64 characters");
+    return name;
+}
+
+bool save_presets(std::string* err) {
+    if (g_cfg.presets_path.empty()) return true;
+    json j;
+    {
+        std::lock_guard<std::mutex> lk(g_preset_mtx);
+        j["active"] = g_presets_active.empty() ? json(nullptr) : json(g_presets_active);
+        j["presets"] = g_presets;
+    }
+    const std::string tmp = g_cfg.presets_path + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        f << j.dump(2) << "\n";
+        if (!f.good()) {
+            *err = "cannot write " + tmp;
+            return false;
+        }
+    }
+#ifdef _WIN32
+    std::remove(g_cfg.presets_path.c_str());  // rename() does not replace on Windows
+#endif
+    if (std::rename(tmp.c_str(), g_cfg.presets_path.c_str()) != 0) {
+        *err = "cannot rename " + tmp + " -> " + g_cfg.presets_path;
+        return false;
+    }
+    return true;
+}
+
+void load_presets() {
+    json presets = json::object();
+    std::string active;
+    if (!g_cfg.presets_path.empty()) {
+        std::ifstream f(g_cfg.presets_path, std::ios::binary);
+        if (f) {  // no file yet: presets stays empty, the default is added below
+            try {
+                const json j = json::parse(f);
+                if (!j.is_object() || !j.contains("presets") || !j["presets"].is_object())
+                    http::fail(400, "expected {\"presets\": {...}}");
+                for (auto it = j["presets"].begin(); it != j["presets"].end(); ++it)
+                    presets[it.key()] = validate_overrides(it.value());
+                if (j.contains("active") && j["active"].is_string())
+                    active = j["active"].get<std::string>();
+                fprintf(stderr, "qwenox-api: presets from %s: %zu preset(s), active=%s\n",
+                        g_cfg.presets_path.c_str(), presets.size(),
+                        active.empty() ? "(none)" : active.c_str());
+            } catch (const http::Error& e) {
+                fprintf(stderr, "qwenox-api: ignoring %s: %s\n", g_cfg.presets_path.c_str(),
+                        e.message.c_str());
+                presets.clear();
+                active.clear();
+            } catch (const std::exception& e) {
+                fprintf(stderr, "qwenox-api: ignoring %s: %s\n", g_cfg.presets_path.c_str(),
+                        e.what());
+                presets.clear();
+                active.clear();
+            }
+        }
+    }
+    // The default preset is a normal stored preset (only undeletable). When
+    // the file doesn't carry it yet, seed it from the live override table —
+    // "默认" starts as whatever is in effect, never a surprising empty table.
+    // Must precede the active check so an active marker naming it stays valid.
+    if (!presets.contains(kDefaultPreset)) {
+        std::lock_guard<std::mutex> lk(g_ovr_mtx);
+        presets[kDefaultPreset] = g_overrides;
+    }
+    if (!active.empty() && !presets.contains(active)) active.clear();  // dangling marker
+    {
+        std::lock_guard<std::mutex> lk(g_preset_mtx);
+        g_presets = presets;
+        g_presets_active = active;
+    }
+}
+
+json presets_state() {
+    json j;
+    {
+        std::lock_guard<std::mutex> lk(g_preset_mtx);
+        j["presets"] = g_presets;
+        j["active"] = g_presets_active.empty() ? json(nullptr) : json(g_presets_active);
+    }
+    j["persist_path"] = g_cfg.presets_path;
+    j["admin_key_required"] = !g_cfg.admin_key.empty();
+    return j;
+}
+
+// Shared tail of the preset write endpoints: persist, log, state response.
+json presets_finish(const http::Request& q, const char* what, const std::string& name) {
+    std::string err;
+    const bool saved = save_presets(&err);
+    fprintf(stderr, "qwenox-api: preset %s '%s' by %s%s\n", what, name.c_str(),
+            q.remote.c_str(), saved ? "" : (" (NOT persisted: " + err + ")").c_str());
+    json j = presets_state();
+    j["saved"] = saved;
+    if (!saved) j["save_error"] = err;
+    return j;
+}
+
+// GET /admin/presets
+void handle_presets_get(const http::Request&, http::Response* r, http::Stream*) {
+    r->set("Cache-Control", "no-store");
+    r->body = json_py::dumps(presets_state(), /*spaced=*/false);
+}
+
+// POST /admin/presets {name, table} — creates or replaces one preset. The
+// table goes through the same validation as a live overrides POST.
+void handle_presets_post(const http::Request& q, http::Response* r, http::Stream*) {
+    if (!admin_ok(q))
+        http::fail(401, "admin key required (Authorization: Bearer <key> or X-Admin-Key)");
+    const json body = parse_body(q);
+    const std::string name = check_preset_name(body);
+    if (!body.contains("table")) http::fail(400, "table is required");
+    const json table = validate_overrides(body["table"]);
+    {
+        std::lock_guard<std::mutex> lk(g_preset_mtx);
+        g_presets[name] = table;
+        // Overwriting the active preset with different content diverges it
+        // from the live table: drop the marker rather than claim the preset
+        // is live with content it no longer has.
+        if (g_presets_active == name) {
+            std::lock_guard<std::mutex> lk2(g_ovr_mtx);
+            if (g_overrides != table) g_presets_active.clear();
+        }
+    }
+    r->body = json_py::dumps(presets_finish(q, "saved", name), /*spaced=*/false);
+}
+
+// POST /admin/presets/delete {name} — removes the preset; the live override
+// table is NOT touched (deleting a preset does not un-apply it).
+void handle_presets_delete(const http::Request& q, http::Response* r, http::Stream*) {
+    if (!admin_ok(q))
+        http::fail(401, "admin key required (Authorization: Bearer <key> or X-Admin-Key)");
+    const json body = parse_body(q);
+    const std::string name = check_preset_name(body);
+    if (name == kDefaultPreset)
+        http::fail(400, "the built-in default preset cannot be deleted");
+    {
+        std::lock_guard<std::mutex> lk(g_preset_mtx);
+        if (!g_presets.erase(name)) http::fail(404, "no such preset: " + name);
+        if (g_presets_active == name) g_presets_active.clear();
+    }
+    r->body = json_py::dumps(presets_finish(q, "deleted", name), /*spaced=*/false);
+}
+
+// POST /admin/presets/apply {name, table?, save?} — without `table` the
+// stored preset becomes the live override table; with `table` the posted
+// (validated) table becomes live instead, so the dashboard can apply what
+// the user sees (a preview, possibly tweaked). With "save": true the posted
+// table is also stored as the preset's content: the dashboard treats the
+// form as the selected preset's editor, so the preset tracks what the user
+// saved. The preset is marked active only when the live table matches its
+// stored content. Persisted like a manual POST /admin/overrides.
+void handle_presets_apply(const http::Request& q, http::Response* r, http::Stream*) {
+    if (!admin_ok(q))
+        http::fail(401, "admin key required (Authorization: Bearer <key> or X-Admin-Key)");
+    const json body = parse_body(q);
+    const std::string name = check_preset_name(body);
+    const bool save_preset = body.contains("save") && body["save"].is_boolean() &&
+                             body["save"].get<bool>();
+    json table;
+    {
+        std::lock_guard<std::mutex> lk(g_preset_mtx);
+        const auto it = g_presets.find(name);
+        if (it == g_presets.end()) http::fail(404, "no such preset: " + name);
+        if (!body.contains("table")) table = it.value();
+    }
+    if (body.contains("table"))
+        table = validate_overrides(body["table"]);
+    {
+        std::lock_guard<std::mutex> lk(g_ovr_mtx);
+        g_overrides = table;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_preset_mtx);
+        if (save_preset) g_presets[name] = table;
+        const json stored = g_presets.value(name, json());
+        g_presets_active = (!stored.is_null() && stored == table) ? name : "";
+    }
+    std::string oerr, perr;
+    const bool osaved = save_overrides(table, &oerr);
+    const bool psaved = save_presets(&perr);
+    fprintf(stderr, "qwenox-api: preset '%s' applied%s by %s: %s%s%s\n", name.c_str(),
+            save_preset ? " (preset updated)" : "", q.remote.c_str(), table.dump().c_str(),
+            osaved ? "" : (" (overrides NOT persisted: " + oerr + ")").c_str(),
+            psaved ? "" : (" (presets NOT persisted: " + perr + ")").c_str());
+    json j = presets_state();
+    j["saved"] = osaved && psaved;
+    if (!osaved) j["save_error"] = oerr;
+    else if (!psaved) j["save_error"] = perr;
+    j["applied"] = overrides_state();  // lets the dashboard repaint the table
     r->body = json_py::dumps(j, /*spaced=*/false);
 }
 
@@ -5237,6 +5480,7 @@ int main(int argc, char** argv) {
             g_tcache.set_save_interval(std::atoi(s));
     }
     load_overrides();
+    load_presets();
 
     std::string err;
     // 词表缺失不再是致命错误：独立运行时控制台、配置与引擎管理照常可用，
@@ -5308,6 +5552,10 @@ int main(int argc, char** argv) {
     srv.on("GET", "/reqstat/page", handle_reqstat_page);
     srv.on("GET", "/admin/overrides", handle_overrides_get);
     srv.on("POST", "/admin/overrides", handle_overrides_post);
+    srv.on("GET", "/admin/presets", handle_presets_get);
+    srv.on("POST", "/admin/presets", handle_presets_post);
+    srv.on("POST", "/admin/presets/delete", handle_presets_delete);
+    srv.on("POST", "/admin/presets/apply", handle_presets_apply);
     srv.on("GET", "/admin/config", handle_config_get);
     srv.on("POST", "/admin/config", handle_config_post);
     srv.on("GET", "/admin/files", handle_admin_files);
