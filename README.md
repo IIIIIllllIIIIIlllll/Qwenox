@@ -172,7 +172,8 @@ bash start_hgn.sh    # 用 hgn 权重启动
 bash start_gguf.sh   # 或用 GGUF 权重启动
 ```
 
-不想直接编辑 `service.conf` 时，可以运行 `./qwenox-settings` 使用跨平台终端设置界面；也可以只运行
+不想直接编辑 `service.conf` 时，可以运行 `./qwenox-settings` 使用跨平台终端设置界面（中英双语，
+第 6 页「语言」切换）；也可以只运行
 `bash build.sh settings` 单独编译它。按键和检查范围见 [SETTINGS-TUI.md](docs/SETTINGS-TUI.md)。
 
 两个启动器只是读的权重不同：先加载引擎，就绪后再启动 API。它们在前台运行，Ctrl+C 同时停止两者；

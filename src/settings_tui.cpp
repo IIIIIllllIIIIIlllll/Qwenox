@@ -3,6 +3,9 @@
 //
 // 终端层不依赖 ncurses：POSIX 使用 termios，Windows 使用 Console API + VT。
 // 配置层复用 service_conf.h，保留未知键、注释、环境变量覆盖和 .bak 备份语义。
+// 界面中英双语：TR(中文, English) 就地双语，第 6 页「语言」切换（立即生效并写
+// lang 标记）；解析优先级 lang 标记 > UI_LANG > 系统界面语言，与 Windows 设置
+// 面板/托盘（settings_panel.inc / tray_win.cpp）共享同一标记。
 #include "service_conf.h"
 
 #include <algorithm>
@@ -41,6 +44,38 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr const char* kWeightsMarker = "# start_win: weights=";
+constexpr const char* kLangMarker = "# start_win: lang=";
+
+// 界面语言：中英双语，与 Windows 设置面板/托盘（settings_panel.inc / tray_win.cpp）
+// 共享同一个 service.conf 注释标记 "# start_win: lang=zh|en"。文案处用 TR(中文, English)
+// 就地双语。解析优先级：lang 标记 > UI_LANG 环境变量 > 系统界面语言
+//（Windows 取 GetUserDefaultUILanguage；POSIX 没有 UI 语言 API，用 locale 变量近似）。
+bool g_lang_en = false;
+#define TR(zh, en) (g_lang_en ? (en) : (zh))
+
+bool lang_name_is(const char* s, const char* want) {
+    return s && std::strlen(s) == 2 &&
+           std::tolower(static_cast<unsigned char>(s[0])) == want[0] &&
+           std::tolower(static_cast<unsigned char>(s[1])) == want[1];
+}
+
+void lang_resolve(const std::string& conf_path) {
+    const std::string marker = svcconf::conf_marker(conf_path, kLangMarker);
+    if (lang_name_is(marker.c_str(), "en")) { g_lang_en = true; return; }
+    if (lang_name_is(marker.c_str(), "zh")) { g_lang_en = false; return; }
+    if (const char* env = std::getenv("UI_LANG")) {
+        if (lang_name_is(env, "en")) { g_lang_en = true; return; }
+        if (lang_name_is(env, "zh")) { g_lang_en = false; return; }
+    }
+#ifdef _WIN32
+    g_lang_en = PRIMARYLANGID(GetUserDefaultUILanguage()) != LANG_CHINESE;
+#else
+    const char* locale = std::getenv("LANGUAGE");
+    if (!locale || !*locale) locale = std::getenv("LC_ALL");
+    if (!locale || !*locale) locale = std::getenv("LANG");
+    g_lang_en = !(locale && std::strstr(locale, "zh"));
+#endif
+}
 
 std::string path_text(const fs::path& p) { return p.u8string(); }
 
@@ -245,7 +280,8 @@ public:
         out_ = GetStdHandle(STD_OUTPUT_HANDLE);
         if (in_ == INVALID_HANDLE_VALUE || out_ == INVALID_HANDLE_VALUE ||
             !GetConsoleMode(in_, &old_in_) || !GetConsoleMode(out_, &old_out_)) {
-            *error = "需要 Windows 控制台（Windows Terminal / PowerShell / CMD；Git Bash 可用 winpty）";
+            *error = TR("需要 Windows 控制台（Windows Terminal / PowerShell / CMD；Git Bash 可用 winpty）",
+                        "A Windows console is required (Windows Terminal / PowerShell / CMD; use winpty from Git Bash)");
             return false;
         }
         old_out_cp_ = GetConsoleOutputCP();
@@ -258,17 +294,19 @@ public:
                         ENABLE_WINDOW_INPUT | ENABLE_EXTENDED_FLAGS;
         if (!SetConsoleMode(in_, in_mode) ||
             !SetConsoleMode(out_, old_out_ | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
-            *error = "无法启用控制台 VT 模式，请使用 Windows 10 或更新版本";
+            *error = TR("无法启用控制台 VT 模式，请使用 Windows 10 或更新版本",
+                        "Could not enable console VT mode; Windows 10 or newer is required");
             close();
             return false;
         }
 #else
         if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
-            *error = "交互模式需要终端；脚本中请使用 --check";
+            *error = TR("交互模式需要终端；脚本中请使用 --check",
+                        "Interactive mode needs a terminal; use --check from scripts");
             return false;
         }
         if (tcgetattr(STDIN_FILENO, &old_term_) != 0) {
-            *error = "无法读取终端状态";
+            *error = TR("无法读取终端状态", "Could not read terminal state");
             return false;
         }
         termios raw = old_term_;
@@ -277,7 +315,7 @@ public:
         raw.c_cc[VMIN] = 0;
         raw.c_cc[VTIME] = 0;
         if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) != 0) {
-            *error = "无法切换终端输入模式";
+            *error = TR("无法切换终端输入模式", "Could not switch terminal input mode");
             return false;
         }
         active_ = true;
@@ -490,64 +528,139 @@ enum class FieldGroup { kAlways, kHgn, kV1, kV2, kGguf };
 struct Option {
     const char* value;
     const char* label;
+    const char* label_en = nullptr;
+    // 当前语言的选项名；语言中立的选项（如 "hgn v1"）不写英文，回退到 label。
+    const char* text() const { return g_lang_en && label_en ? label_en : label; }
 };
 struct Field {
     int page;
     const char* key;
     const char* label;
     const char* hint;
+    const char* label_en;
+    const char* hint_en;
     FieldKind kind;
     FieldGroup group;
     std::vector<Option> options;
+    // 表是 static 的，语言切换后不能重建；访问器按 g_lang_en 现场取值。
+    const char* label_text() const { return g_lang_en && label_en ? label_en : label; }
+    const char* hint_text() const { return g_lang_en && hint_en ? hint_en : hint; }
 };
 
 const std::vector<Field>& field_specs() {
     static const std::vector<Field> fields = {
-        {0, "#WEIGHTS", "权重格式", "V1：内嵌 n-gram；V2：独立 n-gram；GGUF：使用 GGUF 主分片", FieldKind::kChoice, FieldGroup::kAlways,
+        {0, "#WEIGHTS", "权重格式", "V1：内嵌 n-gram；V2：独立 n-gram；GGUF：使用 GGUF 主分片",
+         "Weight format", "V1: embedded n-gram; V2: separate n-gram; GGUF: use the GGUF main shard",
+         FieldKind::kChoice, FieldGroup::kAlways,
          {{"v1", "hgn v1"}, {"v2", "hgn v2"}, {"gguf", "GGUF"}}},
-        {0, "MODEL_FILE", "主模型", "hgn 主权重文件", FieldKind::kText, FieldGroup::kHgn, {}},
-        {0, "NGRAM_FILE", "n-gram 表", "V2 必须是与主模型不同的独立文件", FieldKind::kText, FieldGroup::kV2, {}},
-        {0, "OVERLAY_FILE", "overlay", "V1 可选；留空表示不使用", FieldKind::kText, FieldGroup::kV1, {}},
-        {0, "MTP_FILE", "MTP 草稿", "留空表示不使用独立 MTP 草稿文件", FieldKind::kText, FieldGroup::kHgn, {}},
-        {0, "VISION_FILE", "视觉塔", "留空表示纯文本服务", FieldKind::kText, FieldGroup::kHgn, {}},
-        {0, "GGUF_FILE", "GGUF 主分片", "多分片模型填写 -00001-of-XXXXX.gguf", FieldKind::kText, FieldGroup::kGguf, {}},
-        {0, "GGUF_MTP_FILE", "GGUF MTP", "留空表示不使用 MTP sidecar", FieldKind::kText, FieldGroup::kGguf, {}},
-        {0, "GGUF_VISION_FILE", "GGUF 视觉塔", "留空表示纯文本服务", FieldKind::kText, FieldGroup::kGguf, {}},
-        {0, "GGUF_I4R_PATCH", "i4r 补丁 [Linux]", "可选 .hgn 专家补丁；留空表示不使用", FieldKind::kText, FieldGroup::kGguf, {}},
-        {0, "TOKENIZER_DIR", "tokenizer 目录", "目录中必须有 tokenizer.json", FieldKind::kText, FieldGroup::kAlways, {}},
+        {0, "MODEL_FILE", "主模型", "hgn 主权重文件",
+         "Main model", "Main hgn weights file", FieldKind::kText, FieldGroup::kHgn, {}},
+        {0, "NGRAM_FILE", "n-gram 表", "V2 必须是与主模型不同的独立文件",
+         "n-gram table", "V2 requires a separate file, different from the main model",
+         FieldKind::kText, FieldGroup::kV2, {}},
+        {0, "OVERLAY_FILE", "overlay", "V1 可选；留空表示不使用",
+         "Overlay", "Optional for V1; leave empty to disable", FieldKind::kText, FieldGroup::kV1, {}},
+        {0, "MTP_FILE", "MTP 草稿", "留空表示不使用独立 MTP 草稿文件",
+         "MTP draft", "Leave empty to not use a separate MTP draft file",
+         FieldKind::kText, FieldGroup::kHgn, {}},
+        {0, "VISION_FILE", "视觉塔", "留空表示纯文本服务",
+         "Vision tower", "Leave empty for text-only serving", FieldKind::kText, FieldGroup::kHgn, {}},
+        {0, "GGUF_FILE", "GGUF 主分片", "多分片模型填写 -00001-of-XXXXX.gguf",
+         "GGUF main shard", "For multi-shard models use the -00001-of-XXXXX.gguf file",
+         FieldKind::kText, FieldGroup::kGguf, {}},
+        {0, "GGUF_MTP_FILE", "GGUF MTP", "留空表示不使用 MTP sidecar",
+         "GGUF MTP", "Leave empty to not use an MTP sidecar", FieldKind::kText, FieldGroup::kGguf, {}},
+        {0, "GGUF_VISION_FILE", "GGUF 视觉塔", "留空表示纯文本服务",
+         "GGUF vision tower", "Leave empty for text-only serving",
+         FieldKind::kText, FieldGroup::kGguf, {}},
+        {0, "GGUF_I4R_PATCH", "i4r 补丁 [Linux]", "可选 .hgn 专家补丁；留空表示不使用",
+         "i4r patch [Linux]", "Optional .hgn expert patch; leave empty to disable",
+         FieldKind::kText, FieldGroup::kGguf, {}},
+        {0, "TOKENIZER_DIR", "tokenizer 目录", "目录中必须有 tokenizer.json",
+         "Tokenizer dir", "The directory must contain tokenizer.json",
+         FieldKind::kText, FieldGroup::kAlways, {}},
 
-        {1, "MAX_CONTEXT", "单请求上下文", "输入与输出合计 token 上限", FieldKind::kText, FieldGroup::kAlways, {}},
-        {1, "PARALLEL", "并发路数", "1–8；大于 1 时必须启用分页 KV", FieldKind::kText, FieldGroup::kAlways, {}},
-        {1, "KV_POOL_TOKENS", "并发 KV 总池", "0 表示跟随单请求上下文；小于它时 Linux 也按单请求上限计算", FieldKind::kText, FieldGroup::kAlways, {}},
-        {1, "KV_PAGED", "分页 KV", "并发模式必须开启", FieldKind::kBool, FieldGroup::kAlways, {}},
-        {1, "PREFILL_CHUNK", "prefill 分段", "0：Linux 默认 16384，Windows 默认 6144", FieldKind::kText, FieldGroup::kAlways, {}},
-        {1, "CONC_PREFILL_CHUNK", "并发分段 [Linux]", "0 表示不另设；实际值不会超过 PREFILL_CHUNK", FieldKind::kText, FieldGroup::kAlways, {}},
-        {1, "QSA_INDEXER_BUDGET", "QSA 检索预算", "0 使用默认 2048；4096 会增加 prefill 开销", FieldKind::kChoice, FieldGroup::kAlways,
-         {{"0", "0（默认 2048）"}, {"4096", "4096"}}},
-        {1, "ROPE_FACTOR", "YaRN 倍数", "1 为关闭；超过原生上下文时按扩展倍数设置", FieldKind::kText, FieldGroup::kAlways, {}},
-        {1, "MOE_A4", "prefill 4-bit", "仅 hgn v2 / i4r 补丁路径有效；生成 decode 不经过此路径", FieldKind::kChoice, FieldGroup::kAlways,
-         {{"0", "0（关闭）"}, {"1", "1（gate/up）"}, {"2", "2（down）"}, {"3", "3（两者）"}}},
-        {1, "MTP_GAMMA", "MTP gamma", "0 自动；1–8 固定草稿长度", FieldKind::kText, FieldGroup::kAlways, {}},
-        {1, "MAX_IMAGES", "单请求图片上限", "1–256，按整个 messages 历史累计", FieldKind::kText, FieldGroup::kAlways, {}},
+        {1, "MAX_CONTEXT", "单请求上下文", "输入与输出合计 token 上限",
+         "Context/request", "Max tokens (input + output) per request",
+         FieldKind::kText, FieldGroup::kAlways, {}},
+        {1, "PARALLEL", "并发路数", "1–8；大于 1 时必须启用分页 KV",
+         "Parallel slots", "1-8; values above 1 require paged KV", FieldKind::kText, FieldGroup::kAlways, {}},
+        {1, "KV_POOL_TOKENS", "并发 KV 总池", "0 表示跟随单请求上下文；小于它时 Linux 也按单请求上限计算",
+         "KV pool tokens", "0 = follow the per-request context; smaller values still count as the per-request limit on Linux",
+         FieldKind::kText, FieldGroup::kAlways, {}},
+        {1, "KV_PAGED", "分页 KV", "并发模式必须开启",
+         "Paged KV", "Required for parallel mode", FieldKind::kBool, FieldGroup::kAlways, {}},
+        {1, "PREFILL_CHUNK", "prefill 分段", "0：Linux 默认 16384，Windows 默认 6144",
+         "Prefill chunk", "0: Linux default 16384, Windows default 6144",
+         FieldKind::kText, FieldGroup::kAlways, {}},
+        {1, "CONC_PREFILL_CHUNK", "并发分段 [Linux]", "0 表示不另设；实际值不会超过 PREFILL_CHUNK",
+         "Concurrent chunk [Linux]", "0 = not set separately; the effective value never exceeds PREFILL_CHUNK",
+         FieldKind::kText, FieldGroup::kAlways, {}},
+        {1, "QSA_INDEXER_BUDGET", "QSA 检索预算", "0 使用默认 2048；4096 会增加 prefill 开销",
+         "QSA indexer budget", "0 = default 2048; 4096 adds prefill cost",
+         FieldKind::kChoice, FieldGroup::kAlways,
+         {{"0", "0（默认 2048）", "0 (default 2048)"}, {"4096", "4096"}}},
+        {1, "ROPE_FACTOR", "YaRN 倍数", "1 为关闭；超过原生上下文时按扩展倍数设置",
+         "YaRN factor", "1 = off; set to the extension factor beyond the native context",
+         FieldKind::kText, FieldGroup::kAlways, {}},
+        {1, "MOE_A4", "prefill 4-bit", "仅 hgn v2 / i4r 补丁路径有效；生成 decode 不经过此路径",
+         "Prefill 4-bit", "Only affects hgn v2 / i4r patch paths; decode never uses it",
+         FieldKind::kChoice, FieldGroup::kAlways,
+         {{"0", "0（关闭）", "0 (off)"}, {"1", "1（gate/up）", "1 (gate/up)"},
+          {"2", "2（down）", "2 (down)"}, {"3", "3（两者）", "3 (both)"}}},
+        {1, "MTP_GAMMA", "MTP gamma", "0 自动；1–8 固定草稿长度",
+         "MTP gamma", "0 = auto; 1-8 fixes the draft length", FieldKind::kText, FieldGroup::kAlways, {}},
+        {1, "MAX_IMAGES", "单请求图片上限", "1–256，按整个 messages 历史累计",
+         "Max images/request", "1-256, counted across the whole messages history",
+         FieldKind::kText, FieldGroup::kAlways, {}},
 
-        {2, "KVSNAP_MAX_GB", "SSD 快照上限 GiB", "0 表示关闭；超过上限按 LRU 逐出", FieldKind::kText, FieldGroup::kAlways, {}},
-        {2, "KVSNAP_DIR", "SSD 快照目录", "留空使用 data/kvsnap；否则使用其 qwenox-kvsnap 子目录", FieldKind::kText, FieldGroup::kAlways, {}},
-        {2, "RCKPT_MAX", "RAM 检查点 [Linux]", "0 表示关闭；每个约 118 MiB", FieldKind::kText, FieldGroup::kAlways, {}},
-        {2, "PLE_URING", "PLE io_uring [Linux]", "使用 io_uring 批量读取磁盘分页 n-gram 表", FieldKind::kBool, FieldGroup::kAlways, {}},
-        {2, "MEMORY_CAP_GB", "进程内存 cap [Linux]", "启动器传给 run_capped.sh 的内存上限", FieldKind::kText, FieldGroup::kAlways, {}},
-        {2, "MIN_AVAILABLE_GB", "最低可用内存 [Linux]", "可用内存低于此值时启动器拒绝启动", FieldKind::kText, FieldGroup::kAlways, {}},
-        {2, "START_TIMEOUT", "启动超时秒 [Linux]", "等待引擎进入监听状态的总时间", FieldKind::kText, FieldGroup::kAlways, {}},
-        {2, "STALL_TIMEOUT", "加载停滞秒 [Linux]", "加载进度停滞超过此时间则拒绝继续等待", FieldKind::kText, FieldGroup::kAlways, {}},
-        {2, "AFFINITY", "CPU 亲和性 [Windows]", "空、lower-half、upper-half 或非零整数 mask；Linux 请用 taskset", FieldKind::kText, FieldGroup::kAlways, {}},
+        {2, "KVSNAP_MAX_GB", "SSD 快照上限 GiB", "0 表示关闭；超过上限按 LRU 逐出",
+         "SSD snapshot cap GiB", "0 = off; entries are evicted LRU past the cap",
+         FieldKind::kText, FieldGroup::kAlways, {}},
+        {2, "KVSNAP_DIR", "SSD 快照目录", "留空使用 data/kvsnap；否则使用其 qwenox-kvsnap 子目录",
+         "SSD snapshot dir", "Empty = data/kvsnap; otherwise its qwenox-kvsnap subdirectory is used",
+         FieldKind::kText, FieldGroup::kAlways, {}},
+        {2, "RCKPT_MAX", "RAM 检查点 [Linux]", "0 表示关闭；每个约 118 MiB",
+         "RAM checkpoints [Linux]", "0 = off; about 118 MiB each", FieldKind::kText, FieldGroup::kAlways, {}},
+        {2, "PLE_URING", "PLE io_uring [Linux]", "使用 io_uring 批量读取磁盘分页 n-gram 表",
+         "PLE io_uring [Linux]", "Use io_uring to batch-read the disk-paged n-gram table",
+         FieldKind::kBool, FieldGroup::kAlways, {}},
+        {2, "MEMORY_CAP_GB", "进程内存 cap [Linux]", "启动器传给 run_capped.sh 的内存上限",
+         "Memory cap GB [Linux]", "Memory limit the launcher passes to run_capped.sh",
+         FieldKind::kText, FieldGroup::kAlways, {}},
+        {2, "MIN_AVAILABLE_GB", "最低可用内存 [Linux]", "可用内存低于此值时启动器拒绝启动",
+         "Min free memory [Linux]", "The launcher refuses to start below this much free memory",
+         FieldKind::kText, FieldGroup::kAlways, {}},
+        {2, "START_TIMEOUT", "启动超时秒 [Linux]", "等待引擎进入监听状态的总时间",
+         "Start timeout s [Linux]", "Total time to wait for the engine to start listening",
+         FieldKind::kText, FieldGroup::kAlways, {}},
+        {2, "STALL_TIMEOUT", "加载停滞秒 [Linux]", "加载进度停滞超过此时间则拒绝继续等待",
+         "Load stall s [Linux]", "Give up waiting if load progress stalls for this long",
+         FieldKind::kText, FieldGroup::kAlways, {}},
+        {2, "AFFINITY", "CPU 亲和性 [Windows]", "空、lower-half、upper-half 或非零整数 mask；Linux 请用 taskset",
+         "CPU affinity [Windows]", "Empty, lower-half, upper-half, or a nonzero integer mask; on Linux use taskset",
+         FieldKind::kText, FieldGroup::kAlways, {}},
 
-        {3, "ENGINE_HOST", "引擎监听地址", "内部行协议，推荐 127.0.0.1", FieldKind::kText, FieldGroup::kAlways, {}},
-        {3, "ENGINE_PORT", "引擎端口", "1–65535，且不能与 API 端口相同", FieldKind::kText, FieldGroup::kAlways, {}},
-        {3, "API_HOST", "API 监听地址", "127.0.0.1 仅本机；0.0.0.0 对外开放", FieldKind::kText, FieldGroup::kAlways, {}},
-        {3, "API_PORT", "API 端口", "浏览器和客户端连接此端口", FieldKind::kText, FieldGroup::kAlways, {}},
-        {3, "VIZ", "运行时可视化", "可访问 API 的人能看到生成内容；decode 略有开销", FieldKind::kBool, FieldGroup::kAlways, {}},
-        {3, "REQLOG", "完整请求日志", "完整保存提示词和回复，注意隐私与磁盘占用", FieldKind::kBool, FieldGroup::kAlways, {}},
-        {3, "REQLOG_DIR", "请求日志目录", "留空保存为 logs/reqlog", FieldKind::kText, FieldGroup::kAlways, {}},
-        {3, "REQLOG_LEVEL", "请求日志级别", "1–10", FieldKind::kText, FieldGroup::kAlways, {}},
+        {3, "ENGINE_HOST", "引擎监听地址", "内部行协议，推荐 127.0.0.1",
+         "Engine listen addr", "Internal line protocol; 127.0.0.1 recommended",
+         FieldKind::kText, FieldGroup::kAlways, {}},
+        {3, "ENGINE_PORT", "引擎端口", "1–65535，且不能与 API 端口相同",
+         "Engine port", "1-65535; must differ from the API port", FieldKind::kText, FieldGroup::kAlways, {}},
+        {3, "API_HOST", "API 监听地址", "127.0.0.1 仅本机；0.0.0.0 对外开放",
+         "API listen addr", "127.0.0.1 = local only; 0.0.0.0 = exposed to the LAN",
+         FieldKind::kText, FieldGroup::kAlways, {}},
+        {3, "API_PORT", "API 端口", "浏览器和客户端连接此端口",
+         "API port", "Browsers and clients connect to this port", FieldKind::kText, FieldGroup::kAlways, {}},
+        {3, "VIZ", "运行时可视化", "可访问 API 的人能看到生成内容；decode 略有开销",
+         "Runtime viz", "Anyone with API access can see generated content; slight decode cost",
+         FieldKind::kBool, FieldGroup::kAlways, {}},
+        {3, "REQLOG", "完整请求日志", "完整保存提示词和回复，注意隐私与磁盘占用",
+         "Full request log", "Stores full prompts and replies; mind privacy and disk usage",
+         FieldKind::kBool, FieldGroup::kAlways, {}},
+        {3, "REQLOG_DIR", "请求日志目录", "留空保存为 logs/reqlog",
+         "Request log dir", "Empty = logs/reqlog", FieldKind::kText, FieldGroup::kAlways, {}},
+        {3, "REQLOG_LEVEL", "请求日志级别", "1–10",
+         "Request log level", "1-10", FieldKind::kText, FieldGroup::kAlways, {}},
     };
     return fields;
 }
@@ -688,11 +801,12 @@ struct Check {
 };
 
 const char* level_text(Level level) {
+    // 英文 token 与 Windows 面板保持一致（settings_panel.inc）。
     switch (level) {
-        case Level::kFail: return "失败";
-        case Level::kWarn: return "警告";
-        case Level::kPass: return "通过";
-        default: return "提示";
+        case Level::kFail: return TR("失败", "FAIL");
+        case Level::kWarn: return TR("警告", "WARN");
+        case Level::kPass: return TR("通过", "PASS");
+        default: return TR("提示", "HINT");
     }
 }
 
@@ -802,15 +916,15 @@ std::vector<Check> validate(const Model& model) {
     auto check_file = [&](const char* label, const std::string& value, bool required,
                           bool warn_missing, const char* magic) {
         if (value.empty()) {
-            if (required) fail(std::string(label) + "：不能为空");
-            else hint(std::string(label) + "：未配置，将禁用对应功能");
+            if (required) fail(std::string(label) + TR("：不能为空", ": must not be empty"));
+            else hint(std::string(label) + TR("：未配置，将禁用对应功能", ": not set; the feature stays disabled"));
             return;
         }
         std::error_code ec;
         const fs::path p = model.resolve(value);
         if (!fs::is_regular_file(p, ec)) {
-            if (warn_missing) warn(std::string(label) + "：文件不存在，启动器将跳过：" + value);
-            else fail(std::string(label) + "：文件不存在：" + value);
+            if (warn_missing) warn(std::string(label) + TR("：文件不存在，启动器将跳过：", ": file not found, the launcher will skip it: ") + value);
+            else fail(std::string(label) + TR("：文件不存在：", ": file not found: ") + value);
             return;
         }
         if (magic) {
@@ -819,59 +933,63 @@ std::vector<Check> validate(const Model& model) {
             const size_t n = f ? std::fread(got, 1, 4, f) : 0;
             if (f) std::fclose(f);
             if (n != 4 || std::memcmp(got, magic, 4) != 0) {
-                fail(std::string(label) + "：文件 magic 不是 " + magic + "：" + value);
+                fail(std::string(label) + TR("：文件 magic 不是 ", ": file magic is not ") + magic + TR("：", ": ") + value);
                 return;
             }
         }
-        add(Level::kPass, std::string(label) + "：" + value);
+        add(Level::kPass, std::string(label) + TR("：", ": ") + value);
     };
 
     const std::string ver = model.get("#WEIGHTS", "v2");
     if (ver == "gguf") {
-        check_file("GGUF 主分片", model.get("GGUF_FILE"), true, false, "GGUF");
-        check_file("GGUF MTP", model.get("GGUF_MTP_FILE"), false, false, "GGUF");
-        check_file("GGUF 视觉塔", model.get("GGUF_VISION_FILE"), false, false, "GGUF");
-        check_file("i4r 补丁", model.get("GGUF_I4R_PATCH"), false, false, "HGN1");
+        check_file(TR("GGUF 主分片", "GGUF main shard"), model.get("GGUF_FILE"), true, false, "GGUF");
+        check_file(TR("GGUF MTP", "GGUF MTP"), model.get("GGUF_MTP_FILE"), false, false, "GGUF");
+        check_file(TR("GGUF 视觉塔", "GGUF vision tower"), model.get("GGUF_VISION_FILE"), false, false, "GGUF");
+        check_file(TR("i4r 补丁", "i4r patch"), model.get("GGUF_I4R_PATCH"), false, false, "HGN1");
         if (model.get("GGUF_FILE").find("-00001-of-") != std::string::npos)
-            hint("GGUF 多分片：这里检查第 1 分片，其余分片须与它位于同一目录");
+            hint(TR("GGUF 多分片：这里检查第 1 分片，其余分片须与它位于同一目录",
+                    "GGUF multi-shard: only shard 1 is checked; the other shards must sit in the same directory"));
     } else {
-        check_file("主模型", model.get("MODEL_FILE"), true, false, "HGN1");
+        check_file(TR("主模型", "Main model"), model.get("MODEL_FILE"), true, false, "HGN1");
         if (ver == "v2") {
             const std::string model_file = model.get("MODEL_FILE");
             const std::string ngram = model.get("NGRAM_FILE");
             if (ngram.empty()) {
-                fail("n-gram 表：V2 必须填写独立文件");
+                fail(TR("n-gram 表：V2 必须填写独立文件", "n-gram table: V2 requires a separate file"));
             } else {
                 std::error_code ec1, ec2;
                 const fs::path a = model.resolve(model_file), b = model.resolve(ngram);
                 const bool same = fs::equivalent(a, b, ec1) ||
                                   (!ec1 && !ec2 && absolute_path(a) == absolute_path(b));
                 if (same || a.lexically_normal() == b.lexically_normal())
-                    fail("n-gram 表：V2 必须与主模型使用不同文件");
+                    fail(TR("n-gram 表：V2 必须与主模型使用不同文件",
+                            "n-gram table: V2 must use a file different from the main model"));
                 else
-                    check_file("n-gram 表", ngram, true, false, "HGN1");
+                    check_file(TR("n-gram 表", "n-gram table"), ngram, true, false, "HGN1");
             }
         } else {
-            hint("n-gram 表：V1 保存为 $MODEL_FILE，与主模型同文件");
+            hint(TR("n-gram 表：V1 保存为 $MODEL_FILE，与主模型同文件",
+                    "n-gram table: V1 saves it as $MODEL_FILE, the same file as the main model"));
             check_file("overlay", model.get("OVERLAY_FILE"), false, true, "HGN1");
         }
-        check_file("MTP 草稿", model.get("MTP_FILE"), false, false, "HGN1");
-        check_file("视觉塔", model.get("VISION_FILE"), false, false, "HGN1");
+        check_file(TR("MTP 草稿", "MTP draft"), model.get("MTP_FILE"), false, false, "HGN1");
+        check_file(TR("视觉塔", "Vision tower"), model.get("VISION_FILE"), false, false, "HGN1");
     }
     const std::string tok = model.get("TOKENIZER_DIR");
     std::error_code tok_ec;
     if (!fs::is_regular_file(model.resolve(join_path(tok, "tokenizer.json")), tok_ec))
-        fail("tokenizer：找不到 " + join_path(tok, "tokenizer.json"));
+        fail(TR("tokenizer：找不到 ", "tokenizer: cannot find ") + join_path(tok, "tokenizer.json"));
     else
-        add(Level::kPass, "tokenizer：" + join_path(tok, "tokenizer.json"));
+        add(Level::kPass, TR("tokenizer：", "tokenizer: ") + join_path(tok, "tokenizer.json"));
 
     std::map<std::string, long> nums;
     auto need_int = [&](const char* key, long lo, long hi) {
         long n = 0;
         const std::string value = model.get(key);
         if (!strict_int(value, &n) || n < lo || n > hi) {
-            fail(std::string(key) + " 必须是 " + std::to_string(lo) + "–" +
-                 std::to_string(hi) + " 的整数（当前为 \"" + value + "\"）");
+            fail(std::string(key) + TR(" 必须是 ", " must be an integer in [") + std::to_string(lo) +
+                 TR("–", "-") + std::to_string(hi) + TR(" 的整数（当前为 \"", "] (currently \"") +
+                 value + TR("\"）", "\")"));
             return false;
         }
         nums[key] = n;
@@ -894,20 +1012,22 @@ std::vector<Check> validate(const Model& model) {
     need_int("STALL_TIMEOUT", 1, 99999999);
     need_int("ROPE_ORIGINAL_CTX", 1, 1 << 30);
     if (model.get("QSA_INDEXER_BUDGET") != "0" && model.get("QSA_INDEXER_BUDGET") != "4096")
-        fail("QSA_INDEXER_BUDGET 只允许 0（默认 2048）或 4096");
+        fail(TR("QSA_INDEXER_BUDGET 只允许 0（默认 2048）或 4096",
+                "QSA_INDEXER_BUDGET only accepts 0 (default 2048) or 4096"));
     if (model.get("MOE_A4") < "0" || model.get("MOE_A4") > "3" || model.get("MOE_A4").size() != 1)
-        fail("MOE_A4 只允许 0、1、2、3");
+        fail(TR("MOE_A4 只允许 0、1、2、3", "MOE_A4 only accepts 0, 1, 2 or 3"));
 
     double rope = 1, rope_fast = 32, rope_slow = 1, rope_attn = 0;
     if (!strict_double(model.get("ROPE_FACTOR"), &rope) || rope < 1)
-        fail("ROPE_FACTOR 必须是大于等于 1 的有限小数");
+        fail(TR("ROPE_FACTOR 必须是大于等于 1 的有限小数", "ROPE_FACTOR must be a finite number >= 1"));
     if (!strict_double(model.get("ROPE_BETA_FAST"), &rope_fast) || rope_fast <= 0)
-        fail("ROPE_BETA_FAST 必须大于 0");
+        fail(TR("ROPE_BETA_FAST 必须大于 0", "ROPE_BETA_FAST must be > 0"));
     if (!strict_double(model.get("ROPE_BETA_SLOW"), &rope_slow) || rope_slow <= 0)
-        fail("ROPE_BETA_SLOW 必须大于 0");
-    if (rope_fast < rope_slow) fail("ROPE_BETA_FAST 必须大于等于 ROPE_BETA_SLOW");
+        fail(TR("ROPE_BETA_SLOW 必须大于 0", "ROPE_BETA_SLOW must be > 0"));
+    if (rope_fast < rope_slow) fail(TR("ROPE_BETA_FAST 必须大于等于 ROPE_BETA_SLOW",
+                                       "ROPE_BETA_FAST must be >= ROPE_BETA_SLOW"));
     if (!strict_double(model.get("ROPE_ATTN_SCALE"), &rope_attn) || rope_attn < 0)
-        fail("ROPE_ATTN_SCALE 必须是非负有限小数");
+        fail(TR("ROPE_ATTN_SCALE 必须是非负有限小数", "ROPE_ATTN_SCALE must be a finite number >= 0"));
 
     const auto num = [&](const char* key, long fallback) {
         const auto it = nums.find(key);
@@ -918,53 +1038,64 @@ std::vector<Check> validate(const Model& model) {
     const long kv_paged = num("KV_PAGED", 1);
     const long kv_pool = num("KV_POOL_TOKENS", 0);
     const long rope_original = num("ROPE_ORIGINAL_CTX", 262144);
-    if (parallel > 1 && !kv_paged) fail("PARALLEL>1 需要 KV_PAGED=1");
+    if (parallel > 1 && !kv_paged) fail(TR("PARALLEL>1 需要 KV_PAGED=1", "PARALLEL>1 requires KV_PAGED=1"));
     if (rope > 1 && max_context > rope * rope_original)
-        fail("MAX_CONTEXT 超出 ROPE_FACTOR×ROPE_ORIGINAL_CTX 的 YaRN 上限");
+        fail(TR("MAX_CONTEXT 超出 ROPE_FACTOR×ROPE_ORIGINAL_CTX 的 YaRN 上限",
+                "MAX_CONTEXT exceeds the YaRN limit of ROPE_FACTOR*ROPE_ORIGINAL_CTX"));
     if (rope <= 1 && max_context > rope_original)
-        warn("未开启 YaRN 且 MAX_CONTEXT 超过原生上下文，超出部分的位置编码未验证");
+        warn(TR("未开启 YaRN 且 MAX_CONTEXT 超过原生上下文，超出部分的位置编码未验证",
+                "YaRN is off and MAX_CONTEXT exceeds the native context; positions beyond it are unverified"));
     const long effective_pool = std::max(max_context, kv_pool);
     if (kv_pool > 0 && kv_pool < max_context) {
 #ifdef _WIN32
-        fail("Windows 要求 KV_POOL_TOKENS=0 或不小于 MAX_CONTEXT");
+        fail(TR("Windows 要求 KV_POOL_TOKENS=0 或不小于 MAX_CONTEXT",
+                "Windows requires KV_POOL_TOKENS=0 or a value >= MAX_CONTEXT"));
 #else
-        hint("KV_POOL_TOKENS 小于 MAX_CONTEXT：Linux 按 MAX_CONTEXT 计算有效池");
+        hint(TR("KV_POOL_TOKENS 小于 MAX_CONTEXT：Linux 按 MAX_CONTEXT 计算有效池",
+                "KV_POOL_TOKENS < MAX_CONTEXT: Linux sizes the effective pool by MAX_CONTEXT"));
 #endif
     }
     if (effective_pool > 524288) {
 #ifdef _WIN32
-        fail("有效 KV 池超过 Windows 512K 上限");
+        fail(TR("有效 KV 池超过 Windows 512K 上限", "Effective KV pool exceeds the Windows 512K limit"));
 #else
-        warn("有效 KV 池超过 512K：Linux 可尝试，但这份配置不能直接用于 Windows");
+        warn(TR("有效 KV 池超过 512K：Linux 可尝试，但这份配置不能直接用于 Windows",
+                "Effective KV pool exceeds 512K: fine to try on Linux, but this config will not work on Windows"));
 #endif
     }
 
     const std::string affinity = model.get("AFFINITY");
     if (!affinity.empty() && !svcconf::parse_affinity(affinity))
-        fail("AFFINITY 必须为空、lower-half、upper-half 或非零整数 mask");
+        fail(TR("AFFINITY 必须为空、lower-half、upper-half 或非零整数 mask",
+                "AFFINITY must be empty, lower-half, upper-half, or a nonzero integer mask"));
 
-    if (!ipv4_address(model.get("ENGINE_HOST"))) fail("ENGINE_HOST 必须是 IPv4 点分地址");
-    if (!ipv4_address(model.get("API_HOST"))) fail("API_HOST 必须是 IPv4 点分地址");
+    if (!ipv4_address(model.get("ENGINE_HOST"))) fail(TR("ENGINE_HOST 必须是 IPv4 点分地址", "ENGINE_HOST must be a dotted IPv4 address"));
+    if (!ipv4_address(model.get("API_HOST"))) fail(TR("API_HOST 必须是 IPv4 点分地址", "API_HOST must be a dotted IPv4 address"));
     if (model.get("ENGINE_HOST") != "127.0.0.1" && ipv4_address(model.get("ENGINE_HOST")))
-        warn("ENGINE_HOST 非 127.0.0.1：内部行协议会暴露到网络");
+        warn(TR("ENGINE_HOST 非 127.0.0.1：内部行协议会暴露到网络",
+                "ENGINE_HOST is not 127.0.0.1: the internal line protocol is exposed to the network"));
     need_int("ENGINE_PORT", 1, 65535);
     need_int("API_PORT", 1, 65535);
     if (!model.get("REQLOG_LEVEL").empty()) need_int("REQLOG_LEVEL", 1, 10);
     need_int("VIZ", 0, 1);
     need_int("REQLOG", 0, 1);
-    if (num("ENGINE_PORT", 8730) == num("API_PORT", 8731)) fail("ENGINE_PORT 与 API_PORT 必须不同");
-    if (num("VIZ", 0)) warn("运行时可视化已开启：能访问 API 的人可以看到正在生成的内容");
-    if (num("REQLOG", 0)) warn("完整请求日志已开启：提示词与回复会写入磁盘");
+    if (num("ENGINE_PORT", 8730) == num("API_PORT", 8731)) fail(TR("ENGINE_PORT 与 API_PORT 必须不同", "ENGINE_PORT and API_PORT must differ"));
+    if (num("VIZ", 0)) warn(TR("运行时可视化已开启：能访问 API 的人可以看到正在生成的内容",
+                               "Runtime visualization is on: anyone with API access can watch generated content"));
+    if (num("REQLOG", 0)) warn(TR("完整请求日志已开启：提示词与回复会写入磁盘",
+                                  "Full request logging is on: prompts and replies are written to disk"));
 
     for (const auto& item : v) {
         if (item.first.empty() || item.first[0] == '#') continue;
         const char* env = std::getenv(item.first.c_str());
         if (env && *env)
-            warn(item.first + " 正被环境变量覆盖，文件中的修改对当前进程环境不生效");
+            warn(item.first + TR(" 正被环境变量覆盖，文件中的修改对当前进程环境不生效",
+                                 " is overridden by an environment variable; file edits have no effect in the current process environment"));
     }
     bool has_fail = false;
     for (const Check& c : out) has_fail = has_fail || c.level == Level::kFail;
-    if (!has_fail) add(Level::kPass, "静态配置校验完成；端口占用、运行库和实际内存请在启动前用启动器 --check 复核");
+    if (!has_fail) add(Level::kPass, TR("静态配置校验完成；端口占用、运行库和实际内存请在启动前用启动器 --check 复核",
+                                        "Static checks passed; re-check port availability, runtime libraries and actual memory with the launcher's --check before starting"));
     return out;
 }
 
@@ -984,7 +1115,7 @@ public:
         (void)conf_path;
         mutex_ = CreateMutexW(nullptr, TRUE, L"Local\\Qwenox-settings-tui");
         if (!mutex_ || GetLastError() == ERROR_ALREADY_EXISTS) {
-            *error = "另一个 qwenox-settings 已经打开";
+            *error = TR("另一个 qwenox-settings 已经打开", "Another qwenox-settings instance is already open");
             return false;
         }
 #else
@@ -992,7 +1123,8 @@ public:
         const fs::path lock = fs::temp_directory_path() / ("qwenox-settings-" + id + ".lock");
         fd_ = ::open(path_text(lock).c_str(), O_RDWR | O_CREAT, 0600);
         if (fd_ < 0 || flock(fd_, LOCK_EX | LOCK_NB) != 0) {
-            *error = "另一个 qwenox-settings 正在编辑这份配置";
+            *error = TR("另一个 qwenox-settings 正在编辑这份配置",
+                        "Another qwenox-settings instance is editing this config");
             return false;
         }
 #endif
@@ -1020,6 +1152,7 @@ private:
 class App {
 public:
     App(Model model, Terminal* term) : model_(std::move(model)), term_(term) {
+        lang_sel_ = g_lang_en ? 1 : 0;
         refresh_checks();
     }
 
@@ -1054,12 +1187,12 @@ private:
 
     std::string display_value(const Field& f) const {
         const std::string value = model_.get(f.key);
-        if (f.kind == FieldKind::kBool) return value == "1" ? "[x] 开启" : "[ ] 关闭";
+        if (f.kind == FieldKind::kBool) return value == "1" ? TR("[x] 开启", "[x] On") : TR("[ ] 关闭", "[ ] Off");
         if (f.kind == FieldKind::kChoice) {
             for (const Option& option : f.options)
-                if (value == option.value) return option.label;
+                if (value == option.value) return option.text();
         }
-        return value.empty() ? "(空)" : value;
+        return value.empty() ? TR("（空）", "(empty)") : value;
     }
 
     void refresh_checks() { checks_ = validate(model_); }
@@ -1119,9 +1252,9 @@ private:
         const int next = (completion_.selected + 1) % static_cast<int>(completion_.candidates.size());
         apply_completion(next);
         const PathCandidate& candidate = completion_.candidates[static_cast<size_t>(next)];
-        status_ = "候选 " + std::to_string(next + 1) + "/" +
-                  std::to_string(completion_.candidates.size()) + "：" + candidate.name +
-                  (candidate.directory ? "（目录）" : "");
+        status_ = TR("候选 ", "Candidate ") + std::to_string(next + 1) + "/" +
+                  std::to_string(completion_.candidates.size()) + TR("：", ": ") + candidate.name +
+                  (candidate.directory ? TR("（目录）", " (dir)") : "");
     }
 
     void complete_path(PathKind kind) {
@@ -1148,7 +1281,7 @@ private:
         std::error_code ec;
         fs::directory_iterator it(directory, ec), end;
         if (ec) {
-            status_ = "无法读取目录：" + path_text(directory);
+            status_ = TR("无法读取目录：", "Cannot read directory: ") + path_text(directory);
             return;
         }
         for (; it != end; it.increment(ec)) {
@@ -1168,7 +1301,8 @@ private:
 #endif
         });
         if (next.candidates.empty()) {
-            status_ = ec ? "读取目录时出错：" + path_text(directory) : "没有匹配的路径候选";
+            status_ = ec ? TR("读取目录时出错：", "Error reading directory: ") + path_text(directory)
+                         : TR("没有匹配的路径候选", "No matching path candidates");
             return;
         }
 
@@ -1182,17 +1316,19 @@ private:
             const PathCandidate candidate = completion_.candidates.front();
             apply_completion(0);
             completion_ = CompletionState{};
-            status_ = "已补全：" + candidate.name + (candidate.directory ? "（目录，可继续 Tab）" : "");
+            status_ = TR("已补全：", "Completed: ") + candidate.name +
+                      (candidate.directory ? TR("（目录，可继续 Tab）", " (dir, Tab again to descend)") : "");
             return;
         }
         if (common.size() > completion_.prefix.size()) {
             model_.values[edit_key_] = completion_.head + common + completion_.tail;
             edit_cursor_ = utf8_offsets(completion_.head + common).size() - 1;
             edit_scroll_ = 0;
-            status_ = "已补到公共前缀；Tab 循环候选，Enter 接受";
+            status_ = TR("已补到公共前缀；Tab 循环候选，Enter 接受",
+                         "Completed to common prefix; Tab cycles candidates, Enter accepts");
         } else {
             status_ = std::to_string(completion_.candidates.size()) +
-                      " 个候选；Tab 循环，Enter 接受";
+                      TR(" 个候选；Tab 循环，Enter 接受", " candidates; Tab cycles, Enter accepts");
         }
     }
 
@@ -1201,7 +1337,8 @@ private:
         const int w = size.first, h = size.second;
         std::string frame = "\x1b[H\x1b[0m\x1b[2J";
         if (w < 50 || h < 12) {
-            frame += "\x1b[H终端窗口太小，请至少调整为 50×12。\x1b[K";
+            frame += TR("\x1b[H终端窗口太小，请至少调整为 50×12。\x1b[K",
+                        "\x1b[HTerminal too small; please resize to at least 50x12.\x1b[K");
             term_->render(frame);
             return;
         }
@@ -1209,13 +1346,16 @@ private:
             frame += "\x1b[" + std::to_string(y + 1) + ";1H" + style + clip_text(text, w) +
                      "\x1b[0m\x1b[K";
         };
-        line(0, " Qwenox 跨平台设置  " + path_text(model_.conf_path), "\x1b[1;36m");
-        static const char* names[] = {"1 权重", "2 推理", "3 缓存/启动", "4 端口/日志", "5 检查"};
+        line(0, TR(" Qwenox 跨平台设置  ", " Qwenox Settings  ") + path_text(model_.conf_path), "\x1b[1;36m");
+        // 页签就地双语；英文用短名，保证 50 列最小宽度放得下 6 个页签。
+        static const char* names[][2] = {{"1 权重", "1 Model"},   {"2 推理", "2 Infer"},
+                                         {"3 缓存/启动", "3 Cache"}, {"4 端口/日志", "4 Ports"},
+                                         {"5 检查", "5 Check"},   {"6 语言", "6 Lang"}};
         std::string tabs;
-        for (int i = 0; i < 5; ++i) {
+        for (int i = 0; i < 6; ++i) {
             if (i == page_) tabs += " [";
             else tabs += "  ";
-            tabs += names[i];
+            tabs += TR(names[i][0], names[i][1]);
             tabs += i == page_ ? "] " : "  ";
         }
         line(1, tabs, "\x1b[1m");
@@ -1241,7 +1381,7 @@ private:
                     const bool selected = index == selected_[page_];
                     const int y = body_top + row;
                     const std::string prefix = selected ? "> " : "  ";
-                    line(y, prefix + pad_text(f.label, label_width), selected ? "\x1b[7m" : "");
+                    line(y, prefix + pad_text(f.label_text(), label_width), selected ? "\x1b[7m" : "");
                     const int value_x = 2 + label_width + 1;
                     const int value_width = std::max(4, w - value_x - 1);
                     std::string value = display_value(f);
@@ -1276,8 +1416,8 @@ private:
                 const int available = body_top + body_height - candidate_top;
                 if (available > 0) {
                     line(candidate_top,
-                         "  路径候选 " + std::to_string(completion_.candidates.size()) +
-                             " 个（Tab 循环，Enter 接受）",
+                         TR("  路径候选 ", "  Path candidates: ") + std::to_string(completion_.candidates.size()) +
+                             TR(" 个（Tab 循环，Enter 接受）", " (Tab cycles, Enter accepts)"),
                          "\x1b[36m");
                     const int rows = available - 1;
                     if (rows > 0) {
@@ -1306,16 +1446,17 @@ private:
             if (editing_ && completion_.active) {
                 if (completion_.selected >= 0) {
                     const PathCandidate& candidate = completion_.candidates[static_cast<size_t>(completion_.selected)];
-                    help = "Tab 下一候选；Enter 接受 " + candidate.name +
-                           (candidate.directory ? "（目录）" : "");
+                    help = TR("Tab 下一候选；Enter 接受 ", "Tab next candidate; Enter accepts ") + candidate.name +
+                           (candidate.directory ? TR("（目录）", " (dir)") : "");
                 } else {
-                    help = "Tab 循环候选；Enter 接受当前公共前缀并继续编辑";
+                    help = TR("Tab 循环候选；Enter 接受当前公共前缀并继续编辑",
+                              "Tab cycles candidates; Enter accepts the common prefix and keeps editing");
                 }
             } else {
-                help = f ? f->hint : "";
+                help = f ? f->hint_text() : "";
             }
             line(h - 4, help, "\x1b[2m");
-        } else {
+        } else if (page_ == 4) {
             std::vector<std::pair<Level, std::string>> rows;
             for (const Check& check : checks_) {
                 const std::string prefix = std::string("[") + level_text(check.level) + "] ";
@@ -1331,21 +1472,46 @@ private:
                                                                  : "\x1b[2m";
                 line(body_top + row, item.second, color);
             }
-            line(h - 4, "环境覆盖、文件格式和平台差异在此汇总；保存前请处理失败项。", "\x1b[2m");
+            line(h - 4, TR("环境覆盖、文件格式和平台差异在此汇总；保存前请处理失败项。",
+                           "Environment overrides, file formats and platform differences are summarized here; resolve failures before saving."),
+                 "\x1b[2m");
+        } else {
+            // 语言页：中英界面切换，Enter/空格 应用后立即生效并写入 lang 标记，
+            // 不经过 F2 保存，也不触碰 dirty 与任何配置值。
+            static const char* kLangNames[] = {"中文", "English"};
+            for (int i = 0; i < 2; ++i) {
+                const bool current = (i == 1) == g_lang_en;
+                const bool selected = i == lang_sel_;
+                line(body_top + i,
+                     std::string(selected ? "> " : "  ") + (current ? "[x] " : "[ ] ") + kLangNames[i],
+                     selected ? "\x1b[7m" : "");
+            }
+            line(body_top + 3, TR("↑↓ 移动，Enter/空格 应用；选择立即生效，无需保存。",
+                                  "Up/Down to move, Enter/Space to apply; takes effect at once, no save needed."),
+                 "\x1b[2m");
+            line(h - 4, TR("写入 service.conf 的 \"# start_win: lang=\" 注释标记，Windows 设置面板/托盘读取同一标记。",
+                           "Stored as the \"# start_win: lang=\" comment marker in service.conf, shared with the Windows panel/tray."),
+                 "\x1b[2m");
         }
 
         if (confirm_ != Confirm::kNone) {
             std::string message = confirm_ == Confirm::kSaveErrors
-                                      ? "当前有 " + std::to_string(failure_count(checks_)) + " 个失败项，仍保存？ y=保存 / n=取消"
-                                      : "有未保存修改，确定退出并放弃？ y=退出 / n=继续编辑";
+                                      ? TR("当前有 ", "") + std::to_string(failure_count(checks_)) +
+                                            TR(" 个失败项，仍保存？ y=保存 / n=取消",
+                                               " failing checks; save anyway? y=save / n=cancel")
+                                      : TR("有未保存修改，确定退出并放弃？ y=退出 / n=继续编辑",
+                                           "Unsaved changes; quit and discard? y=quit / n=keep editing");
             line(h - 3, message, "\x1b[1;33m");
         } else {
-            const std::string state = dirty_ ? "● 未保存  " : "✓ 已保存  ";
+            const std::string state = dirty_ ? TR("● 未保存  ", "● Unsaved  ") : TR("✓ 已保存  ", "✓ Saved  ");
             line(h - 3, state + status_, dirty_ ? "\x1b[33m" : "\x1b[32m");
         }
-        line(h - 2, "↑↓选择  ←→/数字翻页  Enter编辑/切换  Tab下一项  F2/Ctrl+S保存  Esc退出", "\x1b[2m");
-        line(h - 1, editing_ ? "编辑中：路径按 Tab 补全/循环，Enter 接受/确认，←→移动，Ctrl+U清空，Esc取消"
-                             : "本工具只修改 service.conf；保存后重启服务生效，不启动引擎或 API。",
+        line(h - 2, TR("↑↓选择  ←→/数字翻页  Enter编辑/切换  Tab下一项  F2/Ctrl+S保存  Esc退出",
+                       "↑↓ select  ←→/1-6 pages  Enter edit/toggle  Tab next  F2/Ctrl+S save  Esc quit"), "\x1b[2m");
+        line(h - 1, editing_ ? TR("编辑中：路径按 Tab 补全/循环，Enter 接受/确认，←→移动，Ctrl+U清空，Esc取消",
+                                  "Editing: Tab completes/cycles paths, Enter accepts, ←→ move, Ctrl+U clears, Esc cancels")
+                             : TR("本工具只修改 service.conf；保存后重启服务生效，不启动引擎或 API。",
+                                  "Only service.conf is modified; restart the service after saving. The engine or API is never started."),
              "\x1b[2m");
         if (show_cursor)
             frame += "\x1b[" + std::to_string(cursor_y) + ";" + std::to_string(cursor_x) + "H\x1b[?25h";
@@ -1381,17 +1547,19 @@ private:
                 request_save();
                 return;
             case KeyType::kLeft:
-                page_ = (page_ + 4) % 5;
+                page_ = (page_ + 5) % 6;
                 return;
             case KeyType::kRight:
-                page_ = (page_ + 1) % 5;
+                page_ = (page_ + 1) % 6;
                 return;
             case KeyType::kUp:
                 if (page_ == 4) --check_scroll_;
+                else if (page_ == 5) { if (lang_sel_ > 0) --lang_sel_; }
                 else if (selected_[page_] > 0) --selected_[page_];
                 return;
             case KeyType::kDown:
                 if (page_ == 4) ++check_scroll_;
+                else if (page_ == 5) { if (lang_sel_ < 1) ++lang_sel_; }
                 else if (selected_[page_] + 1 < static_cast<int>(fields(page_).size())) ++selected_[page_];
                 return;
             case KeyType::kTab:
@@ -1404,13 +1572,19 @@ private:
                                        static_cast<int>(fields(page_).size());
                 return;
             case KeyType::kEnter:
+                if (page_ == 5) {
+                    apply_language();
+                    return;
+                }
                 activate();
                 return;
             case KeyType::kCharacter:
                 if (key.text == "q" || key.text == "Q") {
                     if (dirty_) confirm_ = Confirm::kQuitDirty;
                     else running_ = false;
-                } else if (key.text.size() == 1 && key.text[0] >= '1' && key.text[0] <= '5') {
+                } else if (page_ == 5 && key.text == " ") {
+                    apply_language();
+                } else if (key.text.size() == 1 && key.text[0] >= '1' && key.text[0] <= '6') {
                     page_ = key.text[0] - '1';
                 }
                 return;
@@ -1469,7 +1643,8 @@ private:
         if (key.type == KeyType::kEnter) {
             if (completion_.active) {
                 completion_ = CompletionState{};
-                status_ = "已接受补全；继续 Tab 可补下一级，Enter 确认字段";
+                status_ = TR("已接受补全；继续 Tab 可补下一级，Enter 确认字段",
+                             "Completion accepted; Tab again for the next level, Enter commits the field");
                 return;
             }
             commit_edit();
@@ -1539,15 +1714,29 @@ private:
         else save_now();
     }
 
+    // 语言页应用所选语言：立即切换界面语言并写入 lang 注释标记（与 Windows
+    // 面板同款即时落盘），不走 F2 保存流程，也不影响配置值与 dirty 标记。
+    void apply_language() {
+        const bool en = lang_sel_ == 1;
+        if (en == g_lang_en) {
+            status_ = TR("界面语言未变化", "UI language unchanged");
+            return;
+        }
+        g_lang_en = en;
+        svcconf::conf_write_marker(path_text(model_.conf_path), kLangMarker, en ? "en" : "zh");
+        status_ = TR("界面语言已切换并写入 lang 标记", "UI language switched and saved to the lang marker");
+    }
+
     void save_now() {
         std::string error;
         if (!svcconf::save_conf(path_text(model_.conf_path), model_.conf_values(), &error,
                                 kWeightsMarker, model_.get("#WEIGHTS", "v2"))) {
-            status_ = "保存失败：" + error;
+            status_ = TR("保存失败：", "Save failed: ") + error;
             return;
         }
         dirty_ = false;
-        status_ = "已写回配置并生成 .bak；重启服务后生效";
+        status_ = TR("已写回配置并生成 .bak；重启服务后生效",
+                     "Config written back with a .bak backup; restart the service to apply");
         refresh_checks();
     }
 
@@ -1557,6 +1746,7 @@ private:
     int selected_[4] = {};
     int top_[4] = {};
     int check_scroll_ = 0;
+    int lang_sel_ = 0;
     bool running_ = false;
     bool dirty_ = false;
     bool editing_ = false;
@@ -1569,12 +1759,19 @@ private:
 };
 
 void usage(const char* argv0) {
-    std::cout << "用法：" << argv0 << " [--conf PATH] [--check]\n"
-              << "  --conf PATH  编辑指定 service.conf；相对路径按当前目录解析\n"
-              << "  --check      只做静态校验并打印结果，不进入 TUI、不写文件\n"
-              << "  -h, --help   显示帮助\n"
-              << "按键：↑↓选择，←→或数字 1–5 翻页，Enter 编辑/切换，F2/Ctrl+S 保存，Esc 退出。\n"
-              << "路径编辑：Tab 补全/循环候选，Enter 接受补全；再按 Enter 确认字段。\n";
+    std::cout << TR("用法：", "Usage: ") << argv0 << " [--conf PATH] [--check]\n"
+              << TR("  --conf PATH  编辑指定 service.conf；相对路径按当前目录解析\n",
+                    "  --conf PATH  Edit the given service.conf; relative paths resolve against the current directory\n")
+              << TR("  --check      只做静态校验并打印结果，不进入 TUI、不写文件\n",
+                    "  --check      Run static checks and print the results without entering the TUI or writing files\n")
+              << TR("  -h, --help   显示帮助\n",
+                    "  -h, --help   Show this help\n")
+              << TR("按键：↑↓选择，←→或数字 1–6 翻页，Enter 编辑/切换，F2/Ctrl+S 保存，Esc 退出。\n",
+                    "Keys: ↑↓ select, ←→ or digits 1-6 switch pages, Enter edit/toggle, F2/Ctrl+S save, Esc quit.\n")
+              << TR("路径编辑：Tab 补全/循环候选，Enter 接受补全；再按 Enter 确认字段。\n",
+                    "Path editing: Tab completes/cycles candidates, Enter accepts a completion; Enter again commits the field.\n")
+              << TR("界面语言：第 6 页「语言」切换中英界面；也可设 UI_LANG=zh|en 或 service.conf 的 \"# start_win: lang=\" 标记。\n",
+                    "UI language: page 6 (Language) switches between Chinese and English; UI_LANG=zh|en or the \"# start_win: lang=\" marker in service.conf also work.\n");
 }
 
 }  // namespace
@@ -1583,28 +1780,11 @@ int main(int argc, char** argv) {
 #ifndef _WIN32
     std::setlocale(LC_ALL, "");
 #endif
+    // 先粗扫一遍 --conf：界面语言的解析依赖 conf 路径，而帮助/报错文案也要随语言。
+    // 粗扫不报错（--conf 缺值等情况留给下面的正式参数循环处理）。
     fs::path conf;
-    bool check_only = false;
-    for (int i = 1; i < argc; ++i) {
-        const std::string arg = argv[i];
-        if (arg == "-h" || arg == "--help") {
-            usage(argv[0]);
-            return 0;
-        }
-        if (arg == "--check") {
-            check_only = true;
-        } else if (arg == "--conf") {
-            if (i + 1 >= argc) {
-                std::cerr << "错误：--conf 缺少路径\n";
-                return 2;
-            }
-            conf = argv[++i];
-        } else {
-            std::cerr << "错误：未知参数 " << arg << "\n";
-            usage(argv[0]);
-            return 2;
-        }
-    }
+    for (int i = 1; i + 1 < argc; ++i)
+        if (std::string(argv[i]) == "--conf") { conf = argv[i + 1]; break; }
 
     Model model;
     if (!conf.empty()) {
@@ -1620,6 +1800,29 @@ int main(int argc, char** argv) {
         model.root = root;
         model.conf_path = root / "service.conf";
     }
+    lang_resolve(path_text(model.conf_path));
+
+    bool check_only = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "-h" || arg == "--help") {
+            usage(argv[0]);
+            return 0;
+        }
+        if (arg == "--check") {
+            check_only = true;
+        } else if (arg == "--conf") {
+            if (i + 1 >= argc) {
+                std::cerr << TR("错误：--conf 缺少路径\n", "error: --conf requires a path\n");
+                return 2;
+            }
+            ++i;  // 路径已在上方粗扫时解析，这里只做校验
+        } else {
+            std::cerr << TR("错误：未知参数 ", "error: unknown argument ") << arg << "\n";
+            usage(argv[0]);
+            return 2;
+        }
+    }
     model.load();
 
     if (check_only) {
@@ -1632,12 +1835,12 @@ int main(int argc, char** argv) {
     std::string error;
     SingleInstance instance;
     if (!instance.acquire(model.conf_path, &error)) {
-        std::cerr << "错误：" << error << '\n';
+        std::cerr << TR("错误：", "error: ") << error << '\n';
         return 1;
     }
     Terminal terminal;
     if (!terminal.open(&error)) {
-        std::cerr << "错误：" << error << '\n';
+        std::cerr << TR("错误：", "error: ") << error << '\n';
         return 1;
     }
     App app(std::move(model), &terminal);

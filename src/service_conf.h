@@ -213,6 +213,41 @@ inline std::string conf_marker(const std::string& path, const char* prefix) {
     return trim(text.substr(b, e == std::string::npos ? std::string::npos : e - b));
 }
 
+// 写 "# <prefix><value>" 注释标记行：已有该前缀行则整行改写，否则追加到文件末尾。
+// 只动这一行注释，不触碰任何键值、其它注释，也不生成 .bak——供 UI 状态（如界面语言
+// lang 标记）即时落盘；与 save_conf 的 marker 参数同语义，之后的 save_conf 重写会
+// 通过注释透传保留它。
+inline void conf_write_marker(const std::string& path, const char* prefix,
+                              const std::string& value) {
+    std::string text;
+    read_text_file(path, &text);
+    std::string out;
+    bool written = false;
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        const size_t eol = text.find('\n', pos);
+        const bool last = eol == std::string::npos;
+        std::string line = text.substr(pos, last ? std::string::npos : eol - pos);
+        pos = last ? text.size() + 1 : eol + 1;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!written && line.compare(0, strlen(prefix), prefix) == 0) {
+            out += std::string(prefix) + value;
+            written = true;
+        } else {
+            out += line;
+        }
+        if (!last) out += '\n';
+    }
+    if (!written) {
+        if (!out.empty() && out.back() != '\n') out += '\n';
+        out += std::string(prefix) + value + "\n";
+    }
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) return;
+    fwrite(out.data(), 1, out.size(), f);
+    fclose(f);
+}
+
 // 写回 service.conf：注释/空行/未知键原样保留；已知键整行替换为
 // KEY="${KEY:-值}"（可选文件键为 KEY="${KEY-值}"），保持 bash 启动器兼容。
 // 键缺失时追加到文件末尾。写前备份为 <path>.bak。

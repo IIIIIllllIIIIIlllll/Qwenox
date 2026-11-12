@@ -184,7 +184,8 @@ bash start_hgn.sh    # start with hgn weights
 bash start_gguf.sh   # or with GGUF weights
 ```
 
-Run `./qwenox-settings` for the cross-platform terminal settings UI instead of editing `service.conf` directly.
+Run `./qwenox-settings` for the cross-platform terminal settings UI instead of editing `service.conf` directly —
+the UI is bilingual (Chinese/English; switch on page 6 "Language").
 `bash build.sh settings` builds just that tool. See [SETTINGS-TUI.md](docs/SETTINGS-TUI.md) for keys and check scope.
 
 The two launchers differ only in which weights they read: they load the engine, then start the API once it is
