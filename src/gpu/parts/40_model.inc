@@ -1772,10 +1772,8 @@ struct GpuModel {
         throw std::runtime_error("draft vocab: ids must be sorted, unique, in range");
     }
     const Tensor& lm = ckpt.at("lm_head.weight");
-    if (lm.dtype != 16) {  // 非 ht（v1/GGUF）：暂不支持，静默退回全词表
-      fprintf(stderr, "draft vocab: lm_head dtype %d is not ht; feature off\n",
-              (int)lm.dtype);
-      h_dv_ids.clear();
+    if (lm.dtype != 16) {  // 非 ht：行收集路径（GGUF 原生 / bf16 / q8g32），不重量化
+      setup_draft_vocab_gather(lm);
       return;
     }
     const Tensor& emb = ckpt.at("embed_tokens.weight");  // q4cp codebook 来源
@@ -1860,6 +1858,63 @@ struct GpuModel {
     n_dv = (int)n;
     fprintf(stderr, "draft vocab: %d ids (%.1f%% of vocab), q4cp table %.0f MiB\n",
             n_dv, 100.0 * n / g_cfg.vocab, total / 1048576.0);
+  }
+
+  // 非 ht lm_head 的 QDV1 变体：按 id 表从源表整行收集（字节原样，无重量化
+  // 误差）。支持 GGUF 原生（dtype 100+，行连续）、q8g32（dtype 8，codes 与
+  // scales 双平面各收一次）、bf16（dtype 0）。收集后 w_dv 走同 dtype 的既有
+  // gemv 路径（ggd_gemv / q8g32_gemv_small / k_bf16_gemv），draft argmax 后
+  // 经 k_dv_map 映回全局 id——与 ht+q4cp 版同一消费点。
+  void setup_draft_vocab_gather(const Tensor& lm) {
+    const int n = (int)h_dv_ids.size();
+    const uint64_t K = g_cfg.d;
+    const WView wlm = wview(lm);
+    uint64_t tbl = 0;
+    uint8_t* p = nullptr;
+    CK(hipMalloc(&d_dv_ids, (size_t)n * 4));
+    CK(hipMemcpy(d_dv_ids, h_dv_ids.data(), (size_t)n * 4, hipMemcpyHostToDevice));
+    const char* tname = "gguf-native";
+    if (ggd_dtype(lm.dtype) || lm.dtype == 0) {
+      const uint64_t rb =
+          ggd_dtype(lm.dtype) ? ggd::row_bytes(lm.dtype - ggd::kDtypeBase, K) : K * 2;
+      if (rb % 4) {
+        fprintf(stderr, "draft vocab: lm_head row bytes %llu not dword-aligned; off\n",
+                (unsigned long long)rb);
+        goto off;
+      }
+      tbl = (size_t)n * rb;
+      DALLOC(&p, tbl);
+      k_rows_gather32<<<(unsigned)(((size_t)n * (rb / 4) + 255) / 256), 256, 0, g_str>>>(
+          wlm.data, rb, d_dv_ids, p, n, rb / 4);
+      tname = ggd_dtype(lm.dtype) ? "gguf-native" : "bf16";
+    } else if (lm.dtype == 8) {  // q8g32：codes 平面 + scales 平面各收一次
+      const uint64_t sb = K / 32 * 2;
+      tbl = (size_t)n * (K + sb);
+      DALLOC(&p, tbl);
+      k_rows_gather32<<<(unsigned)(((size_t)n * (K / 4) + 255) / 256), 256, 0, g_str>>>(
+          wlm.data, K, d_dv_ids, p, n, K / 4);
+      k_rows_gather32<<<(unsigned)(((size_t)n * (sb / 4) + 255) / 256), 256, 0, g_str>>>(
+          wlm.data + wlm.rows * K, sb, d_dv_ids, p + (size_t)n * K, n, sb / 4);
+      tname = "q8g32";
+    } else {
+      fprintf(stderr, "draft vocab: lm_head dtype %d has no gather path; off\n",
+              (int)lm.dtype);
+      goto off;
+    }
+    CK(hipGetLastError());
+    w_dv.dtype = lm.dtype;
+    w_dv.data = p;
+    w_dv.rows = n;
+    w_dv.cols = K;
+    w_dv.scale_stride = 0;
+    n_dv = n;
+    fprintf(stderr, "draft vocab: %d ids (%.1f%% of vocab), gathered %s table %.0f MiB\n",
+            n_dv, 100.0 * n / g_cfg.vocab, tname, tbl / 1048576.0);
+    return;
+  off:
+    h_dv_ids.clear();
+    CK(hipFree(d_dv_ids));
+    d_dv_ids = nullptr;
   }
 
   // still use the production lm_head, so committed outputs are unchanged.
@@ -9349,7 +9404,9 @@ struct GpuModel {
     const WView& lw = wview(ckpt.at("lm_head.weight"));
     // QWENOX_DENSE_WMMA: k_ht_wmma takes all P <= 48 rows in one weight
     // stream (rows are independent, so == the 8-row groups bit for bit).
-    if (((lw.dtype == 16 && dense_wmma_on()) || (lw.dtype == 8 && dense_wmma_q8_on())) &&
+    // GGUF native lm_head does the same through k_ggd_wmma (QWENOX_GG_WMMA).
+    if (((lw.dtype == 16 && dense_wmma_on()) || (lw.dtype == 8 && dense_wmma_q8_on()) ||
+         (ggd_dtype(lw.dtype) && dense_wmma_gg_on())) &&
         gemv_multi_q4cp(lw, d_xb, d_logits_b, P, 2560))
       return;
     // The multi-row kernel is specialized for up to eight rows. Chunk larger
@@ -10267,9 +10324,11 @@ struct GpuModel {
       // 草稿突发结束后一次读回收链（只截 verify 行数，输出逐位不变）。
       const float gth = greedy_conf();
       float* d_conf = gth > 0.f ? conf_arr() : nullptr;
-      const int dvn_conf = draft_vocab > 0
-                               ? std::min(draft_vocab, g_cfg.vocab)
-                               : g_cfg.vocab;
+      // 置信度门控的口径跟随草稿实际打分范围：QDV1 子表只写了 n_dv 项。
+      const int dvn_conf = n_dv > 0 ? n_dv
+                                    : draft_vocab > 0
+                                          ? std::min(draft_vocab, g_cfg.vocab)
+                                          : g_cfg.vocab;
       if (draft_desync) {
         mtp_step(d_R, cur, nullptr, true, nullptr, d_argmax_arr);
         if (d_conf) top1_prob_enq(d_logits, dvn_conf, d_conf, g_str);
@@ -10749,11 +10808,13 @@ struct GpuModel {
         if (!dr_done) {
         // draft 1's indexer ring rows are truth; later drafts pollute them.
         // 置信度门控：同 spec_loop，逐步写 top-1 概率，突发结束一次读回。
+        // 口径跟随草稿实际打分范围：QDV1 子表只写了 n_dv 项。
         const float gth = greedy_conf();
         float* d_conf = gth > 0.f ? conf_arr() : nullptr;
-        const int dvn_conf = draft_vocab > 0
-                                 ? std::min(draft_vocab, g_cfg.vocab)
-                                 : g_cfg.vocab;
+        const int dvn_conf = n_dv > 0 ? n_dv
+                                      : draft_vocab > 0
+                                            ? std::min(draft_vocab, g_cfg.vocab)
+                                            : g_cfg.vocab;
         if (draft_desync) {
           mtp_step(d_R, cur, nullptr, true, nullptr, d_argmax_arr);
           if (d_conf) top1_prob_enq(d_logits, dvn_conf, d_conf, g_str);

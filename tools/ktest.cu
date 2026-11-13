@@ -1538,6 +1538,260 @@ int main() {
       }
     }
 
+    // GGUF 原生 dense（dtype 100+GGML type）：k_ggd_wmma 行不变审计（P=1 单行
+    // 参考 vs P=2..48 整批逐位一致）+ 与 chunked k_ggd_gemv 的数值接近度。
+    // 随机 bytes 对这些格式解码均合法，但块内 f16 头（d/dmin）必须写成正常
+    // 小值，否则随机出 NaN/Inf。形状覆盖生产族 + split-K（320x10240、48x2560）。
+    for (int xbf = 0; xbf <= 1; xbf++) {
+      const struct {
+        int t;
+        const char* nm;
+      } fmts[] = {{ggd::kQ4K, "q4k"}, {ggd::kQ5K, "q5k"}, {ggd::kQ6K, "q6k"},
+                  {ggd::kIQ4XS, "iq4xs"}, {ggd::kIQ4NL, "iq4nl"}};
+      const int shapes[][2] = {{512, 2560}, {640, 2560},  {2560, 6144}, {6144, 2560},
+                               {12288, 2560}, {320, 10240}, {48, 2560},   {10240, 2560}};
+      for (const auto& fmt : fmts) {
+        for (const auto& sh : shapes) {
+          const int R = sh[0], C = sh[1];
+          const int bb = fmt.t == ggd::kQ4K   ? 144
+                         : fmt.t == ggd::kQ5K ? 176
+                         : fmt.t == ggd::kQ6K ? 210
+                         : fmt.t == ggd::kIQ4XS ? 136
+                                              : 18;
+          const int cpb = fmt.t == ggd::kIQ4NL ? 32 : 256;
+          if (C % cpb) continue;
+          const uint64_t rb = ggd::row_bytes(fmt.t, C);
+          std::vector<uint8_t> wbuf((size_t)R * rb);
+          for (auto& v : wbuf) v = (uint8_t)rng();
+          const int nb = C / cpb;
+          for (int r = 0; r < R; r++)
+            for (int b = 0; b < nb; b++) {
+              uint8_t* bp = wbuf.data() + (size_t)r * rb + (size_t)b * bb;
+              __half hs = __float2half(0.004f + 0.002f * frand());
+              __half hm = __float2half(0.004f + 0.002f * frand());
+              if (fmt.t == ggd::kQ6K)
+                memcpy(bp + 208, &hs, 2);
+              else if (fmt.t == ggd::kQ4K || fmt.t == ggd::kQ5K) {
+                memcpy(bp, &hs, 2);
+                memcpy(bp + 2, &hm, 2);
+              } else
+                memcpy(bp, &hs, 2);
+            }
+          std::vector<float> xf((size_t)PMAX * C);
+          for (auto& v : xf) v = frand();
+          std::vector<uint16_t> xb(xf.size());
+          for (size_t i = 0; i < xb.size(); i++) xb[i] = bf16_bits(xf[i]);
+          uint8_t* dw = dup(wbuf);
+          float* dxf = dup(xf);
+          uint16_t* dxb = dup(xb);
+          float* dy = dalloc((size_t)PMAX * R);
+          float* dyg = dalloc((size_t)PMAX * R);
+          WView wv;
+          wv.dtype = ggd::kDtypeBase + fmt.t;
+          wv.data = dw;
+          wv.rows = R;
+          wv.cols = C;
+          wv.scale_stride = 0;
+          // 直接调 k_ggd_wmma（gemv_multi 的 maxp 闸在非会合环境只到 24）；
+          // 每次先填 sentinel，kernel 没跑会立刻暴露。
+          auto runP = [&](int P, int r0, float* y) {
+            TCK(hipMemset(y, 0xEE, (size_t)P * R * 4));
+            const void* xp = xbf ? (const void*)(dxb + (size_t)r0 * C)
+                                 : (const void*)(dxf + (size_t)r0 * C);
+            if (!ggd_wmma(wv, xp, xbf != 0, C, y, R, P, 0, R)) {
+              printf("  ri_ggd %s %dx%d: wmma refused P=%d\n", fmt.nm, R, C, P);
+              fails++;
+            }
+          };
+          char nm[80];
+          snprintf(nm, sizeof nm, "ggd_%s_%dx%d%s", fmt.nm, R, C, xbf ? "_bx" : "");
+          audit_full(nm, R, runP, dy);
+          // 分发路由抽查：gemv_multi(P=9) 必须与直调 P=9 逐位一致（证明走的是同一 kernel）
+          {
+            TCK(hipMemset(dy, 0xEE, (size_t)9 * R * 4));
+            TCK(hipMemset(dyg, 0xEE, (size_t)9 * R * 4));
+            const void* xp = xbf ? (const void*)dxb : (const void*)dxf;
+            const bool okd = gemv_multi_q4cp(wv, xp, dy, 9, C, xbf != 0);
+            const bool okw = ggd_wmma(wv, xp, xbf != 0, C, dyg, R, 9, 0, R);
+            if (!okd || !okw) {
+              printf("  ri_ggd_route %s: dispatch=%d wmma=%d\n", nm, (int)okd, (int)okw);
+              fails++;
+            } else {
+              std::vector<float> ya = dget(dy, (size_t)9 * R), yb = dget(dyg, (size_t)9 * R);
+              size_t m = 0;
+              for (size_t i = 0; i < ya.size(); i++) m += ya[i] != yb[i];
+              printf("  ri_ggd_route %-30s mism=%zu %s\n", nm, m, m ? "FAIL" : "ok");
+              if (m) fails++;
+            }
+          }
+          // CPU f64 参考锚定（本环境 GEMV kernel 惰性不跑，CPU 参考与实现无关）：
+          // 抽查 (p, r) 九个点：WMMA PMAX 整批输出 vs gguf::dequant_row + f64
+          // 点积。f16 x 舍入是唯一新误差源，阈值 rel 1e-2。dy 由 runP 预填哨兵，
+          // 有残留即 kernel 未写 → FAIL（同时证明上面的行不变审计非空转）。
+          {
+            runP(PMAX, 0, dy);
+            std::vector<float> ya = dget(dy, (size_t)PMAX * R);
+            const float SENT = [] {
+              uint32_t u = 0xEEEEEEEEu;
+              float f;
+              memcpy(&f, &u, 4);
+              return f;
+            }();
+            size_t sent = 0;
+            for (float v : ya) sent += v == SENT;
+            std::vector<float> wrow(C);
+            auto bf2f = [](uint16_t uu) {
+              uint32_t b = (uint32_t)uu << 16;
+              float f;
+              memcpy(&f, &b, 4);
+              return f;
+            };
+            double worst = 0;
+            int bad = 0;
+            for (int p : {0, 1, PMAX - 1})
+              for (int r : {0, R / 3, R - 1}) {
+                if (ya[(size_t)p * R + r] == SENT) continue;
+                gguf::dequant_row(fmt.t, wbuf.data() + (size_t)r * rb, wrow.data(), C);
+                double acc = 0;
+                for (int k = 0; k < C; k++) {
+                  // kernel 契约即"x 舍入到 f16"，CPU 参考同样先舍入
+                  const double xv0 = xbf ? (double)bf2f(xb[(size_t)p * C + k])
+                                         : (double)xf[(size_t)p * C + k];
+                  const double xv = (double)__half2float(__float2half((float)xv0));
+                  acc += (double)wrow[k] * xv;
+                }
+                const double rel =
+                    std::fabs(acc - (double)ya[(size_t)p * R + r]) / std::max(1.0, std::fabs(acc));
+                worst = std::max(worst, rel);
+                if (rel > 0.01) bad++;
+              }
+            printf("  ri_ggd_vs_cpu %-32s sentinel=%zu worstrel=%.4g %s\n", nm, sent, worst,
+                   (sent || bad) ? "FAIL" : "ok");
+            if (sent || bad) fails++;
+          }
+          TCK(hipFree(dw));
+          TCK(hipFree(dxf));
+          TCK(hipFree(dxb));
+          TCK(hipFree(dy));
+          TCK(hipFree(dyg));
+        }
+      }
+      // lm_head 本体形状（Q6_K 248320x2560，ggw RW=8 无 split-K 档）
+      {
+        const int R = 248320, C = 2560;
+        const uint64_t rb = ggd::row_bytes(ggd::kQ6K, C);
+        std::vector<uint8_t> wbuf((size_t)R * rb);
+        for (auto& v : wbuf) v = (uint8_t)rng();
+        for (int r = 0; r < R; r++)
+          for (int b = 0; b < C / 256; b++) {
+            __half hs = __float2half(0.004f + 0.002f * frand());
+            memcpy(wbuf.data() + (size_t)r * rb + b * 210 + 208, &hs, 2);
+          }
+        std::vector<float> xf((size_t)PMAX * C);
+        for (auto& v : xf) v = frand();
+        std::vector<uint16_t> xb(xf.size());
+        for (size_t i = 0; i < xb.size(); i++) xb[i] = bf16_bits(xf[i]);
+        uint8_t* dw = dup(wbuf);
+        float* dxf = dup(xf);
+        uint16_t* dxb = dup(xb);
+        float* dy = dalloc((size_t)PMAX * R);
+        WView wv;
+        wv.dtype = ggd::kDtypeBase + ggd::kQ6K;
+        wv.data = dw;
+        wv.rows = R;
+        wv.cols = C;
+        wv.scale_stride = 0;
+        auto runP = [&](int P, int r0, float* y) {
+          TCK(hipMemset(y, 0xEE, (size_t)P * R * 4));
+          const void* xp = xbf ? (const void*)(dxb + (size_t)r0 * C)
+                               : (const void*)(dxf + (size_t)r0 * C);
+          if (!ggd_wmma(wv, xp, xbf != 0, C, y, R, P, 0, R)) {
+            printf("  ri_ggd lm_head: wmma refused P=%d\n", P);
+            fails++;
+          }
+        };
+        audit_full("ggd_q6k_lmhead", R, runP, dy);
+        TCK(hipFree(dw));
+        TCK(hipFree(dxf));
+        TCK(hipFree(dxb));
+        TCK(hipFree(dy));
+      }
+    }
+
+    // KTEST_GGW_BENCH=1：k_ggd_gemv（chunked）vs k_ggd_wmma 分档墙钟计时。
+    // 权重字节/pass 相同，看的是单遍效率与 P>8 的遍数摊薄。
+    if (getenv("KTEST_GGW_BENCH")) {
+      struct {
+        int t;
+        const char* nm;
+        int R;
+        int C;
+      } bs[] = {{ggd::kIQ4XS, "iq4xs", 12288, 2560},
+                {ggd::kIQ4XS, "iq4xs", 2560, 6144},
+                {ggd::kIQ4XS, "iq4xs", 320, 10240},
+                {ggd::kQ6K, "q6k", 248320, 2560}};
+      for (auto& b : bs) {
+        const uint64_t rb = ggd::row_bytes(b.t, b.C);
+        std::vector<uint8_t> wbuf((size_t)b.R * rb);
+        for (auto& v : wbuf) v = (uint8_t)rng();
+        const int bb = b.t == ggd::kQ6K ? 210 : 136;
+        const int hboff = b.t == ggd::kQ6K ? 208 : 0;
+        for (int r = 0; r < b.R; r++)
+          for (int blk = 0; blk < b.C / 256; blk++) {
+            __half hs = __float2half(0.004f);
+            memcpy(wbuf.data() + (size_t)r * rb + blk * bb + hboff, &hs, 2);
+          }
+        std::vector<float> xf((size_t)48 * b.C, 0.01f);
+        uint8_t* dw = dup(wbuf);
+        float* dxf = dup(xf);
+        float* dy = dalloc((size_t)48 * b.R);
+        WView wv;
+        wv.dtype = ggd::kDtypeBase + b.t;
+        wv.data = dw;
+        wv.rows = b.R;
+        wv.cols = b.C;
+        wv.scale_stride = 0;
+        printf("ggw_bench %s %dx%d (%.1f MB/pass)\n", b.nm, b.R, b.C, b.R * rb / 1e6);
+        for (int P : {1, 5, 9, 24, 48}) {
+          const int iters = std::max(3, (int)(300e6 / ((double)b.R * rb)));
+          double best_g = 1e30, best_w = 1e30;
+          for (int rep = 0; rep < 2; rep++) {
+            // gemv
+            ggd_gemv(wv, dxf, false, b.C, dy, b.R, 1, 0, b.R);  // warm
+            CK(hipDeviceSynchronize());
+            auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < iters; i++) ggd_gemv(wv, dxf, false, b.C, dy, b.R, P, 0, b.R);
+            CK(hipDeviceSynchronize());
+            const double g = std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - t0)
+                                 .count() /
+                             iters;
+            best_g = std::min(best_g, g);
+            // wmma
+            ggd_wmma(wv, dxf, false, b.C, dy, b.R, 1, 0, b.R);  // warm
+            CK(hipDeviceSynchronize());
+            t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < iters; i++) ggd_wmma(wv, dxf, false, b.C, dy, b.R, P, 0, b.R);
+            CK(hipDeviceSynchronize());
+            const double wms = std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - t0)
+                                   .count() /
+                               iters;
+            best_w = std::min(best_w, wms);
+          }
+          const double gb = (double)b.R * rb / 1e9;
+          const int passes = (P + 7) / 8;
+          printf("  P=%-3d gemv %7.3f ms (%3d GB/s x%d)   wmma %7.3f ms (%3d GB/s)   wall "
+                 "%.2fx\n",
+                 P, best_g, (int)(gb * passes / (best_g / 1e3)), passes, best_w,
+                 (int)(gb / (best_w / 1e3)), best_g / best_w);
+        }
+        TCK(hipFree(dw));
+        TCK(hipFree(dxf));
+        TCK(hipFree(dy));
+      }
+    }
+
     // P>8 分块抽查（le8 内无 host 侧 P 参数，分块只是模板切换）：
     // q4cp {128x1024, 1x2560, 48x2560}（后两个是生产形状：shared_expert_gate
     // R=1 与 in_proj_a/b R=48）、q8g32 64x2560 float（lpr=16）、

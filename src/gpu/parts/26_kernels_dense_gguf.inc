@@ -410,3 +410,286 @@ __global__ void k_ggd_deq_bf16(const uint8_t* __restrict__ w, uint64_t rb,
 #pragma unroll
   for (int i = 0; i < 4; i++) dst[i] = ((const uint4*)o)[i];
 }
+
+// --- k_ggd_wmma: row-invariant WMMA GEMV for native GGUF dense, P = 1..48 ---
+// One pass over the weights for any P <= 48, replacing the chunked (<= 8 rows
+// per pass) k_ggd_gemv reads at verify / rendezvous widths. Same design as
+// k_q6g64_wmma (28_kernels_hgn_v2.inc): the WMMA multiplies only exact small
+// integer codes (int6/int4/IQ4 grid values, all exact in f16 via the 1024-bias
+// trick), scales are applied per 16-col (Q6_K) or 32-col group (others) in
+// f32 with fmaf, and the Q4_K/Q5_K min term uses the f32 group sum of the
+// ORIGINAL x (fixed 4-lane tree, LDS). x -> f16 is the only rounding. Every
+// output (p, r) reads x row p and weight row r only, and the wave layout
+// (RW x KW) / K slicing (gps) are functions of the FULL tensor shape, so one
+// output row is bit-identical for any P, any batch position and any row
+// slice aligned to 16*RW.
+// Block = 8 waves as RW (16-row tiles) x KW (interleaved quant blocks:
+// b = b0 + kw, b0 + kw + KW, ...); blockIdx.y = K slice of gps blocks; slice
+// partials are summed in s order by k_ggd_wred. WMMA operand layout matches
+// k_q6g64_wmma: A = x rows (lane's A row qrowA as in k_ht_wmma), B = weight
+// rows (lane c / 16+c: row c, each decodes 8 of the 16 cols, permlanex16
+// swap), C(r,c) = lane c + 16*(r>=8), elem r%8.
+namespace ggd {
+__device__ __forceinline__ void ldx8g(const float* x, float* o) {
+  const float4 a = *(const float4*)x, b = *(const float4*)(x + 4);
+  o[0] = a.x; o[1] = a.y; o[2] = a.z; o[3] = a.w;
+  o[4] = b.x; o[5] = b.y; o[6] = b.z; o[7] = b.w;
+}
+__device__ __forceinline__ void ldx8g(const uint16_t* x, float* o) {
+  const uint4 v = *(const uint4*)x;
+  const uint32_t u[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    o[2 * i] = __uint_as_float(u[i] << 16);
+    o[2 * i + 1] = __uint_as_float(u[i] & 0xffff0000u);
+  }
+}
+// 8 consecutive codes of one row as exact f16 pairs (4 u32), plus the f32
+// scale of this K-step's 16/32-col group (ds) and min term (dm, Q4_K/Q5_K).
+// blk = the row's quant block holding step ks (16 cols, 8 per lane half h).
+template <int T>
+__device__ __forceinline__ void ggw_step8(const uint8_t* __restrict__ blk, int ks, int h,
+                                          uint32_t own[4], float& ds, float& dm) {
+  if constexpr (T == kQ6K) {
+    const int u = ks >> 1, l0 = 16 * (ks & 1) + 8 * h;
+    const uint32_t* qlp = (const uint32_t*)(blk + 64 * (u >> 2) + 32 * (u & 1) + l0);
+    const uint32_t* qhp = (const uint32_t*)(blk + 128 + 32 * (u >> 2) + l0);
+    const uint32_t lw[2] = {qlp[0], qlp[1]}, hw[2] = {qhp[0], qhp[1]};
+    const int nib = 4 * ((u >> 1) & 1), qb = 2 * (u & 3);
+    const float d = h2f(*(const uint16_t*)(blk + 208));
+    const int scb = (int)*(const int8_t*)(blk + 192 + 8 * (u >> 2) + 2 * (u & 3) + (ks & 1));
+    ds = __fmul_rn(d, (float)scb);
+    const __half2 k1056 = __half2half2(__float2half(1056.f));
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      const uint32_t lb = lw[j >> 1] >> (16 * (j & 1)), hb = hw[j >> 1] >> (16 * (j & 1));
+      const uint32_t q0 = ((lb >> nib) & 0xFu) | ((((hb >> qb) & 3u)) << 4);
+      const uint32_t q1 = ((lb >> (nib + 8)) & 0xFu) | ((((hb >> (qb + 8)) & 3u)) << 4);
+      const uint32_t upk = (0x6400u | q0) | ((0x6400u | q1) << 16);
+      const __half2 hv = __hsub2(*(const __half2*)&upk, k1056);
+      own[j] = *(const uint32_t*)&hv;
+    }
+  } else if constexpr (T == kQ4K || T == kQ5K) {
+    const int u = ks >> 1, l0 = 16 * (ks & 1) + 8 * h;
+    const uint32_t* qlp = (const uint32_t*)(blk + (T == kQ5K ? 48 : 16) + 32 * (u >> 1) + l0);
+    const uint32_t lw[2] = {qlp[0], qlp[1]};
+    const int nib = 4 * (u & 1);
+    const float d = h2f(*(const uint16_t*)blk), dmn = h2f(*(const uint16_t*)(blk + 2));
+    const uint8_t* sc = blk + 4;
+    uint32_t s6, m6;
+    if (u < 4) {
+      s6 = sc[u] & 63;
+      m6 = sc[u + 4] & 63;
+    } else {
+      s6 = (sc[u + 4] & 0xF) | ((sc[u - 4] >> 6) << 4);
+      m6 = (sc[u + 4] >> 4) | ((sc[u] >> 6) << 4);
+    }
+    ds = __fmul_rn(d, (float)s6);
+    dm = __fmul_rn(dmn, (float)m6);
+    const __half2 k1024 = __half2half2(__float2half(1024.f));
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      const uint32_t lb = lw[j >> 1] >> (16 * (j & 1));
+      uint32_t q0 = (lb >> nib) & 0xFu, q1 = (lb >> (nib + 8)) & 0xFu;
+      if constexpr (T == kQ5K) {
+        const uint32_t* qhp = (const uint32_t*)(blk + 16 + l0);
+        const uint32_t hb = qhp[j >> 1] >> (16 * (j & 1));
+        q0 |= ((hb >> u) & 1u) << 4;
+        q1 |= ((hb >> (u + 8)) & 1u) << 4;
+      }
+      const uint32_t upk = (0x6400u | q0) | ((0x6400u | q1) << 16);
+      const __half2 hv = __hsub2(*(const __half2*)&upk, k1024);
+      own[j] = *(const uint32_t*)&hv;
+    }
+  } else {  // kIQ4XS / kIQ4NL: grid codes, per-32-col scale, no min
+    const int u = (T == kIQ4NL) ? 0 : (ks >> 1);
+    const int nib = 4 * (ks & 1);
+    float d0;
+    if constexpr (T == kIQ4XS) {
+      const float dd = h2f(*(const uint16_t*)blk);
+      const uint32_t sh = (uint32_t)*(const uint16_t*)(blk + 2);
+      const uint32_t sl = *(const uint32_t*)(blk + 4);
+      const int ls = ((sl >> (8 * (u >> 1) + 4 * (u & 1))) & 0xF) | (((sh >> (2 * u)) & 3) << 4);
+      d0 = __fmul_rn(dd, (float)(ls - 32));
+    } else {
+      d0 = h2f(*(const uint16_t*)blk);
+    }
+    ds = d0;
+    const __half2 k1152 = __half2half2(__float2half(1152.f));
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      uint32_t b0, b1;
+      if constexpr (T == kIQ4XS) {
+        const uint32_t* qp = (const uint32_t*)(blk + 8 + 16 * u + 8 * h);
+        const uint32_t qw = qp[j >> 1] >> (16 * (j & 1));
+        b0 = (qw >> nib) & 0xFu;
+        b1 = (qw >> (nib + 8)) & 0xFu;
+      } else {  // IQ4_NL rows are 2-byte aligned only: byte loads
+        const uint8_t* qp = blk + 2 + 8 * h + 2 * j;
+        b0 = (qp[0] >> nib) & 0xFu;
+        b1 = (qp[1] >> nib) & 0xFu;
+      }
+      const int g0 = (int)c_iq4nl_kv[b0] + 128, g1 = (int)c_iq4nl_kv[b1] + 128;
+      const uint32_t upk = (0x6400u | (uint32_t)g0) | ((0x6400u | (uint32_t)g1) << 16);
+      const __half2 hv = __hsub2(*(const __half2*)&upk, k1152);
+      own[j] = *(const uint32_t*)&hv;
+    }
+  }
+}
+}  // namespace ggd
+
+using moegg::v16h;
+using moegg::v8f;
+using moegg::wmma;
+
+template <int T, int NPT, int RW, int KW, typename TX>
+__global__ __launch_bounds__(256) void k_ggd_wmma(const uint8_t* __restrict__ w, uint64_t rb,
+                                                  const TX* __restrict__ x, uint64_t xs,
+                                                  float* __restrict__ y, uint64_t ys, int R,
+                                                  int C, int gps, int P) {
+  using namespace ggd;
+  static_assert(RW * KW == 8, "8 waves");
+  constexpr int BB = blk_bytes<T>();
+  constexpr int BPK = (T == kIQ4NL) ? 1 : 8;      // 32-col groups per quant block
+  constexpr int CPB = 32 * BPK;                   // cols per quant block
+  constexpr bool kBias = (T == kQ4K || T == kQ5K);
+  extern __shared__ float sxs[];                  // [p][gl] f32 32-col sums (kBias only)
+  __shared__ float red[8][16 * NPT][16];          // per-wave partial tiles
+  const int tid = threadIdx.x, lane = tid & 31, wf = tid >> 5;
+  const int rw = wf / KW, kw = wf % KW;
+  const int s = blockIdx.y;
+  const int nblk = C / CPB;
+  const int b0 = s * gps, b1 = min(nblk, b0 + gps);
+  const int nsl = (b1 - b0) * BPK;                // 32-col groups in this slice
+  const int n = lane & 15, h = lane >> 4;
+  const int r0 = (blockIdx.x * RW + rw) * 16;
+  const uint8_t* row = w + (size_t)(r0 + n) * rb;  // R % (16*RW) == 0 (host)
+  if constexpr (kBias) {
+    for (int i = tid; i < P * nsl * 4; i += 256) {
+      const int sub = i & 3, pg = i >> 2, p = pg / nsl, gl = pg - p * nsl;
+      float xv[8];
+      ldx8g(x + (size_t)p * xs + (size_t)(b0 * BPK + gl) * 32 + sub * 8, xv);
+      float t = ((xv[0] + xv[1]) + (xv[2] + xv[3])) + ((xv[4] + xv[5]) + (xv[6] + xv[7]));
+      t += __shfl_xor(t, 1, 4);
+      t += __shfl_xor(t, 2, 4);
+      if (sub == 0) sxs[p * nsl + gl] = t;
+    }
+  }
+  __syncthreads();
+  const int b_ = lane >> 1;
+  const int qrowA = (lane & 1) ? ((lane & 16) ? b_ : ((b_ + 4) & 7))
+                               : ((lane & 16) ? 8 + ((b_ + 4) & 7) : b_);
+  v8f acc[NPT];
+#pragma unroll
+  for (int i = 0; i < NPT; i++)
+#pragma unroll
+    for (int e = 0; e < 8; e++) acc[i][e] = 0.f;
+  for (int b = b0 + kw; b < b1; b += KW) {
+    const uint8_t* blk = row + (size_t)b * BB;
+#pragma unroll
+    for (int ks = 0; ks < 2 * BPK; ks++) {
+      uint32_t own[4];
+      float ds, dm = 0.f;
+      ggw_step8<T>(blk, ks, h, own, ds, dm);
+      uint32_t oth[4];
+#pragma unroll
+      for (int j = 0; j < 4; j++)
+        oth[j] = (uint32_t)__builtin_amdgcn_permlanex16((int)own[j], (int)own[j], 0x76543210,
+                                                        (int)0xfedcba98, false, false);
+      uint32_t bw[8];
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        bw[j] = h ? oth[j] : own[j];
+        bw[4 + j] = h ? own[j] : oth[j];
+      }
+      v16h bf;
+      memcpy(&bf, bw, 32);
+      const size_t c0 = (size_t)b * CPB + ks * 16;
+      v8f d[NPT];
+#pragma unroll
+      for (int pt = 0; pt < NPT; pt++) {
+        const int p = pt * 16 + qrowA;
+        uint32_t aw[8] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+        if (p < P) {
+          const TX* xp = x + (size_t)p * xs + c0;
+          float xv[16];
+          ldx8g(xp, xv);
+          ldx8g(xp + 8, xv + 8);
+#pragma unroll
+          for (int j = 0; j < 8; j++) {
+            const __half2 hv = __floats2half2_rn(xv[2 * j], xv[2 * j + 1]);
+            aw[j] = *(const uint32_t*)&hv;
+          }
+        }
+        v16h af;
+        memcpy(&af, aw, 32);
+#pragma unroll
+        for (int e = 0; e < 8; e++) d[pt][e] = 0.f;
+        d[pt] = wmma(af, bf, d[pt]);
+      }
+      if (T == kQ6K) {  // per-16-col scales: apply every step
+#pragma unroll
+        for (int pt = 0; pt < NPT; pt++)
+#pragma unroll
+          for (int e = 0; e < 8; e++) acc[pt][e] = fmaf(ds, d[pt][e], acc[pt][e]);
+      } else if (ks & 1) {  // per-32-col scales: apply after the 2nd step
+#pragma unroll
+        for (int pt = 0; pt < NPT; pt++)
+#pragma unroll
+          for (int e = 0; e < 8; e++) {
+            acc[pt][e] = fmaf(ds, d[pt][e], acc[pt][e]);
+            if constexpr (kBias) {
+              const int p = pt * 16 + h * 8 + e;
+              const float sxv = p < P ? sxs[p * nsl + (b - b0) * BPK + (ks >> 1)] : 0.f;
+              acc[pt][e] = fmaf(-dm, sxv, acc[pt][e]);
+            }
+          }
+      } else {  // carry the first half of the 32-col group
+#pragma unroll
+        for (int pt = 0; pt < NPT; pt++)
+#pragma unroll
+          for (int e = 0; e < 8; e++) acc[pt][e] = fmaf(ds, d[pt][e], acc[pt][e]);
+      }
+    }
+  }
+  __syncthreads();
+#pragma unroll
+  for (int pt = 0; pt < NPT; pt++)
+#pragma unroll
+    for (int e = 0; e < 8; e++) red[wf][pt * 16 + h * 8 + e][n] = acc[pt][e];
+  __syncthreads();
+  for (int i = tid; i < RW * P * 16; i += 256) {
+    const int nn = i & 15, rest = i >> 4, p = rest % P, rwi = rest / P;
+    float v = red[rwi * KW][p][nn];
+#pragma unroll
+    for (int k = 1; k < KW; k++) v += red[rwi * KW + k][p][nn];
+    const int r = (blockIdx.x * RW + rwi) * 16 + nn;
+    if (gridDim.y > 1)
+      y[((size_t)s * P + p) * R + r] = v;  // partial slices (host: out = g_ggw_part)
+    else
+      y[(size_t)p * ys + r] = v;
+  }
+}
+
+// split-K slices of k_ggd_wmma summed in s order (runtime P), as k_q6g64_wred
+__global__ void k_ggd_wred(const float* __restrict__ part, float* __restrict__ y, uint64_t ys,
+                           int R, int ns, int P) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= P * R) return;
+  const int p = i / R, r = i % R;
+  float v = part[(size_t)p * R + r];
+  for (int s = 1; s < ns; s++) v += part[((size_t)s * P + p) * R + r];
+  y[(size_t)p * ys + r] = v;
+}
+
+// Row gather (draft-vocab subset etc.): out[j] = src row ids[j], raw bytes.
+// One thread per 4-byte chunk; rb % 4 == 0 (host checks). ids ascending keeps
+// reads near-sequential; writes fully contiguous.
+__global__ void k_rows_gather32(const uint8_t* __restrict__ src, uint64_t rb,
+                                const int* __restrict__ ids, uint8_t* __restrict__ out,
+                                uint64_t n, uint64_t rb4) {
+  const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n * rb4) return;
+  const uint64_t j = i / rb4, c = i - j * rb4;
+  ((uint32_t*)out)[i] = ((const uint32_t*)(src + (uint64_t)ids[j] * rb))[c];
+}

@@ -1663,6 +1663,132 @@ static bool ggd_gemv2(const WView& a, const WView& b, const float* x, float* ya,
   });
   return true;
 }
+
+// --- GGUF native dense WMMA (k_ggd_wmma), row-invariant for P = 1..48 -------
+// One weight pass for any P <= 48 (the chunked <= 8-row GEMV re-reads the
+// weight ceil(P/8) times: verify gamma=8 twice, a 48-row rendezvous 6x). Same
+// contract as the hgn dense WMMA kernels: the kernel family serves decode
+// (P = 1), verify and rendezvous alike, so concurrent output matches
+// single-run bit for bit. QWENOX_GG_WMMA=0 keeps the chunked GEMV.
+float* g_ggw_part = nullptr;  // split-K partials, ns * 48 * rows floats
+static constexpr size_t kGgwPartFloats = (size_t)4 << 20;  // 16 MiB
+static bool dense_wmma_gg_on() {
+  static const bool v = [] {
+    const char* e = getenv("QWENOX_GG_WMMA");
+    const int mode = e && *e ? atoi(e) : 1;  // 1 = all P (default), 0 = off
+    const bool on = mode != 0;
+    if (on)
+      fprintf(stderr, "dense wmma: GGUF native GEMV P<=48 on k_ggd_wmma (QWENOX_GG_WMMA)\n");
+    return on;
+  }();
+  return v;
+}
+// Wave layout (RW x KW, 8 waves) and K slicing (gps quant blocks per slice)
+// from the FULL tensor shape only. RW is the largest of 8/4/2 keeping
+// R % (16*RW) == 0 with >= 32 row tiles (else 1); split-K then fills toward
+// QWENOX_GGW_BLOCKS (default 80) blocks. The Q4_K/Q5_K x group-sum LDS budget
+// (48 x 192 f32 max) caps the slice at 192 32-col groups.
+static bool ggw_config(int dtype, uint64_t rows, uint64_t cols, int& rw, int& gps, int& ns) {
+  const int t = dtype - ggd::kDtypeBase;
+  const int bpk = t == ggd::kIQ4NL ? 1 : 8;  // 32-col groups per quant block
+  if (t == ggd::kIQ4NL) {
+    if (cols % 32) return false;
+  } else if (cols % 256)
+    return false;
+  if (rows % 16) return false;
+  const int nblk = (int)(cols / (32 * bpk));
+  rw = 1;
+  for (int cand : {8, 4, 2})
+    if (rows % (16 * cand) == 0 && rows / (16 * cand) >= 32) {
+      rw = cand;
+      break;
+    }
+  const int tiles = (int)(rows / (16 * rw));
+  static const int target = [] {
+    const char* e = getenv("QWENOX_GGW_BLOCKS");
+    return e && *e ? std::max(1, atoi(e)) : 80;
+  }();
+  ns = 1;
+  if (tiles < target) ns = std::min((target + tiles - 1) / tiles, nblk);
+  gps = (nblk + ns - 1) / ns;
+  const int gcap = 192 / bpk;
+  if (gps > gcap) {
+    gps = gcap;
+    ns = (nblk + gps - 1) / gps;
+  }
+  if (ns > 1 && (size_t)ns * 48 * rows > kGgwPartFloats) return false;
+  return true;
+}
+static bool ggd_wmma(const WView& w, const void* x, bool xbf16, uint64_t xs, float* y,
+                     uint64_t ys, int P, uint64_t row_off, uint64_t nrows) {
+  static const bool dbg = getenv("QWENOX_GGW_DEBUG") != nullptr;
+  auto rej = [&](const char* why) {
+    if (dbg)
+      fprintf(stderr, "ggw refuse: %s dtype=%d R=%llu C=%llu P=%d row_off=%llu nrows=%llu\n",
+              why, w.dtype, (unsigned long long)w.rows, (unsigned long long)w.cols, P,
+              (unsigned long long)row_off, (unsigned long long)nrows);
+    return false;
+  };
+  if (P < 1 || P > 48 || !nrows || !ggd_dtype(w.dtype)) return rej("P/dtype");
+  int rw = 1, gps = 1, ns = 1;
+  if (!ggw_config(w.dtype, w.rows, w.cols, rw, gps, ns)) return rej("config");
+  // row slices keep the full-tensor per-element arithmetic only when the
+  // slice boundary falls on a wave-tile boundary
+  if (row_off % (uint64_t)(16 * rw) || nrows % (uint64_t)(16 * rw)) return rej("rowslice");
+  const int t = w.dtype - ggd::kDtypeBase;
+  const uint64_t rb = ggd::row_bytes(t, w.cols);
+  if (rb % 4 || !w.data) return rej("rb/data");
+  const uint8_t* wd = w.data + row_off * rb;
+  if (xs % (xbf16 ? 8 : 4) || (((uintptr_t)x | (uintptr_t)y) & 15)) return rej("align");
+  const int bpk = t == ggd::kIQ4NL ? 1 : 8;
+  const bool bias = t == ggd::kQ4K || t == ggd::kQ5K;
+  const size_t lds = bias ? (size_t)P * (gps * bpk) * 4 : 0;
+  if (lds > 48 * 192 * 4) return rej("lds");
+  if (ns > 1 && !g_ggw_part) CK(hipMalloc(&g_ggw_part, kGgwPartFloats * 4));
+  if (dbg) {
+    static int nlog = 0;
+    if (nlog++ < 12)
+      fprintf(stderr, "ggw accept: dtype=%d R=%llu C=%llu P=%d rw=%d gps=%d ns=%d\n",
+              w.dtype, (unsigned long long)w.rows, (unsigned long long)w.cols, P, rw, gps,
+              ns);
+  }
+  float* out = ns > 1 ? g_ggw_part : y;
+  const dim3 grid((unsigned)(nrows / (16 * rw)), (unsigned)ns);
+  const int R = (int)nrows, C = (int)w.cols;
+  ggd_with_type(t, [&](auto tc_) {
+    constexpr int T = decltype(tc_)::value;
+#define QWENOX_GGW(NPT, RW, KW)                                                             \
+  do {                                                                                      \
+    if (xbf16)                                                                              \
+      k_ggd_wmma<T, NPT, RW, KW, uint16_t><<<grid, 256, lds, g_str>>>(                      \
+          wd, rb, (const uint16_t*)x, xs, out, ys, R, C, gps, P);                           \
+    else                                                                                    \
+      k_ggd_wmma<T, NPT, RW, KW, float><<<grid, 256, lds, g_str>>>(                         \
+          wd, rb, (const float*)x, xs, out, ys, R, C, gps, P);                              \
+  } while (0)
+#define QWENOX_GGW_P(RW, KW)                                                                \
+  do {                                                                                      \
+    if (P <= 16)                                                                            \
+      QWENOX_GGW(1, RW, KW);                                                                \
+    else if (P <= 32)                                                                       \
+      QWENOX_GGW(2, RW, KW);                                                                \
+    else                                                                                    \
+      QWENOX_GGW(3, RW, KW);                                                                \
+  } while (0)
+    switch (rw) {
+      case 8: QWENOX_GGW_P(8, 1); break;
+      case 4: QWENOX_GGW_P(4, 2); break;
+      case 2: QWENOX_GGW_P(2, 4); break;
+      default: QWENOX_GGW_P(1, 8); break;
+    }
+#undef QWENOX_GGW
+#undef QWENOX_GGW_P
+  });
+  if (ns > 1)
+    k_ggd_wred<<<(unsigned)(((size_t)P * R + 255) / 256), 256, 0, g_str>>>(out, y, ys, R, ns,
+                                                                          P);
+  return true;
+}
 // D4: merge two independent GEMVs that share x and dtype/cols. Only the
 // native-GGUF path is fused today; everything else falls back (caller runs
 // the old two launches). QWENOX_GEMV_MERGE=0 disables.
@@ -1760,6 +1886,9 @@ static void gemv(const WView& w, const float* x, float* y, uint64_t row_off = 0,
     if (!(dense_wmma_hc_on() && q6g64_wmma(w, x, false, w.cols, y, 0, 1, row_off, rows)))
       q6g64_gemv(w, x, false, 0, y, 0, 1, row_off, rows);
   } else if (ggd_dtype(w.dtype)) {
+    // P = 1 decode/draft stays on the bandwidth-tuned GEMV (k_ggd_wmma at
+    // P = 1 is ~30% slower on the Q6_K lm_head; same split as q8g32). Verify
+    // rows (P >= 2) go through gemm -> gemv_multi_q4cp -> k_ggd_wmma.
     if (!ggd_gemv(w, x, false, w.cols, y, 0, 1, row_off, rows))
       throw std::runtime_error("gemv: GGUF native dense shape/alignment");
   } else {
@@ -2120,9 +2249,16 @@ static bool gemv_multi_q4cp(const WView& w, const void* x, float* y, int P,
   if (w.dtype == 8 && dense_wmma_q8_on() &&
       q8g32_wmma(w, x, xbf16, xstride, y, w.rows, P, 0, w.rows))
     return true;
-  // GGUF native dense: one kernel family for every P (<= 8-token passes), so
-  // batched rows are bit-identical to the P = 1 decode GEMV.
-  if (ggd_dtype(w.dtype)) return ggd_gemv(w, x, xbf16, xstride, y, w.rows, P, 0, w.rows);
+  // GGUF native dense: P >= 2 -> k_ggd_wmma (one weight pass, row-invariant
+  // across P and rendezvous widths); P = 1 keeps the P = 1 GEMV (faster there;
+  // same decode-vs-verify family split as q8g32). The GEMV fallback below is
+  // reachable only when the WMMA config refuses the shape outright (a
+  // shape-static decision, so the per-shape family choice stays consistent).
+  if (ggd_dtype(w.dtype)) {
+    if (P >= 2 && dense_wmma_gg_on() && ggd_wmma(w, x, xbf16, xstride, y, w.rows, P, 0, w.rows))
+      return true;
+    return ggd_gemv(w, x, xbf16, xstride, y, w.rows, P, 0, w.rows);
+  }
   if (P <= 8) return gemv_multi_q4cp_le8(w, x, y, P, xstride, xbf16);
   // P > 8: chunked passes of ≤ 8 rows re-read the weight per pass
   // (0.5-0.75 B/elem/pass vs ~4.5 B/elem for deq+WMMA, so the crossover is
