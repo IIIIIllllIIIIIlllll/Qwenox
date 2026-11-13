@@ -5054,7 +5054,8 @@ static std::string exe_dir() {
 // 致命退出：双击运行（独占控制台）时窗口会随进程关闭，暂停一下让错误可读。
 // 从终端运行（共享控制台）时不暂停；托盘模式（无控制台）弹 MessageBox。
 #ifdef _WIN32
-static bool g_tray_mode = true;       // 托盘模式（默认）；--console 时为 false
+static bool g_tray_mode = true;       // 托盘模式（默认）；--console / --no-tray 时为 false
+static bool g_headless = false;       // --no-tray：无托盘也无控制台（由 launcher 托管时用的纯服务模式）
 static std::string g_api_log_abs;     // 托盘模式 stdout/stderr 重定向的日志（绝对路径）
 
 // UTF-8 → UTF-16 的 MessageBox：A 版弹窗在非中文系统上中文会乱码
@@ -5200,10 +5201,17 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     // 预扫描 --console：本程序是 GUI 子系统，默认托盘模式（无控制台）；
     // --console 立即开控制台，让用法/错误输出可见。
-    for (int i = 1; i < argc; ++i)
-        if (std::strcmp(argv[i], "--console") == 0 || std::strcmp(argv[i], "--collect-diag") == 0)
+    // --no-tray：无托盘也无控制台（launcher_settings 托管 API 时的纯服务模式；
+    // 单实例锁与日志落盘保留），不开控制台。
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--console") == 0 || std::strcmp(argv[i], "--collect-diag") == 0) {
             g_tray_mode = false;
-    if (!g_tray_mode) console_open();
+        } else if (std::strcmp(argv[i], "--no-tray") == 0) {
+            g_tray_mode = false;
+            g_headless = true;
+        }
+    }
+    if (!g_tray_mode && !g_headless) console_open();
     if (!wsa_init()) {
         std::fprintf(stderr, "WSAStartup failed\n");
         return gexit(1);
@@ -5241,6 +5249,7 @@ int main(int argc, char** argv) {
         }
 #ifdef _WIN32
         else if (a == "--console") g_tray_mode = false;  // 已在 main 开头预扫描并开控制台
+        else if (a == "--no-tray") {}  // 同上（预扫描已处理：无托盘无控制台）
 #endif
         else {
             fprintf(stderr,
@@ -5250,7 +5259,7 @@ int main(int argc, char** argv) {
                     "       %s --collect-diag [--diag-engine-log F] [--diag-api-log F] "
                     "[--diag-reason TEXT] [--diag-pid N] [--diag-exit-code N]"
 #ifdef _WIN32
-                    " [--console]"
+                    " [--console] [--no-tray]"
 #endif
                     "\n",
                     argv[0], argv[0]);
@@ -5384,9 +5393,9 @@ int main(int argc, char** argv) {
         return 0;
     }
 #ifdef _WIN32
-    // 托盘模式没有控制台：stdout/stderr 重定向到 logs\api-win-<时间戳>.log。
+    // 托盘/无托盘服务模式都没有控制台：stdout/stderr 重定向到 logs\api-win-<时间戳>.log。
     // 放在 conf 探测之后：CWD 已是项目根，日志落在根的 logs\ 下。
-    if (g_tray_mode) {
+    if (g_tray_mode || g_headless) {
         // 防多开（--console 不受限：脚本场景由端口占用兜底）。必须在 listen 之前：
         // Windows 的 SO_REUSEADDR 允许后启动的实例抢绑同一端口。句柄不关，退出回收。
         CreateMutexW(nullptr, FALSE, L"Local\\Qwenox-api");
@@ -5486,7 +5495,32 @@ int main(int argc, char** argv) {
     // 词表缺失不再是致命错误：独立运行时控制台、配置与引擎管理照常可用，
     // 仅推理端点返回 503。TOKENIZER_DIR 指向的目录不可用时回退到仓库内置的
     // data/tokenizer（随项目分发的兜底词表）；显式 --tokenizer 失败则不回退。
-    g_tok_ready = g_tok.load(g_cfg.tokenizer_dir, &err);
+    // TOKENIZER_DIR 也可以直接指向一个 .gguf 文件：词表从 GGUF 元数据读。
+    {
+        const std::string& td = g_cfg.tokenizer_dir;
+        const bool is_gguf = td.size() > 5 && td.compare(td.size() - 5, 5, ".gguf") == 0;
+        g_tok_ready = is_gguf ? g_tok.load_gguf(td, &err) : g_tok.load(td, &err);
+    }
+    // GGUF 权重：词表内嵌在 GGUF 元数据（tokenizer.ggml.*）里，词表目录不可用时
+    // 直接从 GGUF_FILE 读（模型自带的词表永远比兜底词表更匹配）。即使显式给了
+    // --tokenizer 也兜底——加载失败时从模型权重读比直接 503 好。
+    if (!g_tok_ready &&
+        svcconf::conf_marker(g_conf_path, kWeightsMarker) == "gguf") {
+        const std::string gf = svcconf::cfg(g_svc_conf, "GGUF_FILE", "");
+        if (!gf.empty()) {
+            std::string err3;
+            if (g_tok.load_gguf(gf, &err3)) {
+                fprintf(stderr,
+                        "qwenox-api: tokenizer: loaded from GGUF metadata (%s)\n",
+                        gf.c_str());
+                g_tok_ready = true;
+            } else {
+                fprintf(stderr,
+                        "qwenox-api: tokenizer: GGUF metadata load failed: %s\n",
+                        err3.c_str());
+            }
+        }
+    }
     if (!g_tok_ready && !arg_tokenizer) {
         const std::string fb = g_conf_root + "/data/tokenizer";
         std::string err2;

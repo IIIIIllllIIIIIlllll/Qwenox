@@ -1,7 +1,9 @@
 // start_stub_win.cpp — start_win.exe：根目录最小入口，只做一件事：
-// 以项目根为工作目录拉起 build\qwenox-win.exe（GUI 托盘程序，API 服务 +
-// 控制台网页 + 引擎启停）。放在根目录是为了用户不必点进 build\。
-// 旧启动器（配置面板/双进程看守）已归档到 attic/launcher/，不再维护。
+// 以项目根为工作目录拉起 launcher_settings.exe（网页启动器：配置 service.conf、
+// 启停 API + 引擎）。放在根目录是为了用户不必找 launcher_settings.exe。
+// 旧版直接拉起 build\qwenox-win.exe（API 托盘程序）；新交互逻辑下 API 由
+// launcher 网页里的「启动」按钮拉起。旧启动器（配置面板/双进程看守）已归档到
+// attic/launcher/，不再维护。
 #include <windows.h>
 
 #include <cstdio>
@@ -27,11 +29,11 @@ int fail(const std::string& msg) {
 
 int main() {
     const std::string root = exe_dir();
-    const std::string exe = root + "\\build\\qwenox-win.exe";
+    const std::string exe = root + "\\launcher_settings.exe";
     if (GetFileAttributesA(exe.c_str()) == INVALID_FILE_ATTRIBUTES)
         return fail(
-            "Missing build\\qwenox-win.exe — build the project first (build_win.bat).\n"
-            "缺少 build\\qwenox-win.exe —— 请先编译（build_win.bat）。");
+            "Missing launcher_settings.exe — build the project first (build_win.bat).\n"
+            "缺少 launcher_settings.exe —— 请先编译（build_win.bat）。");
 
     STARTUPINFOA si{};
     si.cb = sizeof(si);

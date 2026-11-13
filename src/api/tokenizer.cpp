@@ -1,8 +1,10 @@
 #include "tokenizer.h"
 
+#include "gguf_kv.h"
 #include "unicode_tables.inc"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -389,9 +391,60 @@ bool Tokenizer::load(const std::string& dir, std::string* err) {
     }
     std::stringstream ss;
     ss << f.rdbuf();
+    return from_json_text(ss.str(), dir + "/tokenizer.json", err);
+}
+
+// GGUF 内嵌词表：tokenizer.ggml.{tokens,token_type,merges} 合成 tokenizer.json
+// 形态后走 from_json_text。token_type（llama.cpp 约定 1 normal / 2 unknown /
+// 3 control / 4 byte / 5 unused / 6 user-defined）：本模型词表里 byte 单字符是
+// type 1（已与 tokenizer.json 逐条对拍一致），type 3/4 恰是全部 added_tokens，
+// type 5 是 [PAD…] 填充位（tokenizer.json 不收，跳过）。缺 token_type 时全部按
+// normal 处理（特殊 token 退化为普通词表项，会告警）。
+bool Tokenizer::load_gguf(const std::string& path, std::string* err) {
+    init_alphabet();
+    std::unordered_map<std::string, gguf_kv::Value> kv;
+    if (!gguf_kv::load(path, &kv, err)) return false;
+    auto tok_it = kv.find("tokenizer.ggml.tokens");
+    auto tt_it = kv.find("tokenizer.ggml.token_type");
+    auto mg_it = kv.find("tokenizer.ggml.merges");
+    if (tok_it == kv.end() || tok_it->second.as.empty()) {
+        if (err) *err = path + ": no tokenizer.ggml.tokens in GGUF metadata";
+        return false;
+    }
+    if (mg_it == kv.end() || mg_it->second.as.empty()) {
+        if (err) *err = path + ": no tokenizer.ggml.merges in GGUF metadata";
+        return false;
+    }
+    const std::vector<std::string>& toks = tok_it->second.as;
+    const bool have_tt = tt_it != kv.end() && tt_it->second.ai.size() == toks.size();
+    if (!have_tt)
+        fprintf(stderr, "qwenox: WARNING: %s has no tokenizer.ggml.token_type; "
+                        "special tokens will not be recognized\n", path.c_str());
+    nlohmann::json j;
+    j["model"]["merges"] = mg_it->second.as;
+    auto& vocab = j["model"]["vocab"];
+    auto added = nlohmann::json::array();
+    for (size_t i = 0; i < toks.size(); ++i) {
+        const int64_t t = have_tt ? tt_it->second.ai[i] : 1;
+        if (t == 5) continue;  // unused/[PAD…] 占位
+        if (t == 3 || t == 4 || t == 6) {
+            added.push_back({{"content", toks[i]},
+                             {"id", static_cast<int64_t>(i)},
+                             {"special", true}});
+        } else {
+            vocab[toks[i]] = static_cast<int64_t>(i);
+        }
+    }
+    j["model"]["vocab"] = std::move(vocab);
+    j["added_tokens"] = std::move(added);
+    return from_json_text(j.dump(), path + " (GGUF metadata)", err);
+}
+
+bool Tokenizer::from_json_text(const std::string& text, const std::string& src,
+                               std::string* err) {
     nlohmann::json j;
     try {
-        j = nlohmann::json::parse(ss.str());
+        j = nlohmann::json::parse(text);
     } catch (const std::exception& e) {
         if (err) *err = std::string("json parse: ") + e.what();
         return false;
@@ -443,7 +496,7 @@ bool Tokenizer::load(const std::string& dir, std::string* err) {
             ++rank;
         }
     } catch (const std::exception& e) {
-        if (err) *err = std::string("tokenizer.json content: ") + e.what();
+        if (err) *err = src + " content: " + e.what();
         return false;
     }
 

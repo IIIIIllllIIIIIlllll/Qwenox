@@ -81,6 +81,13 @@ class Tokenizer {
     // Loads <dir>/tokenizer.json. Returns false on error (message in `err`).
     bool load(const std::string& dir, std::string* err = nullptr);
 
+    // Loads the tokenizer embedded in a GGUF file's metadata
+    // (tokenizer.ggml.tokens / token_type / merges). The metadata is
+    // synthesized into the tokenizer.json shape and goes through the exact
+    // same construction path as load(), so encode/decode behavior is
+    // identical for the same model. Only the first shard is read.
+    bool load_gguf(const std::string& path, std::string* err = nullptr);
+
     // Encode text to token ids. `add_special_tokens` is accepted for API
     // parity with HF; this model's post-processor never adds tokens, and
     // added tokens appearing literally in the text are always recognized
@@ -135,6 +142,10 @@ class Tokenizer {
         int id;
         bool special;
     };
+
+    // load()/load_gguf() 共用的构造路径：解析 tokenizer.json 形态的 JSON 文本。
+    bool from_json_text(const std::string& text, const std::string& src,
+                        std::string* err);
 
     std::unordered_map<std::string, int> vocab_;      // token str -> id
     std::vector<std::string> id_to_token_;            // id -> token str

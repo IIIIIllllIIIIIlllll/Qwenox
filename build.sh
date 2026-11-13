@@ -8,6 +8,7 @@
 #   bash build.sh bench           # 编译独立性能测试工具 → build/qwenox-bench
 #   bash build.sh api             # 只编 API 服务器 + CLI 工具
 #   bash build.sh settings        # 只编跨平台 TUI 设置工具 → ./qwenox-settings
+#   bash build.sh launcher        # 只编网页启动器 → ./launcher_settings
 #   bash build.sh test            # 编 ktest 并运行
 #
 # 产物:
@@ -44,7 +45,7 @@ set -- "${POSITIONAL[@]}"
 TARGET="${1:-all}"
 ENGINE_NAME="${2:-qwenox-engine}"
 case "$TARGET" in
-  all|engine|api|bench|settings|test) ;;
+  all|engine|api|bench|settings|launcher|test) ;;
   *) usage >&2; exit 2 ;;
 esac
 command -v flock >/dev/null || { echo '缺少 flock，请安装 util-linux' >&2; exit 1; }
@@ -59,7 +60,7 @@ exec 8>"${XDG_RUNTIME_DIR:-/run/user/$UID}/hgn-work.lock"
 flock -n 8 || { echo '另一个 Qwenox 编译或启动任务正在运行' >&2; exit 1; }
 
 GPU_ARCH="${GPU_ARCH:-gfx1151}"
-if [[ "$TARGET" != api && "$TARGET" != settings ]]; then
+if [[ "$TARGET" != api && "$TARGET" != settings && "$TARGET" != launcher ]]; then
   if [[ -z "${HIPCC:-}" ]]; then
     HIPCC="$(command -v hipcc || true)"
     HIPCC="${HIPCC:-/opt/rocm/bin/hipcc}"
@@ -290,13 +291,23 @@ API_FLAGS=(-O2 -std=c++17 "${VER_FLAGS[@]}" -Isrc/api -Ithird_party -Ithird_part
            -Wall -Wextra -Wpedantic -Werror "${BUNDLE_RPATH[@]}")
 # 静态页嵌入:编译生成器并重新生成 src/api/static_gen.inc。生成器输出是确定性的,
 # 内容未变不会重写文件;static_gen.inc 是生成物,不入库(.gitignore),此处按需重新生成。
-gen_static_inc() {
+# api 与 launcher 目标并行时会同时需要生成器:编译走 tmp+mv,避免并发写坏。
+ensure_gen_static_inc() {
   if [ ! -x build/gen_static_inc ] || [ tools/gen_static_inc.cpp -nt build/gen_static_inc ]; then
     echo "[生成] build/gen_static_inc"
-    "$CXX" -O2 -std=c++17 tools/gen_static_inc.cpp -o build/gen_static_inc || return 1
+    "$CXX" -O2 -std=c++17 tools/gen_static_inc.cpp -o "build/gen_static_inc.tmp.$$" \
+      && mv -f "build/gen_static_inc.tmp.$$" build/gen_static_inc || return 1
   fi
+}
+gen_static_inc() {
+  ensure_gen_static_inc || return 1
   echo "[生成] src/api/static_gen.inc"
   ./build/gen_static_inc src/api/static src/api/static_gen.inc
+}
+gen_launcher_static_inc() {
+  ensure_gen_static_inc || return 1
+  echo "[生成] src/launcher_static_gen.inc"
+  ./build/gen_static_inc src/launcher_static src/launcher_static_gen.inc
 }
 # tokenizer/chat_template 由 CLI 与服务器共用,每个目标须显式列出源文件
 # (否则 main.cpp 会与 CLI 的 main 冲突)。
@@ -348,6 +359,16 @@ build_settings() {
     -Wall -Wextra -Wpedantic -Werror src/settings_tui.cpp -pthread
 }
 
+build_launcher() {
+  # 网页启动器 launcher_settings：API/引擎之前的配置+启动前端
+  # （127.0.0.1:8729）。静态页 src/launcher_static/ 经 gen_static_inc 嵌入；
+  # 复用 src/api 的 http.cpp。纯主机 C++，不依赖 HIP/ROCm。
+  gen_launcher_static_inc || return 1
+  compile launcher_settings 1 60 "$CXX" -O2 -std=c++17 \
+    -Wall -Wextra -Wpedantic -Werror "${VER_FLAGS[@]}" -Ithird_party \
+    src/launcher_settings.cpp src/api/http.cpp -pthread
+}
+
 build_test() {
   run 8 180 python3 tools/kv_admission_test.py --cxx "$CXX" || return 1
   run 8 180 python3 tools/kv_page_test.py --cxx "$CXX" || return 1
@@ -372,6 +393,9 @@ case "$TARGET" in
   settings)
     build_settings
     ;;
+  launcher)
+    build_launcher
+    ;;
   test)
     build_test
     if (( BUNDLE_RUNTIME )); then
@@ -391,6 +415,7 @@ case "$TARGET" in
     build_bench  & pids+=($!)
     build_api    & pids+=($!)
     build_settings & pids+=($!)
+    build_launcher & pids+=($!)
     fail=0
     for p in "${pids[@]}"; do wait "$p" || fail=1; done
     [[ "$fail" == 0 ]] || { echo '[失败] 见上方编译输出' >&2; exit 1; }

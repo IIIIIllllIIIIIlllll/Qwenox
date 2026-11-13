@@ -214,13 +214,26 @@ build_bench() {
 # 静态页嵌入：编译生成器并重新生成 src/api/static_gen.inc（复用调用方设好的 CXX）。
 # 生成器输出是确定性的，内容未变不会重写文件；static_gen.inc 是生成物，
 # 不入库（.gitignore），此处按需重新生成。
-gen_static_inc() {
+# api 与 launcher 目标并行时会同时需要生成器：编译走 tmp+mv，避免并发写坏。
+ensure_gen_static_inc() {
     [[ -x build/gen_static_inc.exe && ! tools/gen_static_inc.cpp -nt build/gen_static_inc.exe ]] || {
         echo "[编译] build/gen_static_inc.exe"
-        "$CXX" -O2 -std=c++17 tools/gen_static_inc.cpp -o build/gen_static_inc.exe || exit 1
+        "$CXX" -O2 -std=c++17 tools/gen_static_inc.cpp -o "build/gen_static_inc.exe.tmp.$$" \
+            && mv -f "build/gen_static_inc.exe.tmp.$$" build/gen_static_inc.exe || exit 1
     }
+}
+
+gen_static_inc() {
+    ensure_gen_static_inc
     echo "[生成] src/api/static_gen.inc"
     ./build/gen_static_inc.exe src/api/static src/api/static_gen.inc || exit 1
+}
+
+# launcher_settings 的静态页嵌入：同一生成器，来源 src/launcher_static/。
+gen_launcher_static_inc() {
+    ensure_gen_static_inc
+    echo "[生成] src/launcher_static_gen.inc"
+    ./build/gen_static_inc.exe src/launcher_static src/launcher_static_gen.inc || exit 1
 }
 
 # GUI 子系统链接选项（托盘/入口程序，双击不出控制台）；入口仍是 main()。
@@ -380,7 +393,7 @@ mkiconres() {  # $1=rc 源文件  $2=res 输出  $3=exe 名（提示用）
 
 build_launcher() {
     # 根目录最小入口 start_win.exe：只负责以项目根为工作目录拉起
-    # build\qwenox-win.exe（托盘程序）。旧启动器（配置面板/双进程看守）
+    # launcher_settings.exe（网页启动器）。旧启动器（配置面板/双进程看守）
     # 已归档到 attic/launcher/，不再编译。
     CXX="$TR/lib/llvm/bin/clang++.exe"
     [[ -x "$CXX" ]] || { echo "找不到 TheRock clang++: $CXX" >&2; exit 1; }
@@ -393,6 +406,22 @@ build_launcher() {
       [[ ${#RES[@]} -gt 0 ]] || exit 1
       echo "提示：带图标资源链接失败，改为不带文件图标重试" >&2
       "$CXX" "${STUB_SRC[@]}"
+    fi
+
+    # launcher_settings.exe：API/引擎之前的网页配置+启动前端（默认
+    # 127.0.0.1:8729）。静态页 src/launcher_static/ 用 gen_static_inc 同款
+    # 机制嵌入；复用 src/api 的 http.cpp 与 third_party/nlohmann。
+    gen_launcher_static_inc
+    mkiconres src/launcher_settings.rc build/launcher_settings.res launcher_settings.exe
+    echo "[编译] launcher_settings.exe"
+    LAUNCHER_SRC=(-O2 -std=c++17 -D_CRT_SECURE_NO_WARNINGS -I third_party
+                  "${VER_FLAGS[@]}"
+                  src/launcher_settings.cpp src/api/http.cpp
+                  -lws2_32 -luser32 -lshell32 -ladvapi32 -lgdi32 "${GUI_LDFLAGS[@]}" -o launcher_settings.exe)
+    if ! "$CXX" "${LAUNCHER_SRC[@]}" ${RES[@]+"${RES[@]}"}; then
+      [[ ${#RES[@]} -gt 0 ]] || exit 1
+      echo "提示：带图标资源链接失败，改为不带文件图标重试" >&2
+      "$CXX" "${LAUNCHER_SRC[@]}"
     fi
 }
 

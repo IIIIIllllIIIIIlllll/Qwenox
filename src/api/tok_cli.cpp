@@ -10,10 +10,12 @@
 #include "tokenizer.h"
 
 int main(int argc, char** argv) {
+    // dir 也可以直接指向一个 .gguf 文件：词表从 GGUF 元数据读
     std::string dir = argc > 1 ? argv[1] : "models/tokenizer";
     qwenox::Tokenizer tok;
     std::string err;
-    if (!tok.load(dir, &err)) {
+    const bool is_gguf = dir.size() > 5 && dir.compare(dir.size() - 5, 5, ".gguf") == 0;
+    if (is_gguf ? !tok.load_gguf(dir, &err) : !tok.load(dir, &err)) {
         std::cerr << "load failed: " << err << "\n";
         return 1;
     }

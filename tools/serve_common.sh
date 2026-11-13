@@ -95,7 +95,10 @@ serve_init() {
 }
 
 serve_run() {
-  need tokenizer "$TOKENIZER_DIR/tokenizer.json" '两种权重共用，取自原模型 HF 仓库'
+  # GGUF 权重的词表内嵌在 GGUF 元数据里（API 自动从 GGUF_FILE 读），不需要 tokenizer 目录
+  if [[ "$FORMAT" != GGUF ]]; then
+    need tokenizer "$TOKENIZER_DIR/tokenizer.json" 'hgn 权重用；GGUF 用内嵌词表'
+  fi
   if (( ${#MISSING[@]} )); then
     {
       echo "错误：$LAUNCHER（$FORMAT 权重）缺少以下文件："

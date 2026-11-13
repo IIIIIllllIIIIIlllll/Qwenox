@@ -132,7 +132,7 @@ else
 fi
 
 for f in build/qwenox-engine-win.exe build/qwenox-win.exe build/qwenox-bench.exe \
-         start_win.exe settings_win.exe; do
+         start_win.exe launcher_settings.exe settings_win.exe; do
     [[ -s "$f" ]] || die "缺少编译产物：$f（先运行 bash build_win.sh all）"
 done
 [[ -d "build/rocblas/library/$GPU_ARCH" ]] || die "缺少 rocBLAS kernel db：build/rocblas/library/$GPU_ARCH"
@@ -183,7 +183,7 @@ for f in build/rocblas/library/*"$GPU_ARCH"*; do
     cp -a "$f" "$OUT/build/rocblas/library/"
 done
 
-for f in start_win.exe settings_win.exe qwenox-settings.exe start_win.sh service.conf \
+for f in start_win.exe launcher_settings.exe settings_win.exe qwenox-settings.exe start_win.sh service.conf \
          README.md README_EN.md CHANGELOG.md LICENSE VERSION; do
     [[ -e "$f" ]] || die "缺少根目录文件：$f"
     cp -a "$f" "$OUT/"
@@ -334,7 +334,9 @@ weights=$WEIGHTS（默认启动权重）
 
 目录内容
 --------
-start_win.exe             托盘入口：双击启动 API 与控制台网页，不自动加载模型
+start_win.exe             入口：双击打开网页启动器（launcher_settings.exe）
+launcher_settings.exe     网页启动器：配置 service.conf、启停 API+引擎
+                          （http://127.0.0.1:8729），API/引擎未启动时也可配置
 settings_win.exe          配置工具：编辑 service.conf、环境检查（不启动服务）
 qwenox-settings.exe       终端配置工具：TUI 编辑 service.conf、静态检查（中英双语）
 start_win.sh              Git Bash 命令行启动（行为同 Linux 启动器，可选）
@@ -354,8 +356,8 @@ SHA256SUMS.txt            包内主要文件的校验和
 --------
 1. 把 hgn v2 权重与 tokenizer 放进 models\（文件名见 models\README.txt，
    或按 README.md「支持的权重」一节下载）。
-2. 双击 start_win.exe。托盘图标右键：启动引擎；双击图标：打开控制台网页。
-   也可以先在控制台 #/engine 页确认权重与参数，再启动引擎。
+2. 双击 start_win.exe：浏览器打开启动器网页，确认权重路径与参数后点
+   「保存并启动」；之后可随时在该页停止。控制台地址启动后显示在页面上。
 3. API 基址 http://127.0.0.1:8731/v1，控制台 http://127.0.0.1:8731/。
 
 硬件前提：BIOS 为 GPU 划分 96 GiB 显存。参考占用：512K 页池（524288）+
@@ -374,7 +376,7 @@ if command -v sha256sum >/dev/null 2>&1; then
     (
         cd "$OUT"
         files=(build/qwenox-engine-win.exe build/qwenox-win.exe build/qwenox-bench.exe
-               start_win.exe settings_win.exe qwenox-settings.exe service.conf
+               start_win.exe launcher_settings.exe settings_win.exe qwenox-settings.exe service.conf
                data/tokenizer/tokenizer.json BUILD-INFO.txt)
         for f in build/*.pdb; do [[ -f "$f" ]] && files+=("$f"); done
         for f in data/qsa-oracle/*.tokens; do [[ -f "$f" ]] && files+=("$f"); done
@@ -386,7 +388,7 @@ fi
 
 # ---- 完整性检查 -------------------------------------------------------------
 miss=0
-for f in start_win.exe settings_win.exe qwenox-settings.exe service.conf BUILD-INFO.txt \
+for f in start_win.exe launcher_settings.exe settings_win.exe qwenox-settings.exe service.conf BUILD-INFO.txt \
          build/qwenox-engine-win.exe build/qwenox-win.exe build/qwenox-bench.exe \
          build/amdhip64_7.dll build/rocm_kpack.dll build/amd_comgr.dll \
          build/rocblas.dll build/libhipblaslt.dll build/origami.dll \

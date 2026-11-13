@@ -1,0 +1,1003 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qwenox 启动器</title>
+<style>
+:root{
+  --ink:#e8ecf6; --dim:#9aa6c0; --line:rgba(120,140,190,.28);
+  --card:rgba(13,18,34,.82); --card2:rgba(9,13,26,.88); --inp:rgba(10,14,28,.78);
+  --accent:#7aa2f0; --btn:#3b5fb8; --btn-hi:#4f7ad9;
+  --ok:#5fc98a; --bad:#ff7a7a; --warn:#e8b95f;
+}
+*{box-sizing:border-box}
+body{margin:0;height:100vh;overflow:hidden;color:var(--ink);
+  font:14px/1.6 "Segoe UI","Microsoft YaHei",system-ui,sans-serif;
+  background:#0a0e1a url(/media/panel-bg.png) center/cover fixed no-repeat;
+  display:flex;flex-direction:column}
+body::before{content:"";position:fixed;inset:0;background:rgba(8,12,26,.45);
+  pointer-events:none}
+header{position:relative;z-index:2;display:flex;align-items:center;gap:12px;
+  padding:12px 22px;flex:0 0 auto}
+h1{font-size:18px;margin:0;text-shadow:0 1px 6px rgba(0,0,0,.6)}
+.spacer{flex:1}
+main{position:relative;z-index:1;flex:1;min-height:0;width:100%;
+  max-width:1060px;margin:0 auto;padding:4px 20px 20px;display:flex;
+  flex-direction:column}
+.panel{flex:1;min-height:0;display:flex;background:var(--card);
+  border:1px solid var(--line);border-radius:12px;overflow:hidden;
+  box-shadow:0 12px 40px rgba(0,0,0,.45);backdrop-filter:blur(3px)}
+.art{flex:0 0 250px;background:rgba(9,13,26,.35);display:flex;
+  align-items:center;justify-content:center;overflow:hidden}
+.art img{width:250px;filter:drop-shadow(0 0 18px rgba(60,80,160,.45))}
+.content{flex:1;min-width:0;min-height:0;padding:16px 20px 18px;overflow-y:auto}
+/* 低分辨率适配：窄窗先缩立绘、再藏立绘，超窄时标签叠到输入框上方 */
+@media(max-width:1150px){.art{flex-basis:185px}.art img{width:185px}}
+@media(max-width:960px){.art{display:none}.panel{min-height:0}}
+@media(max-width:700px){
+  label.k{flex-basis:100%;margin-bottom:-4px}
+  .help{margin-left:0}
+  .tab{min-width:0;font-size:12px;padding:6px 0}
+  .content{padding:12px 12px 14px}
+}
+
+/* ---- 选项卡 ---- */
+.tabs{display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap}
+.tab{flex:1;min-width:120px;text-align:center;padding:7px 0;border-radius:7px;
+  border:1px solid var(--line);background:rgba(16,22,40,.72);color:var(--dim);
+  cursor:pointer;user-select:none;font-weight:600}
+.tab:hover{border-color:var(--accent)}
+.tab.on{color:var(--ink);border-color:var(--accent);
+  background:rgba(59,95,184,.35);box-shadow:0 0 10px rgba(90,130,230,.25)}
+
+h2{font-size:13px;margin:14px 0 6px;color:var(--dim);font-weight:600;
+  letter-spacing:.08em}
+.row{display:flex;align-items:center;gap:8px;margin:7px 0;flex-wrap:wrap}
+label.k{flex:0 0 200px;color:var(--dim);font-family:Consolas,monospace;
+  font-size:12.5px}
+input[type=text],select{flex:1;min-width:150px;background:var(--inp);
+  border:1px solid var(--line);border-radius:5px;color:var(--ink);
+  padding:5px 9px;font:13px Consolas,monospace}
+input:focus,select:focus{outline:none;border-color:var(--accent)}
+input:disabled,select:disabled{opacity:.42}
+input[type=checkbox]{width:15px;height:15px;accent-color:var(--accent)}
+.help{flex-basis:100%;margin:-2px 0 4px 208px;font-size:12px;color:var(--dim)}
+.radio{display:inline-flex;align-items:center;gap:6px;margin-right:18px;
+  cursor:pointer}
+.radio input{accent-color:var(--accent)}
+.envtag{font-size:11px;color:var(--warn);border:1px solid var(--warn);
+  border-radius:4px;padding:0 5px}
+button{background:var(--btn);color:#fff;border:1px solid rgba(140,165,240,.35);
+  border-radius:6px;padding:7px 18px;font-size:13.5px;cursor:pointer}
+button:hover{background:var(--btn-hi)}
+button:disabled{opacity:.4;cursor:not-allowed}
+button.ghost{background:rgba(16,22,40,.72);color:var(--ink)}
+button.danger{background:#7a3440;border-color:rgba(240,150,150,.3)}
+button.danger:hover{background:#94404d}
+button.mini{padding:3px 10px;font-size:12px;border-radius:5px}
+#langBtn{font-size:14px;padding:7px 18px;border-color:var(--accent);font-weight:600}
+a{color:var(--accent)}
+
+/* ---- 状态 ---- */
+.state{font-weight:600}
+.s-idle{color:var(--dim)} .s-running{color:var(--ok)}
+.s-failed,.s-exited{color:var(--bad)}
+.s-spawning,.s-waiting_engine,.s-waiting_api,.s-stopping{color:var(--warn)}
+#notice{display:none;position:fixed;top:58px;left:50%;transform:translateX(-50%);
+  z-index:100;max-width:min(680px,92vw);border-radius:6px;padding:8px 14px;
+  font-size:13px;transition:opacity .4s;cursor:pointer;
+  box-shadow:0 6px 24px rgba(0,0,0,.5)}
+#notice.err{display:block;background:rgba(70,26,34,.92);color:#ffc9c9;
+  border:1px solid rgba(240,150,150,.5)}
+#notice.ok{display:block;background:rgba(22,56,38,.92);color:#c9ecd4;
+  border:1px solid rgba(95,201,138,.5)}
+
+/* ---- 日志 ---- */
+pre#log{background:var(--card2);border:1px solid var(--line);border-radius:8px;
+  padding:10px 12px;height:250px;overflow:auto;font:12px/1.5 Consolas,monospace;
+  white-space:pre-wrap;word-break:break-all;margin:8px 0 0}
+.logbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.logbar select{flex:0 0 auto}
+.small{font-size:12px;color:var(--dim)}
+
+/* ---- 文件浏览器 ---- */
+.modal{position:fixed;inset:0;background:rgba(4,6,14,.6);z-index:50;
+  display:flex;align-items:center;justify-content:center}
+.modal-card{width:min(680px,92vw);max-height:78vh;display:flex;flex-direction:column;
+  background:var(--card2);border:1px solid var(--line);border-radius:10px;
+  box-shadow:0 18px 60px rgba(0,0,0,.6)}
+.fb-toolbar{display:flex;align-items:center;gap:8px;padding:10px 12px;
+  border-bottom:1px solid var(--line)}
+.fb-toolbar input{flex:1}
+.fb-chips{display:flex;gap:6px;padding:8px 12px;border-bottom:1px solid var(--line);
+  flex-wrap:wrap}
+.fb-chips button{font-size:11.5px;padding:2px 10px}
+.fb-list{flex:1;overflow:auto;padding:4px 6px}
+.fb-item{display:flex;gap:8px;align-items:center;padding:4px 10px;
+  border-radius:5px;cursor:pointer;font:13px Consolas,monospace}
+.fb-item:hover{background:rgba(59,95,184,.3)}
+.fb-item .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap}
+.fb-item .sz,.fb-item .mt{color:var(--dim);font-size:11.5px;flex:0 0 auto}
+.fb-foot{display:flex;gap:8px;justify-content:flex-end;align-items:center;
+  padding:10px 14px;border-top:1px solid var(--line)}
+</style>
+</head>
+<body>
+<header>
+  <h1>Qwenox <span data-i18n="title">启动器</span></h1>
+  <span id="stateBadge" class="state s-idle">—</span>
+  <span id="saveHint" class="small" style="opacity:.55"></span>
+  <span class="spacer"></span>
+  <span id="consoleLink" class="small"></span>
+  <button class="ghost mini" id="langBtn">EN</button>
+</header>
+<main>
+<div id="notice"></div>
+<div class="panel">
+  <div class="art"><img src="/media/qwen-charactor-alpha.png" alt=""></div>
+  <div class="content">
+    <div class="tabs">
+      <div class="tab on" data-tab="weights">1 <span data-i18n="weights">权重</span></div>
+      <div class="tab" data-tab="infer">2 <span data-i18n="infer">推理设置</span></div>
+      <div class="tab" data-tab="netlog">3 <span data-i18n="netlog">端口与日志</span></div>
+      <div class="tab" data-tab="control">4 <span data-i18n="control">启动控制</span></div>
+    </div>
+
+    <!-- ============ 权重 ============ -->
+    <section id="tab-weights">
+      <div class="row" style="margin-bottom:12px">
+        <label class="k" data-i18n="profile">方案</label>
+        <select id="profileSel" style="flex:1"></select>
+        <button class="ghost mini" id="btnPfSave" data-i18n="pf_saveas">另存为…</button>
+        <button class="ghost mini" id="btnPfDel" data-i18n="pf_del">删除</button>
+      </div>
+      <div class="help" style="margin:0 0 8px" data-i18n="pf_hint">方案 = 权重 + 推理设置，选中即整体应用</div>
+      <div class="row" style="margin:4px 0 10px">
+        <label class="radio"><input type="radio" name="wv" value="v1"><span data-i18n="wv1">V1 版本</span></label>
+        <label class="radio"><input type="radio" name="wv" value="v2"><span data-i18n="wv2">V2 版本</span></label>
+        <label class="radio"><input type="radio" name="wv" value="gguf"><span>GGUF 版本</span></label>
+      </div>
+      <div id="w-hgn">
+        <div class="row"><label class="k" data-i18n="f_model">主模型</label>
+          <input type="text" data-key="MODEL_FILE">
+          <button class="ghost mini" data-browse="MODEL_FILE" data-i18n="browse">浏览…</button></div>
+        <div class="row" data-wv="v2"><label class="k">n-gram 表</label>
+          <input type="text" data-key="NGRAM_FILE">
+          <button class="ghost mini" data-browse="NGRAM_FILE" data-i18n="browse">浏览…</button></div>
+        <div class="row" data-wv="v1"><label class="k">overlay</label>
+          <input type="checkbox" data-notuse="OVERLAY_FILE" title="不使用"><span class="small" data-i18n="notuse">不使用</span>
+          <input type="text" data-key="OVERLAY_FILE" data-optional="1">
+          <button class="ghost mini" data-browse="OVERLAY_FILE" data-i18n="browse">浏览…</button></div>
+        <div class="row"><label class="k" data-i18n="f_mtp">MTP 草稿</label>
+          <input type="checkbox" data-notuse="MTP_FILE"><span class="small" data-i18n="notuse">不使用</span>
+          <input type="text" data-key="MTP_FILE" data-optional="1">
+          <button class="ghost mini" data-browse="MTP_FILE" data-i18n="browse">浏览…</button></div>
+        <div class="row"><label class="k" data-i18n="f_vision">视觉塔</label>
+          <input type="checkbox" data-notuse="VISION_FILE"><span class="small" data-i18n="notuse">不使用</span>
+          <input type="text" data-key="VISION_FILE" data-optional="1">
+          <button class="ghost mini" data-browse="VISION_FILE" data-i18n="browse">浏览…</button></div>
+      </div>
+      <div id="w-gguf" style="display:none">
+        <div class="row"><label class="k">GGUF_FILE</label>
+          <input type="text" data-key="GGUF_FILE">
+          <button class="ghost mini" data-browse="GGUF_FILE" data-i18n="browse">浏览…</button></div>
+        <div class="help" data-i18n="h_gguf">填第 1 个分片（*-00001-of-0000N.gguf），其余分片须同目录</div>
+        <div class="row"><label class="k">GGUF_MTP_FILE</label>
+          <input type="checkbox" data-notuse="GGUF_MTP_FILE"><span class="small" data-i18n="notuse">不使用</span>
+          <input type="text" data-key="GGUF_MTP_FILE" data-optional="1">
+          <button class="ghost mini" data-browse="GGUF_MTP_FILE" data-i18n="browse">浏览…</button></div>
+        <div class="row"><label class="k">GGUF_VISION_FILE</label>
+          <input type="checkbox" data-notuse="GGUF_VISION_FILE"><span class="small" data-i18n="notuse">不使用</span>
+          <input type="text" data-key="GGUF_VISION_FILE" data-optional="1">
+          <button class="ghost mini" data-browse="GGUF_VISION_FILE" data-i18n="browse">浏览…</button></div>
+      </div>
+      <div class="row" id="row-tokenizer"><label class="k">tokenizer</label>
+        <input type="text" data-key="TOKENIZER_DIR">
+        <button class="ghost mini" data-browse="TOKENIZER_DIR" data-mode="dir" data-i18n="browse">浏览…</button></div>
+      <div class="help" id="help-tokenizer" data-i18n="h_tok">目录内需包含 tokenizer.json</div>
+      <div class="help" id="help-gguf-tok" style="display:none" data-i18n="h_gguftok">GGUF 权重内嵌词表，无需 tokenizer 目录</div>
+    </section>
+
+    <!-- ============ 推理设置 / 端口与日志 ============ -->
+    <section id="tab-infer" style="display:none"><div id="groups-infer"></div></section>
+    <section id="tab-netlog" style="display:none"><div id="groups-netlog"></div></section>
+
+    <!-- ============ 启动控制 ============ -->
+    <section id="tab-control" style="display:none">
+      <div class="row" style="margin-bottom:10px">
+        <button id="btnStart" data-i18n="savestart">保存并启动</button>
+        <button id="btnStop" class="danger" data-i18n="stop">停止</button>
+        <span class="small" data-i18n="autosave" style="align-self:center">改动自动保存</span>
+        <span class="spacer"></span>
+        <button id="btnQuit" class="ghost" data-i18n="quit">退出启动器</button>
+      </div>
+      <div id="statusDetail" class="small"></div>
+      <div class="logbar" style="margin-top:12px">
+        <span class="small" data-i18n="logview">日志：</span>
+        <select id="logWhich">
+          <option value="engine" data-i18n="logengine">引擎</option>
+          <option value="api">API</option>
+          <option value="script" data-i18n="logscript">启动脚本</option>
+          <option value="launcher" data-i18n="loglauncher">启动器</option>
+        </select>
+        <span id="logPath" class="small"></span>
+      </div>
+      <pre id="log"></pre>
+    </section>
+  </div>
+</div>
+</main>
+
+<!-- 文件浏览器 -->
+<div class="modal" id="fbModal" style="display:none">
+  <div class="modal-card">
+    <div class="fb-toolbar">
+      <button class="ghost mini" id="fbUp" title="上一级 / up">↑</button>
+      <input type="text" id="fbPath" spellcheck="false">
+      <select id="fbFilter" style="flex:0 0 auto"></select>
+    </div>
+    <div class="fb-chips">
+      <button class="ghost mini" data-fbgo="" data-i18n="fb_root">项目根</button>
+      <button class="ghost mini" data-fbgo="models">models</button>
+      <button class="ghost mini" data-fbgo="@drives" id="fbDrives">计算机</button>
+    </div>
+    <div class="fb-list" id="fbList"></div>
+    <div class="fb-foot">
+      <span class="small" id="fbHint"></span>
+      <span class="spacer"></span>
+      <button id="fbSelectDir" class="ghost" data-i18n="fbpickdir">选择当前目录</button>
+      <button id="fbCancel" data-i18n="fbcancel">取消</button>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+// ---- i18n ------------------------------------------------------------------
+const T = {
+  zh: {
+    title:"启动器", weights:"权重", infer:"推理设置", netlog:"端口与日志",
+    control:"启动控制",
+    save:"保存", savestart:"保存并启动", stop:"停止", quit:"退出启动器",
+    browse:"浏览…", notuse:"不使用",
+    wv1:"V1 版本", wv2:"V2 版本",
+    f_model:"主模型", f_mtp:"MTP 草稿", f_vision:"视觉塔",
+    h_gguf:"填第 1 个分片（*-00001-of-0000N.gguf），其余分片须同目录",
+    h_tok:"目录内需包含 tokenizer.json",
+    h_gguftok:"GGUF 权重内嵌词表，无需 tokenizer 目录",
+    fbroot:"项目根：", fbpickdir:"选择当前目录", fbcancel:"取消",
+    logview:"日志：", logengine:"引擎", logscript:"启动脚本", loglauncher:"启动器",
+    saved:"已保存，下次启动生效", starting:"启动中…", stopping:"停止中…",
+    autosave:"改动自动保存",
+    confirmQuit:"服务还在运行。强制退出会同时停止服务，确定？",
+    confirmStop:"确定停止 API 与引擎？",
+    console:"打开控制台",
+    st:{idle:"未启动",spawning:"启动中",waiting_engine:"引擎加载中",
+        waiting_api:"等待 API",running:"运行中",stopping:"停止中",
+        exited:"已退出",failed:"启动失败"},
+    envOvr:"环境变量覆盖，conf 改动不生效",
+    ck_ok:"通过", ck_bad:"失败", ck_hint:"提示",
+    ck:{model:"主模型", ngram:"n-gram 表", overlay:"overlay", mtp:"MTP 草稿",
+        vision:"视觉塔", tok:"tokenizer", bins:"编译产物", kerneldb:"kernel db",
+        scripts:"启动脚本", eport:"引擎端口", aport:"API 端口"},
+    ck_notfound:"找不到", ck_disabled:"已禁用", ck_busy:"已被占用",
+    ck_missing:"缺少", ck_free:"空闲",
+    profile:"方案", pf_none:"（当前配置）", pf_saveas:"另存为…", pf_del:"删除",
+    pf_switched:"已切换到方案", pf_namewhat:"方案名称：", pf_delq:"删除方案",
+    pf_saved:"方案已保存", pf_deleted:"方案已删除",
+    pf_hint:"方案 = 权重 + 推理设置，选中即整体应用",
+    fb_root:"项目根", fb_all:"全部文件",
+    fb_hint_dir:"点目录进入；选好后点「选择当前目录」",
+    fb_hint_file:"点文件选中；↑ 上一级；路径可手输后回车跳转",
+  },
+  en: {
+    title:"Launcher", weights:"Weights", infer:"Inference", netlog:"Ports & logs",
+    control:"Run",
+    save:"Save", savestart:"Save & start", stop:"Stop", quit:"Quit launcher",
+    browse:"Browse…", notuse:"Disable",
+    wv1:"V1 (w4b single file)", wv2:"V2 (split n-gram)",
+    f_model:"Main model", f_mtp:"MTP draft", f_vision:"Vision tower",
+    h_gguf:"First shard (*-00001-of-0000N.gguf); siblings in same dir",
+    h_tok:"Directory must contain tokenizer.json",
+    h_gguftok:"Tokenizer is embedded in the GGUF; no tokenizer dir needed",
+    fbroot:"Root: ", fbpickdir:"Pick this directory", fbcancel:"Cancel",
+    logview:"Logs: ", logengine:"Engine", logscript:"Launch script",
+    loglauncher:"Launcher",
+    saved:"Saved; applies on next start", starting:"Starting…",
+    stopping:"Stopping…",
+    autosave:"changes auto-saved",
+    confirmQuit:"Service is still running. Quitting forcibly stops it. Continue?",
+    confirmStop:"Stop API and engine?",
+    console:"Open console",
+    st:{idle:"idle",spawning:"starting",waiting_engine:"engine loading",
+        waiting_api:"waiting for API",running:"running",stopping:"stopping",
+        exited:"exited",failed:"failed"},
+    envOvr:"overridden by environment",
+    ck_ok:"OK", ck_bad:"FAIL", ck_hint:"--",
+    ck:{model:"main model", ngram:"n-gram table", overlay:"overlay",
+        mtp:"MTP draft", vision:"vision tower", tok:"tokenizer",
+        bins:"binaries", kerneldb:"kernel db", scripts:"launch scripts",
+        eport:"engine port", aport:"API port"},
+    ck_notfound:"not found", ck_disabled:"disabled", ck_busy:"in use",
+    ck_missing:"missing", ck_free:"free",
+    profile:"Profile", pf_none:"(current config)", pf_saveas:"Save as…",
+    pf_del:"Delete", pf_switched:"Switched to profile",
+    pf_namewhat:"Profile name:", pf_delq:"Delete profile",
+    pf_saved:"Profile saved", pf_deleted:"Profile deleted",
+    pf_hint:"Profile = weights + inference settings; selecting applies both",
+    fb_root:"Project root", fb_all:"All files",
+    fb_hint_dir:"Click a directory to enter; then pick this directory",
+    fb_hint_file:"Click a file to pick; ↑ goes up; type a path and press Enter",
+  }
+};
+let LANG = "zh";
+const t = k => T[LANG][k] || k;
+
+// ---- 参数分组定义 -------------------------------------------------------------
+const GROUPS = [
+  {id:"ctx", tab:"infer", zh:"上下文与并发", en:"Context & concurrency", keys:[
+    {k:"MAX_CONTEXT",type:"int"},{k:"PARALLEL",type:"int"},
+    {k:"KV_PAGED",type:"check"},{k:"KV_POOL_TOKENS",type:"int"},
+    {k:"PREFILL_CHUNK",type:"int"},{k:"CONC_PREFILL_CHUNK",type:"int",plat:"linux"},
+    {k:"QSA_INDEXER_BUDGET",type:"select",opts:["0","4096"]}]},
+  {id:"cache", tab:"infer", zh:"缓存（SSD/内存 prompt cache）", en:"Caches", keys:[
+    {k:"KVSNAP_MAX_GB",type:"int"},
+    {k:"KVSNAP_DIR",browse:"dir"}]},
+  {id:"misc", tab:"infer", zh:"推理与杂项", en:"Inference & misc", keys:[
+    {k:"MOE_A4",type:"select",opts:["0","1","2","3"]},
+    {k:"MAX_IMAGES",type:"int"},{k:"VIZ",type:"check"},
+    {k:"AFFINITY",type:"affinity",plat:"windows"},{k:"PLE_URING",type:"check",plat:"linux"},
+    {k:"MEMORY_CAP_GB",type:"int",plat:"linux"},
+    {k:"MIN_AVAILABLE_GB",type:"int",plat:"linux"},
+    {k:"START_TIMEOUT",type:"int"},{k:"STALL_TIMEOUT",type:"int",plat:"linux"}]},
+  {id:"net", tab:"netlog", zh:"网络与端口", en:"Network & ports", keys:[
+    {k:"ENGINE_HOST"},{k:"ENGINE_PORT",type:"int"},
+    {k:"API_HOST"},{k:"API_PORT",type:"int"}]},
+  {id:"reqlog", tab:"netlog", zh:"请求日志（隐私注意）", en:"Request logging (privacy!)", keys:[
+    {k:"REQLOG",type:"check"},
+    {k:"REQLOG_DIR",browse:"dir"},
+    {k:"REQLOG_LEVEL",type:"int"}]},
+];
+const HELP = {
+  zh: {
+    ENGINE_HOST:"引擎行协议监听地址（默认仅本机）", ENGINE_PORT:"引擎端口（默认 8730）",
+    API_HOST:"API 对外监听地址（0.0.0.0 = 所有网卡）", API_PORT:"API 端口（默认 8731）",
+    MAX_CONTEXT:"单条请求输入+输出上限（token），同时是 KV 池默认大小；超过 256K 时自动开启 YaRN（无需手动设置）",
+    PARALLEL:"并发请求数 1–8（需 KV_PAGED）", KV_PAGED:"分页 KV（推荐开启）",
+    KV_POOL_TOKENS:"全部并发共享的 KV 总量；0 = 一条 MAX_CONTEXT，小于 MAX_CONTEXT 时按 MAX_CONTEXT 算",
+    PREFILL_CHUNK:"prefill 分段，0 = 引擎默认（Win 6144 / Linux 16384）",
+    CONC_PREFILL_CHUNK:"并发分段，仅 Linux；0 = 不另设",
+    QSA_INDEXER_BUDGET:"QSA 检索预算：0 = 2048，4096 = 扩大",
+    ROPE_FACTOR:"YaRN 因子，1 = 关；>1 时 MAX_CONTEXT ≤ 因子×原生上下文",
+    KVSNAP_MAX_GB:"SSD prompt cache 上限 GiB，0 = 关",
+    KVSNAP_DIR:"SSD 缓存目录，留空 = data/kvsnap",
+    RCKPT_MAX:"RAM 检查点个数，0 = 关", MTP_GAMMA:"MTP gamma 1–8，0 = 引擎自选",
+    MOE_A4:"prefill 4-bit 加速（仅 hgn v2，快约 9%，会降低精度）：0 关 / 1 gate/up / 2 down / 3 两者",
+    MAX_IMAGES:"单请求图片数上限 1–256", VIZ:"运行时可视化（局域网可见生成内容）",
+    AFFINITY:"处理器亲和性：lower-half / upper-half / mask（仅 Windows）",
+    PLE_URING:"PLE io_uring 聚集读（仅 Linux）",
+    MEMORY_CAP_GB:"cgroup 内存上限 GiB（仅 Linux）",
+    MIN_AVAILABLE_GB:"启动前可用内存下限 GiB（仅 Linux）",
+    START_TIMEOUT:"引擎启动超时秒", STALL_TIMEOUT:"加载停滞超时秒（仅 Linux）",
+    REQLOG:"记录完整请求/响应到 ZIP（注意隐私与磁盘）",
+    REQLOG_DIR:"请求日志目录", REQLOG_LEVEL:"请求日志详细度 0–9",
+  },
+  en: {
+    ENGINE_HOST:"Engine line-protocol bind IP (localhost by default)",
+    ENGINE_PORT:"Engine port (8730)",
+    API_HOST:"API bind IP (0.0.0.0 = all interfaces)", API_PORT:"API port (8731)",
+    MAX_CONTEXT:"Per-request input+output cap (tokens); also default KV pool size. YaRN turns on automatically above 256K",
+    PARALLEL:"Concurrent requests 1–8 (needs KV_PAGED)", KV_PAGED:"Paged KV (recommended)",
+    KV_POOL_TOKENS:"Shared KV pool tokens; 0 = one MAX_CONTEXT; smaller values round up to MAX_CONTEXT",
+    PREFILL_CHUNK:"Prefill chunk; 0 = engine default (Win 6144 / Linux 16384)",
+    CONC_PREFILL_CHUNK:"Concurrent prefill chunk, Linux only; 0 = unset",
+    QSA_INDEXER_BUDGET:"QSA retrieval budget: 0 = 2048, 4096 = extended",
+    ROPE_FACTOR:"YaRN factor; 1 = off. MAX_CONTEXT ≤ factor × native ctx",
+    KVSNAP_MAX_GB:"SSD prompt cache cap GiB; 0 = off",
+    KVSNAP_DIR:"SSD cache dir; empty = data/kvsnap",
+    RCKPT_MAX:"RAM checkpoints; 0 = off", MTP_GAMMA:"MTP gamma 1–8; 0 = auto",
+    MOE_A4:"Prefill 4-bit act (hgn v2 only, ~9% faster, less precise): 0/1/2/3",
+    MAX_IMAGES:"Images per request 1–256", VIZ:"Runtime viz (LAN can see output!)",
+    AFFINITY:"CPU affinity: lower-half / upper-half / mask (Windows only)",
+    PLE_URING:"PLE io_uring batched read (Linux only)",
+    MEMORY_CAP_GB:"cgroup memory cap GiB (Linux)",
+    MIN_AVAILABLE_GB:"Min free RAM GiB before start (Linux)",
+    START_TIMEOUT:"Engine start timeout (s)", STALL_TIMEOUT:"Load stall timeout (s, Linux)",
+    REQLOG:"Dump full requests/responses to ZIP (privacy & disk!)",
+    REQLOG_DIR:"Request log dir", REQLOG_LEVEL:"Request log verbosity 0–9",
+  }
+};
+
+// ---- 状态 ---------------------------------------------------------------------
+let CFG = null;
+let SVC = {state:"idle"};
+let PLATFORM = "windows";
+
+const $ = s => document.querySelector(s);
+const $$ = s => Array.from(document.querySelectorAll(s));
+
+let noticeTimer = null;
+function notice(msg, isErr){
+  const n = $("#notice");
+  clearTimeout(noticeTimer);
+  n.className = isErr ? "err" : "ok";
+  n.textContent = msg;
+  if (!msg) n.className = "";
+  // 成功提示 4s 自动淡出；错误常留（点击任意提示可立即关闭）
+  if (msg && !isErr) noticeTimer = setTimeout(() => {
+    n.style.opacity = "0";
+    setTimeout(() => { n.className = ""; n.style.opacity = ""; }, 450);
+  }, 4000);
+}
+$("#notice").addEventListener("click", () => {
+  clearTimeout(noticeTimer);
+  const n = $("#notice");
+  n.className = ""; n.style.opacity = "";
+});
+
+async function api(path, method, body){
+  const opt = {method: method || "GET"};
+  if (body !== undefined) opt.body = JSON.stringify(body);
+  const r = await fetch(path, opt);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error && j.error.message || (path + " → " + r.status));
+  return j;
+}
+
+// ---- 选项卡 ---------------------------------------------------------------------
+$$(".tab").forEach(el => el.addEventListener("click", () => {
+  $$(".tab").forEach(x => x.classList.toggle("on", x === el));
+  for (const id of ["weights","infer","netlog","control"])
+    $("#tab-"+id).style.display = id === el.dataset.tab ? "" : "none";
+}));
+function gotoTab(id){ $(`.tab[data-tab="${id}"]`)?.click(); }
+
+// ---- 参数表单 -------------------------------------------------------------------
+function buildParams(){
+  const hosts = {infer: $("#groups-infer"), netlog: $("#groups-netlog")};
+  for (const h of Object.values(hosts)) h.innerHTML = "";
+  for (const g of GROUPS){
+    const host = hosts[g.tab];
+    if (!host) continue;
+    const keys = g.keys.filter(f => !f.plat || f.plat === PLATFORM);
+    if (!keys.length) continue;
+    const h = document.createElement("h2");
+    h.textContent = LANG === "zh" ? g.zh : g.en;
+    host.appendChild(h);
+    for (const f of keys){
+      const row = document.createElement("div");
+      row.className = "row";
+      const lab = document.createElement("label");
+      lab.className = "k"; lab.textContent = f.k;
+      row.appendChild(lab);
+      let inp;
+      if (f.type === "check"){
+        inp = document.createElement("input");
+        inp.type = "checkbox"; inp.dataset.key = f.k; inp.dataset.check = "1";
+        inp.style.flex = "0 0 auto";
+      } else if (f.type === "select"){
+        inp = document.createElement("select");
+        inp.dataset.key = f.k;
+        for (const o of f.opts){
+          const op = document.createElement("option");
+          op.value = o; op.textContent = o; inp.appendChild(op);
+        }
+      } else if (f.type === "affinity"){
+        inp = document.createElement("select");
+        inp.dataset.key = f.k; inp.dataset.affinity = "1";
+        for (const [v, l] of [["", LANG==="zh"?"不设置（默认）":"(unset)"],
+                              ["lower-half","lower-half（CCD0）"],
+                              ["upper-half","upper-half（CCD1）"],
+                              ["custom", LANG==="zh"?"自定义 mask…":"custom mask…"]]){
+          const op = document.createElement("option");
+          op.value = v; op.textContent = l; inp.appendChild(op);
+        }
+        row.appendChild(inp);
+        const cust = document.createElement("input");
+        cust.type = "text"; cust.id = "affinity-custom";
+        cust.placeholder = LANG==="zh" ? "掩码，如 0xFFFF" : "mask, e.g. 0xFFFF";
+        cust.style.display = "none";
+        inp.addEventListener("change", () => {
+          cust.style.display = inp.value === "custom" ? "" : "none";
+        });
+        row.appendChild(cust);
+      } else {
+        inp = document.createElement("input");
+        inp.type = "text"; inp.dataset.key = f.k;
+        if (f.type === "int") inp.inputMode = "numeric";
+      }
+      if (!inp.parentNode) row.appendChild(inp);
+      if (f.browse){
+        const b = document.createElement("button");
+        b.className = "ghost mini"; b.textContent = t("browse");
+        b.dataset.browse = f.k; b.dataset.mode = f.browse;
+        row.appendChild(b);
+      }
+      const env = document.createElement("span");
+      env.className = "envtag"; env.style.display = "none";
+      env.textContent = "env"; env.title = t("envOvr");
+      row.appendChild(env);
+      host.appendChild(row);
+      const helpText = HELP[LANG][f.k];
+      if (helpText){
+        const hp = document.createElement("div");
+        hp.className = "help"; hp.textContent = helpText;
+        host.appendChild(hp);
+      }
+    }
+  }
+  // 动态生成的浏览按钮绑定
+  for (const h of Object.values(hosts))
+    h.querySelectorAll("[data-browse]").forEach(b =>
+      b.addEventListener("click", () => openBrowser2(b.dataset.browse, b.dataset.mode || "file")));
+}
+
+// ---- 配置载入/收集 ---------------------------------------------------------------
+const OPTIONAL_FILE_KEYS = ["OVERLAY_FILE","MTP_FILE","VISION_FILE",
+                            "GGUF_MTP_FILE","GGUF_VISION_FILE"];
+
+function fillConfig(){
+  const c = CFG;
+  document.documentElement.lang = LANG === "zh" ? "zh-CN" : "en";
+  const wv = c.weights_ver || "v2";
+  $$(`input[name=wv]`).forEach(r => { r.checked = r.value === wv; });
+  applyWv(wv);
+  for (const inp of $$(`[data-key]`)){
+    const k = inp.dataset.key;
+    const v = (c.values && k in c.values) ? c.values[k] : "";
+    if (inp.dataset.check) inp.checked = v === "1";
+    else if (inp.dataset.affinity){
+      const cust = $("#affinity-custom");
+      if (v === "" || v === "lower-half" || v === "upper-half"){
+        inp.value = v;
+        if (cust) cust.style.display = "none";
+      } else {
+        inp.value = "custom";
+        if (cust){ cust.value = v; cust.style.display = ""; }
+      }
+    }
+    else inp.value = v;
+    if (inp.placeholder !== undefined)
+      inp.placeholder = (c.defaults && c.defaults[k]) || "";
+    const envov = (c.env_overridden || []).includes(k);
+    inp.disabled = envov;
+    const tag = inp.parentElement.querySelector(".envtag");
+    if (tag) tag.style.display = envov ? "" : "none";
+  }
+  // 可选文件键：「不使用」勾选
+  for (const k of OPTIONAL_FILE_KEYS){
+    const cb = $(`input[data-notuse="${k}"]`);
+    const inp = $(`input[data-key="${k}"]`);
+    if (!cb || !inp) continue;
+    const v = (c.values && c.values[k]) || "";
+    cb.checked = v === "";
+    if (!inp.disabled) inp.disabled = cb.checked;
+    const envov = (c.env_overridden || []).includes(k);
+    if (envov){ cb.disabled = true; }
+  }
+}
+
+function applyWv(wv){
+  $("#w-hgn").style.display = wv === "gguf" ? "none" : "";
+  $("#w-gguf").style.display = wv === "gguf" ? "" : "none";
+  $$(`#w-hgn [data-wv]`).forEach(el => {
+    el.style.display = el.dataset.wv === wv ? "" : "none";
+  });
+  // GGUF 权重自带 tokenizer，不需要单独的词表目录
+  $("#row-tokenizer").style.display = wv === "gguf" ? "none" : "";
+  $("#help-tokenizer").style.display = wv === "gguf" ? "none" : "";
+  $("#help-gguf-tok").style.display = wv === "gguf" ? "" : "none";
+}
+
+function collectValues(){
+  const vals = {};
+  for (const inp of $$(`[data-key]`)){
+    const k = inp.dataset.key;
+    if ((CFG.env_overridden||[]).includes(k)) continue;  // env 覆盖键不写
+    if (inp.dataset.affinity){
+      vals[k] = inp.value === "custom"
+        ? (($("#affinity-custom")?.value) || "").trim()
+        : inp.value;
+      continue;
+    }
+    if (OPTIONAL_FILE_KEYS.includes(k)){
+      const cb = $(`input[data-notuse="${k}"]`);
+      vals[k] = (cb && cb.checked) ? "" : inp.value.trim();
+      continue;
+    }
+    if (inp.dataset.check) vals[k] = inp.checked ? "1" : "0";
+    else vals[k] = inp.value.trim();
+  }
+  return vals;
+}
+
+async function save(thenStart, quiet){
+  if (!quiet) notice("");
+  const wv = $(`input[name=wv]:checked`).value;
+  try{
+    await api("/api/config", "POST", {values: collectValues(), weights_ver: wv});
+    if (thenStart){
+      await api("/api/start", "POST", {});
+      notice(t("starting"));
+      gotoTab("control");  // 跳到启动页看状态
+    } else if (!quiet){
+      notice(t("saved"));
+    }
+    if (!quiet) await refreshConfig();  // 手动路径全量刷新；自动保存不动 DOM（防止打字被顶）
+    if (quiet){
+      // 静默同步服务端值（供方案匹配判断），不重排 DOM
+      const j = await api("/api/config");
+      CFG.values = j.values; CFG.weights_ver = j.weights_ver;
+      saveHintFlash();
+      updateProfileSel();
+    }
+    pollStatus();
+  }catch(e){ notice(e.message, true); }
+}
+
+// ---- 自动保存：面板内任何输入 800ms 去抖后落盘 -----------------------------------
+function saveHintFlash(){
+  const el = $("#saveHint");
+  const d = new Date();
+  const p = n => String(n).padStart(2, "0");
+  el.textContent = (LANG === "zh" ? "✓ 已自动保存 " : "✓ saved ") +
+                   `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  el.style.opacity = "1";
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.style.opacity = ".55", 2500);
+}
+let saveTimer = null;
+function autoSave(){
+  if (!CFG) return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => save(false, true), 800);
+}
+document.querySelector(".panel").addEventListener("input", autoSave);
+document.querySelector(".panel").addEventListener("change", autoSave);
+
+// ---- 文件浏览器（支持项目外目录 / 绝对路径） --------------------------------------
+let FB = {key:null, mode:"file", path:"", root:"", exts:[]};
+
+// 字段 → 默认过滤扩展名
+const FB_EXTS = {MODEL_FILE:[".hgn"], NGRAM_FILE:[".hgn"], OVERLAY_FILE:[".hgn"],
+                 MTP_FILE:[".hgn"], VISION_FILE:[".hgn"],
+                 GGUF_FILE:[".gguf"], GGUF_MTP_FILE:[".gguf"], GGUF_VISION_FILE:[".gguf"]};
+
+function fmtSize(n){
+  if (n === undefined) return "";
+  if (n >= 1e9) return (n/1e9).toFixed(1) + "G";
+  if (n >= 1e6) return (n/1e6).toFixed(1) + "M";
+  if (n >= 1e3) return (n/1e3).toFixed(1) + "K";
+  return n + "B";
+}
+function fmtTime(ts){
+  if (!ts) return "";
+  const d = new Date(ts * 1000);
+  const p = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+// 选中路径的展示形式：项目根内 → ./相对路径；外部 → 绝对路径
+function fbDisplayPath(absPath){
+  const root = (FB.root || "").replace(/\\/g, "/");
+  const p = absPath.replace(/\\/g, "/");
+  if (root && (p === root)) return ".";
+  if (root && p.startsWith(root + "/")) return "./" + p.slice(root.length + 1);
+  return p;
+}
+
+async function fbLoad(path){
+  const j = await api("/api/files?path=" + encodeURIComponent(path));
+  FB.path = j.path;         // 服务器回显的规范化绝对路径（或 @drives）
+  FB.root = j.root || FB.root;
+  $("#fbPath").value = j.path === "@drives" ? "" : j.path;
+  const list = $("#fbList");
+  list.innerHTML = "";
+  const filt = $("#fbFilter").value;  // "auto" = 按字段类型过滤；"" = 全部
+  const mk = (icon, name, onclick, size, mtime) => {
+    const d = document.createElement("div");
+    d.className = "fb-item";
+    d.innerHTML = `<span>${icon}</span><span class="nm"></span>` +
+                  `<span class="sz">${size !== undefined ? fmtSize(size) : ""}</span>` +
+                  `<span class="mt">${fmtTime(mtime)}</span>`;
+    d.children[1].textContent = name;
+    d.addEventListener("click", onclick);
+    list.appendChild(d);
+  };
+  const join = (base, name) =>
+    base === "@drives" ? name : base.endsWith("/") ? base + name : base + "/" + name;
+  for (const dir of j.dirs)
+    mk("📁", dir.name, () => fbLoad(join(j.path, dir.name)), undefined, dir.mtime);
+  for (const f of j.files){
+    if (FB.mode === "dir") continue;  // 选目录模式下文件只读
+    if (filt === "auto" && FB.exts.length &&
+        !FB.exts.some(e => f.name.toLowerCase().endsWith(e))) continue;
+    mk("📄", f.name, () => pickFile(join(j.path, f.name)), f.size, f.mtime);
+  }
+  if (!list.children.length)
+    list.innerHTML = `<div class="small" style="padding:12px">${
+      LANG === "zh" ? "（空目录或过滤后无匹配）" : "(empty or filtered out)"}</div>`;
+}
+
+function pickFile(absPath){
+  const inp = $(`input[data-key="${FB.key}"]`);
+  if (!inp) return;
+  inp.value = fbDisplayPath(absPath);
+  // 选中了文件 = 启用（去掉「不使用」）
+  const cb = $(`input[data-notuse="${FB.key}"]`);
+  if (cb){ cb.checked = false; inp.disabled = false; }
+  closeFb();
+}
+
+// 上一级：C:/x → C:/；C:/ → @drives；/a → /；@drives 时回到项目根
+function fbUp(){
+  if (FB.path === "@drives") return fbLoad("");
+  let p = FB.path.replace(/\/+$/, "");
+  if (!p) return;
+  const i = p.lastIndexOf("/");
+  let up = i <= 0 ? "/" : p.slice(0, i);
+  if (/^[A-Za-z]:$/.test(up)) up = "@drives";       // C:/ 再往上是计算机
+  if (up === p) up = "@drives";
+  fbLoad(up).catch(e => fbShowErr(e));
+}
+
+function fbShowErr(e){
+  $("#fbList").innerHTML =
+    `<div class="small" style="padding:12px;color:var(--bad)">${e.message}</div>`;
+}
+
+function openBrowser2(key, mode){
+  FB.key = key; FB.mode = mode || "file";
+  FB.exts = FB_EXTS[key] || [];
+  // 过滤下拉：有相关扩展名时才显示
+  const filt = $("#fbFilter");
+  filt.innerHTML = "";
+  if (FB.exts.length){
+    filt.innerHTML = `<option value="auto">*${FB.exts.join(" ")}</option>` +
+                     `<option value="">${t("fb_all")}</option>`;
+    filt.style.display = "";
+  } else {
+    filt.style.display = "none";
+  }
+  const cur = ($(`input[data-key="${key}"]`)?.value || "").trim();
+  // 初始目录：当前值的目录部分（相对/绝对均可，服务器解析）
+  let dir = cur.replace(/\\/g, "/");
+  if (mode !== "dir" && dir.includes("/")) dir = dir.slice(0, dir.lastIndexOf("/"));
+  if (mode !== "dir" && dir && !dir.includes("/")) dir = "";  // 裸文件名 → 项目根
+  $("#fbSelectDir").style.display = FB.mode === "dir" ? "" : "none";
+  $("#fbHint").textContent = FB.mode === "dir" ? t("fb_hint_dir") : t("fb_hint_file");
+  $("#fbModal").style.display = "";
+  $("#fbPath").focus();
+  // 目录不存在（如还没建 models/）时逐级退到项目根
+  const tryLoad = (p) => fbLoad(p).catch(() => {
+    if (!p || p === "@drives") { fbShowErr({message: "root"}); return; }
+    tryLoad(p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "");
+  });
+  tryLoad(dir);
+}
+
+function closeFb(){ $("#fbModal").style.display = "none"; }
+$("#fbCancel").addEventListener("click", closeFb);
+$("#fbUp").addEventListener("click", fbUp);
+$("#fbFilter").addEventListener("change", () => fbLoad(FB.path).catch(fbShowErr));
+$("#fbPath").addEventListener("keydown", ev => {
+  if (ev.key === "Enter") fbLoad(ev.target.value.trim()).catch(fbShowErr);
+  if (ev.key === "Escape") closeFb();
+});
+document.addEventListener("keydown", ev => {
+  if (ev.key === "Escape" && $("#fbModal").style.display !== "none") closeFb();
+});
+$("#fbModal").addEventListener("click", ev => {
+  if (ev.target === $("#fbModal")) closeFb();
+});
+$("#fbSelectDir").addEventListener("click", () => {
+  const inp = $(`input[data-key="${FB.key}"]`);
+  if (inp) inp.value = fbDisplayPath(FB.path);
+  closeFb();
+});
+// 快捷跳转条
+$$("[data-fbgo]").forEach(b =>
+  b.addEventListener("click", () => fbLoad(b.dataset.fbgo).catch(fbShowErr)));
+// 静态 HTML 里的浏览按钮（动态区的已在 buildParams 里绑过）
+$$("[data-browse]").forEach(b => {
+  if (b.closest("#groups-infer") || b.closest("#groups-netlog")) return;
+  b.addEventListener("click", () => openBrowser2(b.dataset.browse, b.dataset.mode || "file"));
+});
+
+// ---- 方案（权重 + 推理设置绑定） --------------------------------------------------
+let PROFILES = {};
+// 权重键按版本过滤；推理设置键总是进方案
+const PROFILE_WKEYS = {  // 权重版本 → 该版本的键
+  v1: ["MODEL_FILE","OVERLAY_FILE","MTP_FILE","VISION_FILE","TOKENIZER_DIR"],
+  v2: ["MODEL_FILE","NGRAM_FILE","MTP_FILE","VISION_FILE","TOKENIZER_DIR"],
+  gguf: ["GGUF_FILE","GGUF_MTP_FILE","GGUF_VISION_FILE","TOKENIZER_DIR"],
+};
+const PROFILE_IKEYS = ["MAX_CONTEXT","PARALLEL","KV_PAGED","KV_POOL_TOKENS",
+  "PREFILL_CHUNK","CONC_PREFILL_CHUNK","QSA_INDEXER_BUDGET","KVSNAP_MAX_GB",
+  "KVSNAP_DIR","MOE_A4","MAX_IMAGES","VIZ","AFFINITY","PLE_URING",
+  "MEMORY_CAP_GB","MIN_AVAILABLE_GB","START_TIMEOUT","STALL_TIMEOUT"];
+const PROFILE_KEYS = ["MODEL_FILE","NGRAM_FILE","OVERLAY_FILE","MTP_FILE",
+  "VISION_FILE","GGUF_FILE","GGUF_MTP_FILE","GGUF_VISION_FILE","TOKENIZER_DIR",
+  ...PROFILE_IKEYS];
+
+async function loadProfiles(){
+  try{ const j = await api("/api/profiles"); PROFILES = j.profiles || {}; }
+  catch(e){ PROFILES = {}; }
+  const sel = $("#profileSel");
+  sel.innerHTML = "";
+  const o0 = document.createElement("option");
+  o0.value = ""; o0.textContent = t("pf_none"); sel.appendChild(o0);
+  for (const n of Object.keys(PROFILES)){
+    const o = document.createElement("option");
+    o.value = n; o.textContent = n; sel.appendChild(o);
+  }
+  updateProfileSel();
+}
+
+// 当前配置与哪个方案完全一致（权重版本 + 方案收的全部键逐项相等）；无匹配 = 当前配置
+function matchProfileName(){
+  if (!CFG || !CFG.values) return "";
+  const wv = $(`input[name=wv]:checked`)?.value || CFG.weights_ver;
+  for (const [name, data] of Object.entries(PROFILES)){
+    if ((data.weights_ver || "v2") !== wv) continue;
+    let ok = true;
+    for (const [k, v] of Object.entries(data)){
+      if (k === "weights_ver") continue;
+      if ((CFG.values[k] ?? "") !== v) { ok = false; break; }
+    }
+    if (ok) return name;
+  }
+  return "";
+}
+function updateProfileSel(){
+  const sel = $("#profileSel");
+  if (sel) sel.value = matchProfileName();
+}
+
+$("#profileSel").addEventListener("change", async ev => {
+  ev.stopPropagation();  // 方案切换自己保存，不触发面板的自动保存
+  const name = ev.target.value;
+  if (!name) return;  // 手动选回「当前配置」不做事（只是显示态）
+  const data = PROFILES[name];
+  if (!data) return;
+  const vals = {};
+  for (const k of PROFILE_KEYS) if (k in data) vals[k] = data[k];
+  try{
+    await api("/api/config", "POST",
+              {values: vals, weights_ver: data.weights_ver || "v2"});
+    notice(`${t("pf_switched")}「${name}」`);
+    await refreshConfig();  // 内含 updateProfileSel：下拉停在所切方案上
+  }catch(e){ notice(e.message, true); updateProfileSel(); }
+});
+
+$("#btnPfSave").addEventListener("click", async () => {
+  const name = prompt(t("pf_namewhat"));
+  if (!name || !name.trim()) return;
+  const wv = $(`input[name=wv]:checked`).value;
+  const vals = collectValues();
+  // 权重键按版本收，推理设置键全收
+  const data = {weights_ver: wv};
+  for (const k of [...PROFILE_WKEYS[wv], ...PROFILE_IKEYS])
+    if (k in vals) data[k] = vals[k];
+  try{
+    await api("/api/profiles", "POST", {name: name.trim(), data});
+    notice(`${t("pf_saved")}「${name.trim()}」`);
+    await loadProfiles();
+  }catch(e){ notice(e.message, true); }
+});
+
+$("#btnPfDel").addEventListener("click", async () => {
+  const sel = $("#profileSel");
+  const name = sel.value;
+  if (!name) return;
+  if (!confirm(`${t("pf_delq")}「${name}」?`)) return;
+  try{
+    await api("/api/profiles/delete", "POST", {name});
+    notice(`${t("pf_deleted")}「${name}」`);
+    await loadProfiles();
+  }catch(e){ notice(e.message, true); }
+});
+
+// ---- 状态轮询 ---------------------------------------------------------------------
+const ST_ORDER = ["spawning","waiting_engine","waiting_api","running","stopping"];
+
+async function pollStatus(){
+  try{ SVC = await api("/api/status"); }catch(e){ return; }
+  const badge = $("#stateBadge");
+  badge.textContent = t("st")[SVC.state] || SVC.state;
+  badge.className = "state s-" + SVC.state;
+  const active = ST_ORDER.includes(SVC.state);
+  // 失败/退出但 API 还在：允许「停止」清理残留
+  const leftover = (SVC.state === "failed" || SVC.state === "exited") &&
+                   SVC.api && SVC.api.up;
+  $("#btnStart").disabled = active || leftover;
+  $("#btnStop").disabled = !(active || leftover) || SVC.state === "stopping";
+  let d = SVC.detail || "";
+  if (SVC.engine){
+    if (SVC.engine.external) d += (d?"；":"") + (LANG==="zh"?"引擎由外部启动":"engine started externally");
+    if (SVC.engine.log) d += (d?"；":"") + SVC.engine.log;
+  }
+  if (SVC.api && SVC.api.external && SVC.api.up)
+    d += (d?"；":"") + (LANG==="zh"?"API 为外部进程":"API is external");
+  $("#statusDetail").textContent = d;
+  $("#consoleLink").innerHTML =
+    (SVC.api && SVC.api.up && SVC.console_url)
+      ? `<a href="${SVC.console_url}" target="_blank">${t("console")} →</a>` : "";
+  if ($('.tab[data-tab="control"]').classList.contains("on")) refreshLog();
+}
+
+async function refreshLog(){
+  const which = $("#logWhich").value;
+  try{
+    const j = await api("/api/logs?which=" + which);
+    $("#log").textContent = j.text || "";
+    $("#logPath").textContent = j.path || "";
+    $("#log").scrollTop = $("#log").scrollHeight;
+  }catch(e){ /* 忽略 */ }
+}
+
+async function refreshConfig(){
+  CFG = await api("/api/config");
+  LANG = CFG.lang || "zh";
+  PLATFORM = CFG.platform;
+  document.title = LANG === "zh" ? "Qwenox 启动器" : "Qwenox Launcher";
+  $("#langBtn").textContent = LANG === "zh" ? "EN" : "中文";
+  $$("[data-i18n]").forEach(el => { el.textContent = t(el.dataset.i18n); });
+  // 「计算机」按平台换：Linux 是根目录 /
+  const drv = $("#fbDrives");
+  drv.textContent = PLATFORM === "windows" ? "计算机" : "/";
+  drv.dataset.fbgo = PLATFORM === "windows" ? "@drives" : "/";
+  buildParams();
+  fillConfig();
+  loadProfiles();
+}
+
+// ---- 事件 ---------------------------------------------------------------------
+$$(`input[name=wv]`).forEach(r => r.addEventListener("change", () => applyWv(r.value)));
+document.addEventListener("change", ev => {
+  const cb = ev.target.closest("input[data-notuse]");
+  if (cb){
+    const inp = $(`input[data-key="${cb.dataset.notuse}"]`);
+    if (inp) inp.disabled = cb.checked;
+  }
+});
+$("#btnStart").addEventListener("click", () => save(true));
+$("#btnStop").addEventListener("click", async () => {
+  if (!confirm(t("confirmStop"))) return;
+  notice("");
+  try{ await api("/api/stop", "POST", {}); notice(t("stopping")); }
+  catch(e){ notice(e.message, true); }
+  pollStatus();
+});
+$("#btnQuit").addEventListener("click", async () => {
+  const active = ST_ORDER.includes(SVC.state);
+  if (active && !confirm(t("confirmQuit"))) return;
+  try{ await api("/api/shutdown" + (active ? "?force=1" : ""), "POST", {}); }catch(e){}
+  document.body.innerHTML =
+    `<p style="padding:40px;text-align:center;color:#9aa6c0">launcher_settings ${
+      LANG==="zh"?"已退出，本页可关闭（托盘图标可能仍在，可一并退出）。":"has exited; this page can be closed."}</p>`;
+});
+$("#langBtn").addEventListener("click", async () => {
+  LANG = LANG === "zh" ? "en" : "zh";
+  try{ await api("/api/config", "POST", {values:{}, lang: LANG}); }catch(e){}
+  await refreshConfig();
+  pollStatus();
+});
+$("#logWhich").addEventListener("change", refreshLog);
+
+// ---- 启动 ---------------------------------------------------------------------
+(async () => {
+  try{
+    await refreshConfig();
+    await pollStatus();
+  }catch(e){
+    notice(e.message, true);
+  }
+  setInterval(pollStatus, 2000);
+  setInterval(() => { if ($('.tab[data-tab="control"]').classList.contains("on")) refreshLog(); }, 3000);
+})();
+</script>
+</body>
+</html>
