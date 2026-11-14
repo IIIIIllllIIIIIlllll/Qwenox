@@ -3457,6 +3457,165 @@ GenOutcome run_generation_guarded(GenSpec& spec, const ThinkGuardCtx& g,
 
     std::string reasoning, answer;
     split_reasoning(out.text, true, &reasoning, &answer);
+
+    // D: the turn ended inside an unterminated tool call. The wild shape is
+    // "我来X:" + <tool_call> + EOS: the parser buffers the dangling opener, the
+    // wire reply looks like an empty stop turn, the client stores it, and the
+    // stored exemplar few-shots the model into ending early again
+    // (dev-docs/BUG-FINISH-LENGTH.md). Resume on the same slot with EOS banned
+    // so the call body actually gets written, stopping at </tool_call>; a stop
+    // hit withholds the closer text, so it is put back afterwards. Greedy
+    // cannot ban (engine BIAS is sampler-only): its single attempt replays the
+    // early EOS and fails — same tolerance as A/B.
+    bool partial_call = false;
+    if (!is_blank_text(answer) && g.tools != nullptr && g.tools->enabled()) {
+        const size_t last_open = answer.rfind("<tool_call>");
+        if (last_open != std::string::npos &&
+            answer.find("</tool_call>", last_open) == std::string::npos) {
+            // Anything unterminated after the last opener is resumable by
+            // appending tokens. Note a bare opener ends the probe in Broken
+            // (the parser cannot know a <function= would follow), so Broken
+            // is not grounds to skip; garbled text simply fails the attempts.
+            toolparse::StreamParser probe(g.tools->tools, nullptr, true, g.tool_format, "");
+            probe.feed(answer);
+            probe.finish();
+            partial_call = probe.has_partial_call();
+        }
+    }
+    if (partial_call) {
+        // The resume context is prompt + generated ids: it ends right after
+        // the opener (the EOS is not part of out.tokens, same as A/B relies on).
+        if (static_cast<long long>(spec.ids.size() + out.tokens.size()) + 16 >
+            static_cast<long long>(g_cfg.context)) {
+            fprintf(stderr, "REQ %s think guard: open tool call, but no context left to "
+                            "resume\n", log_tag.c_str());
+            return out;
+        }
+        const int im_end_id = g_tok.added_token_id("<|im_end|>");
+        const int endoftext_id = g_tok.added_token_id("<|endoftext|>");
+        std::vector<int> prompt_ids = spec.ids;
+        spec.ids.insert(spec.ids.end(), out.tokens.begin(), out.tokens.end());
+        std::vector<long long> snaps = std::move(spec.snaps);
+        spec.snaps.clear();  // the hints index the original prompt only
+        const unsigned long long seed = spec.seed;
+        // The resume only needs to cover one call body, so it gets its own
+        // ceiling: the client budget may be huge or absent (the whole
+        // context), and a model that never writes </tool_call> would otherwise
+        // generate until it. QWENOX_TOOL_CALL_RESUME_MAX overrides; 8192
+        // leaves room for a call that carries a whole HTML file.
+        static const int call_resume_max = [] {
+            const char* env = std::getenv("QWENOX_TOOL_CALL_RESUME_MAX");
+            if (env != nullptr) {
+                const int value = std::atoi(env);
+                if (value > 0) return value;
+            }
+            return 8192;
+        }();
+        long long budget = call_resume_max;
+        if (max_tokens > 0)
+            budget = std::min(budget, std::max<long long>(max_tokens - out.n_gen, 1));
+        // Whether running into `budget` would be our ceiling rather than the
+        // client's: then a "length" end is not the client's budget running out.
+        const bool cap_binds = max_tokens <= 0 || call_resume_max < max_tokens - out.n_gen;
+        spec.max_tokens = static_cast<int>(budget);
+        const size_t bias_before = spec.bias.size();
+        if (spec.sample) {
+            for (int id : {im_end_id, endoftext_id}) {
+                if (id < 0) continue;
+                bool client = false;
+                for (const auto& b : spec.bias) client = client || b.first == id;
+                if (!client) spec.bias.emplace_back(id, -100.0f);  // no early EOS again
+            }
+        }
+        const size_t stop_before = spec.stop.size();
+        spec.stop.push_back("</tool_call>");
+        fprintf(stderr, "REQ %s think guard: turn ended inside a tool call, resuming "
+                        "(%zu generated)\n", log_tag.c_str(), out.tokens.size());
+
+        bool completed = false;
+        bool hit_cap = false;
+        int resume_cached = 0;
+        long long resume_prompt = 0;
+        const int attempts = spec.sample ? 3 : 1;
+        for (int attempt = 1; attempt <= attempts && !completed; ++attempt) {
+            if (attempt > 1) {
+                // splitmix64 step: same seed => the same early end of turn
+                unsigned long long z = (spec.seed += 0x9E3779B97F4A7C15ull);
+                z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+                z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+                spec.seed = z ^ (z >> 31);
+            }
+            GenOutcome rest = run_generation(spec, on_delta, log_tag, on_wait, &slot);
+            resume_cached = rest.n_cached;
+            resume_prompt = rest.n_prompt;
+            out.text += rest.text;
+            out.n_gen += rest.n_gen;
+            out.prefill_ms += rest.prefill_ms;
+            out.decode_ms += rest.decode_ms;
+            out.rounds += rest.rounds;
+            out.commit += rest.commit;
+            out.proposed += rest.proposed;
+            out.ng_rounds += rest.ng_rounds;
+            out.ng_proposed += rest.ng_proposed;
+            out.ng_accepted += rest.ng_accepted;
+            out.logprobs.insert(out.logprobs.end(), rest.logprobs.begin(), rest.logprobs.end());
+            out.reason = rest.reason;
+            out.hit_stop = rest.hit_stop;
+            out.stop_hit = rest.stop_hit;
+            if (rest.client_gone) {
+                out.client_gone = true;
+                break;
+            }
+            completed = rest.hit_stop && rest.stop_hit == "</tool_call>";
+            if (rest.reason == "length") {
+                // A short count means the context ran out first: a real length.
+                hit_cap = cap_binds && rest.n_gen >= budget;
+                break;
+            }
+            if (rest.hit_stop && !completed) break;       // a client stop string: terminal
+            // Text an attempt wrote has already gone out through on_delta; a
+            // retry from the opener would be spliced onto it. Only an attempt
+            // that produced nothing (the early EOS replayed) is retried.
+            if (!completed && !is_blank_text(rest.text)) break;
+            if (!completed)
+                fprintf(stderr, "REQ %s think guard: tool-call resume %d/%d still open\n",
+                        log_tag.c_str(), attempt, attempts);
+        }
+        spec.ids = std::move(prompt_ids);
+        spec.snaps = std::move(snaps);
+        spec.max_tokens = max_tokens;
+        spec.seed = seed;
+        spec.bias.resize(bias_before);
+        spec.stop.resize(stop_before);
+
+        if (completed) {
+            // Put the closer back: the stop hit withheld it. It must also flow
+            // through on_delta so a streaming client's parser sees the call
+            // close (non-stream re-parses out.text instead).
+            if (on_delta && !on_delta("</tool_call>")) {
+                out.client_gone = true;
+                return out;
+            }
+            out.text += "</tool_call>";
+            out.guard = "resumed_open_tool_call";
+        } else {
+            out.guard = "resume_failed";
+            if (hit_cap) {
+                // Our resume ceiling, not the client's max_tokens, ended the
+                // turn: report the model's own stop, as before the resume. A
+                // "length" here would make clients treat the turn as cut off
+                // by their budget (the original bug's symptom).
+                out.reason = "stop";
+                fprintf(stderr, "REQ %s think guard: tool-call resume hit the %d-token "
+                                "ceiling without </tool_call>\n", log_tag.c_str(),
+                        call_resume_max);
+            }
+        }
+        fprintf(stderr, "REQ %s think guard: %s (resume prompt=%lld cached=%d)\n",
+                log_tag.c_str(), out.guard.c_str(), resume_prompt, resume_cached);
+        return out;
+    }
+
     if (!is_blank_text(answer)) return out;
 
     // C: a finished tool call left inside the reasoning.
@@ -3576,6 +3735,21 @@ GenOutcome run_generation_guarded(GenSpec& spec, const ThinkGuardCtx& g,
     fprintf(stderr, "REQ %s think guard: %s (resume prompt=%lld cached=%d)\n", log_tag.c_str(),
             out.guard.c_str(), resume_prompt, resume_cached);
     return out;
+}
+
+// The last ~80 bytes of a reply, newline-escaped, for the partial-call
+// diagnostic: the tail tells a bare <tool_call> opener apart from a call cut
+// mid-body or garbled text.
+std::string reply_tail(const std::string& text) {
+    size_t at = 0;
+    if (text.size() > 80) at = utf8_boundary_at_or_before(text, text.size() - 80);
+    std::string tail;
+    for (const char c : text.substr(at)) {
+        if (c == '\n') tail += "\\n";
+        else if (c == '\r') tail += "\\r";
+        else tail += c;
+    }
+    return tail;
 }
 
 // POST /v1/chat/completions
@@ -3734,9 +3908,22 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
         j["created"] = created;
         j["model"] = g_cfg.model;
         j["object"] = "chat.completion";
-        const std::string finish = (o.reason == "length" || parser.has_partial_call())
-                                       ? "length"
-                                       : (parser.calls().empty() ? o.reason : "tool_calls");
+        // finish_reason says why generation stopped, nothing else: a partial
+        // tool call on a natural stop stays "stop" (never upgraded to
+        // "length", which means a real budget hit), and blocks "tool_calls"
+        // so clients don't execute a half batch (dev-docs/BUG-FINISH-LENGTH.md).
+        const std::string finish = o.reason == "length" ? "length"
+                                   : parser.has_partial_call() || parser.calls().empty()
+                                       ? o.reason
+                                       : "tool_calls";
+        if (parser.has_partial_call())
+            fprintf(stderr, "REQ %s partial tool call at end of turn (reason=%s "
+                            "guard=%s tail=%s)\n", id.c_str(), o.reason.c_str(),
+                    o.guard.c_str(), reply_tail(o.text).c_str());
+        for (const auto& call : parser.calls())
+            if (!toolparse::function_exists(tool_setup.tools, call.name))
+                fprintf(stderr, "REQ %s undeclared function passed through: %s\n",
+                        id.c_str(), call.name.c_str());
         json choice{{"index", 0}, {"finish_reason", finish}, {"message", msg}};
         if (spec.logprobs) choice["logprobs"] = logprobs_json(o.logprobs);
         j["choices"] = json::array({std::move(choice)});
@@ -3800,9 +3987,20 @@ void handle_chat(const http::Request& q, http::Response* r, http::Stream* st) {
         if (!dispatch_tool_events(parser.feed(o.reasoning_calls))) return;
     }
     if (!dispatch_tool_events(parser.finish())) return;
-    const std::string finish = (o.reason == "length" || parser.has_partial_call())
-                                   ? "length"
-                                   : (parser.calls().empty() ? o.reason : "tool_calls");
+    // Same rule as the non-stream path above: partial call never reads as
+    // "length", and holds finish at the underlying stop reason.
+    const std::string finish = o.reason == "length" ? "length"
+                               : parser.has_partial_call() || parser.calls().empty()
+                                   ? o.reason
+                                   : "tool_calls";
+    if (parser.has_partial_call())
+        fprintf(stderr, "REQ %s partial tool call at end of turn (reason=%s "
+                        "guard=%s tail=%s)\n", id.c_str(), o.reason.c_str(),
+                o.guard.c_str(), reply_tail(o.text).c_str());
+    for (const auto& call : parser.calls())
+        if (!toolparse::function_exists(tool_setup.tools, call.name))
+            fprintf(stderr, "REQ %s undeclared function passed through: %s\n",
+                    id.c_str(), call.name.c_str());
     send_frame(st, chunk(json::object(), finish.c_str()));
     if (include_usage) {
         json u;
@@ -3954,9 +4152,7 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
                                  {"total_tokens", pt + outcome->n_gen}};
             if (!outcome->guard.empty()) response["usage"]["think_guard"] = outcome->guard;
             if (status == "incomplete")
-                response["incomplete_details"] = {
-                    {"reason", outcome->reason == "length" ? "max_output_tokens"
-                                                              : "invalid_tool_call"}};
+                response["incomplete_details"] = {{"reason", "max_output_tokens"}};
         }
         return response;
     };
@@ -3980,7 +4176,11 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
         parser.feed(o.reasoning_calls);
         parser.finish();
 
-        const bool incomplete = o.reason == "length" || parser.has_partial_call();
+        // Only a real budget exhaustion makes the response incomplete. A
+        // partial tool call on a natural stop leaves the response "completed";
+        // the partial call is simply absent from the output items
+        // (dev-docs/BUG-FINISH-LENGTH.md).
+        const bool incomplete = o.reason == "length";
         json output = json::array();
         if (!parser.content().empty() || (!incomplete && parser.calls().empty())) {
             output.push_back(message_item(make_id("msg_"),
@@ -4165,10 +4365,9 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
     if (!dispatch_tool_events(parser.finish())) return;
     if (!finish_message() || !ensure_created()) return;
 
-    bool partial_call = parser.has_partial_call();
+    // Flush calls still open at end of stream as per-item "incomplete".
     for (CallState& call : call_states) {
         if (!call.open) continue;
-        partial_call = true;
         json item = function_item(call.item_id, call.call_id, "incomplete",
                                   call.name, call.arguments);
         if (!event("response.output_item.done",
@@ -4178,7 +4377,9 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
         call.open = false;
     }
 
-    const bool incomplete = o.reason == "length" || partial_call;
+    // Per-item "incomplete" markers above stay, but only a real budget hit
+    // marks the whole response incomplete.
+    const bool incomplete = o.reason == "length";
     if (output_slots.empty() && !incomplete) {
         if (!start_message() || !finish_message()) return;
     }
@@ -4621,8 +4822,11 @@ void messages_impl(const http::Request& q, http::Response* r, http::Stream* st) 
         return u;
     };
     auto stop_reason = [](const GenOutcome& o, bool partial_call, bool has_calls) {
-        if (o.reason == "length" || partial_call) return "max_tokens";
-        if (has_calls) return "tool_use";
+        // max_tokens only on a real budget hit; a partial call keeps the
+        // underlying reason and is never reported as a usable tool_use
+        // (dev-docs/BUG-FINISH-LENGTH.md).
+        if (o.reason == "length") return "max_tokens";
+        if (has_calls && !partial_call) return "tool_use";
         if (o.hit_stop) return "stop_sequence";
         return "end_turn";
     };

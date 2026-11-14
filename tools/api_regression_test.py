@@ -443,6 +443,18 @@ def main():
           "上海" in json.loads(required_call["function"]["arguments"])["city"],
           "chat-tool-required-multiple", raw[:1000])
 
+    # A complete call of a function the request did not declare goes out as
+    # written (vLLM/llama.cpp behavior): the client answers with a tool error
+    # and the model can correct itself, instead of the call vanishing.
+    status, _, raw = request(args.base, "/v1/chat/completions", dict(tool_body, seed=9004))
+    choice = json.loads(raw)["choices"][0]
+    undeclared_calls = choice["message"].get("tool_calls", [])
+    check(status == 200 and choice["finish_reason"] == "tool_calls" and
+          len(undeclared_calls) == 1 and
+          undeclared_calls[0]["function"]["name"] == "delete_file" and
+          json.loads(undeclared_calls[0]["function"]["arguments"]) == {"path": "/tmp/x"},
+          "chat-tool-undeclared-passthrough", raw[:1000])
+
     response_tools = [
         {"type": "function", "name": "get_weather",
          "parameters": tools[0]["function"]["parameters"]},

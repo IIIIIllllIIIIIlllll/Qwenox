@@ -175,6 +175,9 @@ int main() {
     check(partial_second.calls().size() == 1 && partial_second.has_partial_call(),
           "later incomplete call does not hide a partial result");
 
+    // Invalid-but-well-formed calls are passed through as written (vLLM and
+    // llama.cpp behave the same): the client answers with a tool error and the
+    // model can correct itself. Only structurally unclosable text is partial.
     json required_tools = tools();
     required_tools[0]["function"]["parameters"]["required"] =
         json::array({"path", "content"});
@@ -183,14 +186,21 @@ int main() {
                           "<parameter=path>\n/tmp/a\n</parameter>\n"
                           "</function>\n</tool_call>");
     missing_required.finish();
-    check(missing_required.has_partial_call() && missing_required.calls().empty(),
-          "missing required argument is not returned as a complete call");
+    check(!missing_required.has_partial_call() && missing_required.calls().size() == 1 &&
+              missing_required.calls()[0].name == "write_file" &&
+              json::parse(missing_required.calls()[0].arguments) ==
+                  json::object({{"path", "/tmp/a"}}),
+          "missing required argument still goes out as a complete call");
 
     toolparse::StreamParser unknown_tool(tools(), make_id);
-    unknown_tool.feed("<tool_call>\n<function=delete_file>\n</function>\n</tool_call>");
+    unknown_tool.feed("<tool_call>\n<function=delete_file>\n<parameter=path>\n"
+                      "/tmp/x\n</parameter>\n</function>\n</tool_call>");
     unknown_tool.finish();
-    check(unknown_tool.has_partial_call() && unknown_tool.calls().empty(),
-          "unknown function is not returned as a complete call");
+    check(!unknown_tool.has_partial_call() && unknown_tool.calls().size() == 1 &&
+              unknown_tool.calls()[0].name == "delete_file" &&
+              json::parse(unknown_tool.calls()[0].arguments) ==
+                  json::object({{"path", "/tmp/x"}}),
+          "unknown function goes out as a complete call, values as raw strings");
 
     json messages = json::array(
         {{{"role", "assistant"},

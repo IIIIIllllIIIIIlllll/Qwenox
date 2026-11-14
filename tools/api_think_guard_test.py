@@ -251,6 +251,58 @@ def run_checks(env):
     check(r["calls"] == [] and r["content"] == "Hi" and guard_of(r) == "resumed_unclosed",
           "C-without-tools-resumes", r["raw"][:1500])
 
+    # D: EOS right after a bare <tool_call> opener. The resume continues on the
+    # same slot with EOS banned and a stop at </tool_call>, so the call body is
+    # written and the call closes. The first run is think + "</think>\n\n" +
+    # the opener = 9 tokens; the resume prompt ends with the opener.
+    for stream in (False, True):
+        tag = "stream" if stream else "nonstream"
+        env.guard_log()
+        r = chat(env, dict(sampled, messages=user, tools=TOOLS, max_tokens=8000), stream)
+        log = env.guard_log()
+        check(r["finish"] == "tool_calls" and
+              r["calls"] == [("get_weather", {"city": "北京"})] and
+              r["content"] == "" and guard_of(r) == "resumed_open_tool_call" and
+              len(log) == 2 and not log[0]["resumed"] and log[1]["resumed"] and
+              log[1]["tail"][-1] == 248058 and log[1]["max_tokens"] == 8000 - 9 and
+              any(value == -100.0 for _, value in log[1]["bias"]),
+              f"D-chat-{tag}", (r["raw"][:1500], log))
+    r = responses(env, dict(sampled, input="weather?", tools=RESPONSE_TOOLS,
+                            max_output_tokens=8000), False)
+    check(r["calls"] == [("get_weather", {"city": "北京"})] and
+          r["status"] == "completed" and guard_of(r) == "resumed_open_tool_call",
+          "D-responses-nonstream", r["raw"][:1500])
+    r = messages(env, dict(sampled, messages=user, tools=ANTHROPIC_TOOLS, max_tokens=8000),
+                 False)
+    check(r["calls"] == [("get_weather", {"city": "北京"})] and r["finish"] == "tool_use" and
+          guard_of(r) == "resumed_open_tool_call", "D-messages-nonstream", r["raw"][:1500])
+    # Greedy cannot ban the EOS (engine BIAS is sampler-only): the single
+    # resume attempt replays the early end of turn, the reply stays as it was.
+    # finish_reason still reports the real stop reason, not "length".
+    env.guard_log()
+    r = chat(env, dict(greedy, messages=user, tools=TOOLS, max_tokens=8000), False)
+    log = env.guard_log()
+    check(r["finish"] == "stop" and r["calls"] == [] and r["content"] == "" and
+          guard_of(r) == "resume_failed" and len(log) == 2 and log[1]["resumed"],
+          "D-greedy-resume-failed", (r["raw"][:1200], log))
+    # The resume never closes the call. Running into our own 8192-token resume
+    # ceiling is not the client's budget: finish stays "stop". Running into
+    # the client's max_tokens (8150 - 9 left, below the ceiling) is a real
+    # "length". Neither retries: the attempt's text is already out.
+    for max_tokens, want, tag in ((8300, "stop", "ceiling"), (8150, "length", "budget")):
+        env.guard_log()
+        r = chat(env, dict(sampled, messages=user, tools=TOOLS, max_tokens=max_tokens), False)
+        log = env.guard_log()
+        check(r["finish"] == want and r["calls"] == [] and r["content"] == "" and
+              guard_of(r) == "resume_failed" and len(log) == 2 and log[1]["resumed"] and
+              log[1]["max_tokens"] == min(8192, max_tokens - 9),
+              f"D-resume-{tag}-{want}", (r["raw"][:600], log))
+    # Without tools the opener is literal text and the guard stays out of it.
+    env.guard_log()
+    r = chat(env, dict(greedy, messages=user, max_tokens=8000), False)
+    check(r["calls"] == [] and guard_of(r) is None and len(env.guard_log()) == 1,
+          "D-without-tools-no-guard", r["raw"][:800])
+
     # Not the guard's cases: cut by max_tokens, no think block, forced tool
     # choice, a client stop string.
     env.guard_log()

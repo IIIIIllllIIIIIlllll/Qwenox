@@ -153,16 +153,6 @@ json coerce_value(const std::string& raw, const std::vector<std::string>& types)
     return raw;
 }
 
-bool function_exists(const json& tools, const std::string& name) {
-    for (const auto& tool : tools) {
-        if (tool.is_object() && tool.contains("function") && tool["function"].is_object() &&
-            tool["function"].contains("name") && tool["function"]["name"].is_string() &&
-            tool["function"]["name"].get_ref<const std::string&>() == name)
-            return true;
-    }
-    return false;
-}
-
 bool append_function(const json& source, json* output, std::string* error) {
     json function;
     if (source.contains("function")) {
@@ -234,6 +224,16 @@ std::string message_role(const json& message) {
 }
 
 }  // namespace
+
+bool function_exists(const json& tools, const std::string& name) {
+    for (const auto& tool : tools) {
+        if (tool.is_object() && tool.contains("function") && tool["function"].is_object() &&
+            tool["function"].contains("name") && tool["function"]["name"].is_string() &&
+            tool["function"]["name"].get_ref<const std::string&>() == name)
+            return true;
+    }
+    return false;
+}
 
 std::string ToolChoice::parser_prefix(const std::string& format) const {
     if (!forced()) return {};
@@ -482,22 +482,13 @@ void StreamParser::finish_parameter(std::string raw, std::vector<Event>* events)
 }
 
 bool StreamParser::valid_call() const {
+    // The arguments are assembled by the parser itself, so this is only a
+    // defensive check on the JSON framing. Undeclared names and missing
+    // required parameters do not invalidate a call: it is passed to the
+    // client as written, and the client's tool error lets the model recover.
     json args = json::parse(current_.arguments + (argument_count_ == 0 ? "{}" : "}"),
                             nullptr, false);
-    if (!args.is_object()) return false;
-    for (const auto& tool : tools_) {
-        const json& function = tool["function"];
-        if (function["name"] != current_.name) continue;
-        if (!function.contains("parameters") || !function["parameters"].is_object())
-            return true;
-        const json& schema = function["parameters"];
-        if (!schema.contains("required") || !schema["required"].is_array()) return true;
-        for (const auto& key : schema["required"])
-            if (key.is_string() && !args.contains(key.get_ref<const std::string&>()))
-                return false;
-        return true;
-    }
-    return false;
+    return args.is_object();
 }
 
 bool StreamParser::finish_call(std::vector<Event>* events) {
@@ -562,7 +553,6 @@ std::vector<Event> StreamParser::pump(bool final) {
                     *out = json::parse(python_literals_to_json(text), nullptr, false);
                 return out->is_object() && out->contains("name") &&
                        (*out)["name"].is_string() &&
-                       function_exists(tools_, (*out)["name"].get<std::string>()) &&
                        (forced_name_.empty() ||
                         (*out)["name"].get<std::string>() == forced_name_);
             };
@@ -666,10 +656,10 @@ std::vector<Event> StreamParser::pump(bool final) {
                 state_ = State::Broken;
                 continue;
             }
-            if (!function_exists(tools_, buffer_.substr(at, close - at))) {
-                state_ = State::Broken;
-                continue;
-            }
+            // Undeclared names are passed through (vLLM/llama.cpp behave the
+            // same): the client can answer with a tool error and the model can
+            // correct itself next turn. Without a schema every parameter value
+            // stays the raw string the model wrote.
             start_call(buffer_.substr(at, close - at), &events);
             buffer_.erase(0, close + 1);
             state_ = State::Between;

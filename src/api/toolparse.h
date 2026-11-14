@@ -31,6 +31,11 @@ bool normalize_tools(const json* input, json* output, std::string* error);
 bool parse_tool_choice(const json* input, const json& tools, ToolChoice* output,
                        std::string* error);
 
+// True when `name` is one of the declared function tools. Calls with
+// undeclared names still parse and go out to the client; this exists for the
+// tool_choice validation and the diagnostic log.
+bool function_exists(const json& tools, const std::string& name);
+
 // Parse JSON-string arguments in assistant history and put contiguous tool
 // results back into the order declared by the preceding tool_calls array.
 bool normalize_messages(json* messages, std::string* error);

@@ -42,7 +42,7 @@ BIAS_LOG = []
 IDS_LOG = []
 
 
-def guard_scenario(key, resumed, max_tokens):
+def guard_scenario(key, resumed, max_tokens, sampled):
     """(tokens, reason) for a think-guard scenario GEN."""
     if key == 7100:  # A: the turn ends inside the unclosed think block
         return (GUARD_HI if resumed else GUARD_THINK), "done"
@@ -70,6 +70,17 @@ def guard_scenario(key, resumed, max_tokens):
         return tokens, ("length" if len(tokens) == max_tokens else "done")
     if key == 7900:  # think-only text that a client stop string cuts
         return GUARD_THINK, "done"
+    if key == 8000:  # D: EOS right after a bare <tool_call> opener. The resume
+        if not resumed:  # prompt ends with the opener (ids[-1] == 248058).
+            return GUARD_THINK + [248069, 271, 248058], "done"
+        if not sampled:  # greedy cannot ban the EOS: the early end replays
+            return [], "done"
+        return GUARD_CALL[1:], "done"  # call body + </tool_call>
+    if key in (8200, 8300):  # D, but the resume never writes </tool_call>: it
+        if not resumed:      # runs until its max_tokens. A request of 8300
+            return GUARD_THINK + [248069, 271, 248058], "done"  # resumes at
+        tokens = (GUARD_THINK * 1400)[:max_tokens]  # the 8192 ceiling (key 8200)
+        return tokens, ("length" if len(tokens) == max_tokens else "done")
     return None
 
 
@@ -239,13 +250,19 @@ def handle(conn):
 
             max_tokens = int(fields[2])
             guard_key = (max_tokens + 99) // 100 * 100
-            if 7100 <= guard_key <= 7900:
-                resumed = ids[-2:] == [248069, 271] and guard_key != 7700
-                tokens, reason = guard_scenario(guard_key, resumed, max_tokens)
+            if 7100 <= guard_key <= 8000 or guard_key in (8200, 8300):
+                # A/B resume prompts end with the appended closer
+                # "</think>\n\n"; a shape-D resume prompt ends with the
+                # dangling <tool_call> opener the first run generated.
+                resumed = (ids[-2:] == [248069, 271] and guard_key != 7700) or \
+                          (guard_key in (8000, 8200) and ids[-1:] == [248058])
+                tokens, reason = guard_scenario(guard_key, resumed, max_tokens,
+                                                "SAMPLE" in fields)
                 with TRACE_LOCK:
                     GUARD_LOG.append({"key": guard_key, "resumed": resumed,
                                       "max_tokens": max_tokens, "seed": seed,
-                                      "sampled": "SAMPLE" in fields, "tail": ids[-40:]})
+                                      "sampled": "SAMPLE" in fields, "bias": bias,
+                                      "tail": ids[-40:]})
                 for token in tokens:
                     send_line(conn, f"T {req} {token} -0.1")
                 send_line(conn, f"D {req} {reason} {n_ids} {len(tokens)} 1.0 2.0 0 0 0 0 0")
@@ -275,6 +292,15 @@ def handle(conn):
                 tokens = [447, 67017, 29, 198, 27, 15704, 28, 8656, 29, 198,
                           98817, 198, 510, 15704, 29, 198, 510, 1628, 29, 198,
                           248059]
+                tokens = [(token, -0.1) for token in tokens]
+            elif "9004" in fields:
+                # <tool_call> delete_file(path=/tmp/x) </tool_call>: the
+                # function is NOT among the declared tools; the API must pass
+                # the call through as written, not swallow it. (Leads with
+                # "</think>\n\n" like 9001 so the reply is a normal answer.)
+                tokens = [248069, 271, 248058, 198, 27, 1628, 28, 4394, 2378,
+                          29, 198, 27, 15704, 79114, 29, 198, 55101, 10459, 198,
+                          510, 15704, 29, 198, 510, 1628, 29, 198, 248059]
                 tokens = [(token, -0.1) for token in tokens]
             elif n_ids <= 2:
                 tokens = [(4130, -0.5), (284, -0.25)]  # " Par" + "is"
