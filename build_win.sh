@@ -14,13 +14,15 @@
 #   QWENOX_ENGINE_OUT=build/qwenox-engine-candidate.exe bash build_win.sh engine
 #   QWENOX_API_OUT=build/qwenox-webp-candidate.exe bash build_win.sh api
 #                                # 独立候选引擎/API，不覆盖正在运行的默认 exe
+#   QWENOX_LTO_PARTITIONS=8 bash build_win.sh engine
+#                                # Full LTO 并行代码生成分区；默认 min(nproc,16)，1 为串行
 #   bash build_win.sh npu        # NPU 检测工具（仅 Windows）→ build/npucheck-win.exe
 #                                #   （GUI）+ build/npuio.exe + build/gpuload.exe；
 #                                #   XRT 头/def 与 xclbin/insts 不进仓库，默认取自
 #                                #   ~/npuprobe（NPUASSETS=/path 覆盖），缺资产时该
 #                                #   目标报错，但不影响 all
-# 同样检测到这些资产时，engine/bench/test 会编入 NPU 卸载（-DQWENOX_NPU=1，
-# 运行时 QWENOX_NPU=1 启用，QWENOX_BUILD_NPU=0 不编入）。
+# engine/bench/test 默认不编入 NPU；显式 QWENOX_BUILD_NPU=1 且资产齐全时才编入
+# （-DQWENOX_NPU=1；运行时还需 QWENOX_NPU=1 才启用）。
 #
 # 前置：TheRock 多架构包（默认 C:\therock-dist-windows-multiarch-10.0.0\...，
 # 可用 THEROCK=/path 覆盖）；GPU_ARCH 默认 gfx1151。
@@ -101,17 +103,31 @@ for f in "$TR/bin/rocblas/library/"*"$GPU_ARCH"*; do
 done
 fi  # NEED_HIP
 
+# TheRock 默认对 HIP 设备代码做 Full LTO。整模块优化仍是串行的，但
+# --lto-partitions 可把后续代码生成分到多个 worker；16 在 32 核机器上实测优于
+# 32，也避免 all 同时编译 engine/bench/API 时过度超额订阅。
+CPU_COUNT="$(nproc 2>/dev/null || echo 16)"
+[[ "$CPU_COUNT" =~ ^[1-9][0-9]*$ ]] || CPU_COUNT=16
+DEFAULT_LTO_PARTITIONS=$((CPU_COUNT < 16 ? CPU_COUNT : 16))
+LTO_PARTITIONS="${QWENOX_LTO_PARTITIONS:-$DEFAULT_LTO_PARTITIONS}"
+[[ "$LTO_PARTITIONS" =~ ^[1-9][0-9]*$ ]] || {
+  echo "QWENOX_LTO_PARTITIONS 必须是正整数（1 为串行）" >&2; exit 2;
+}
+HIP_LTO_FLAGS=(-Xoffload-linker "--lto-partitions=$LTO_PARTITIONS")
+if (( NEED_HIP )) && [[ "$TARGET" != npu ]]; then
+  echo "[并行] HIP Full LTO 代码生成分区：$LTO_PARTITIONS"
+fi
+
 # _CRT_NONSTDC_NO_DEPRECATE：屏蔽 MSVC 头文件对 strdup 等 POSIX 名的
 # deprecated 标记（_CRT_NONSTDC_DEPRECATE → __declspec(deprecated)）。
-FLAGS=(-O3 -std=c++17 --offload-arch="$GPU_ARCH" -D_CRT_SECURE_NO_WARNINGS
-       -D_CRT_NONSTDC_NO_DEPRECATE "${VER_FLAGS[@]}"
+FLAGS=(-O3 -std=c++17 --offload-arch="$GPU_ARCH" "${HIP_LTO_FLAGS[@]}"
+       -D_CRT_SECURE_NO_WARNINGS -D_CRT_NONSTDC_NO_DEPRECATE "${VER_FLAGS[@]}"
        -I"$TR/include" -Lbuild/winlibs -lrocblas -lhipblaslt)
 
 # ---- NPU 卸载（QWENOX_NPU，仅 Windows）-------------------------------------
-# 检测到 XRT 资产（默认 ~/npuprobe，NPUASSETS 覆盖）就给 engine/bench/test
-# 加编译期开关 -DQWENOX_NPU=1；运行时 QWENOX_NPU=1 才启用，默认关，同一份二
-# 进制可 A/B。xrt_coreutil.dll 走 delay-load，没装 NPU 驱动的机器照常运行。
-# QWENOX_BUILD_NPU=0 强制不编入。
+# 默认不编入。显式 QWENOX_BUILD_NPU=1 且检测到 XRT 资产（默认 ~/npuprobe，
+# NPUASSETS 覆盖）才给 engine/bench/test 加 -DQWENOX_NPU=1；运行时 QWENOX_NPU=1
+# 才启用，同一份二进制可 A/B。xrt_coreutil.dll 走 delay-load，没装 NPU 驱动的机器照常运行。
 NPU_FLAGS=()
 NPU_LINK=()
 npu_assets_ok() {  # $1=资产目录（XRT 头/def + xclbin/insts）
@@ -146,14 +162,14 @@ gen_npu_bins() {  # $1=资产目录；内嵌 NPU 设备二进制（~900KB 源文
       echo "static const unsigned int kInstsLen = sizeof kInsts;"
     } > "$INC"
 }
-if [[ "$NEED_HIP" == 1 && "${QWENOX_BUILD_NPU:-1}" != 0 ]]; then
+if [[ "$NEED_HIP" == 1 && "${QWENOX_BUILD_NPU:-0}" == 1 ]]; then
     NA="${NPUASSETS:-$HOME/npuprobe}"
     if npu_assets_ok "$NA" && ensure_xrt_lib "$NA" && gen_npu_bins "$NA"; then
         NPU_FLAGS=(-DQWENOX_NPU=1 -I"$(cygpath -w "$NA/xrtinc")"
                    -I"$(cygpath -w "$ROOT/build")")
         NPU_LINK=(-Xlinker build/winlibs/xrt_coreutil.lib
                   -Xlinker -delayload:xrt_coreutil.dll -Xlinker delayimp.lib)
-        echo "[NPU] 编进 engine/bench/test（运行时 QWENOX_NPU=1 启用；QWENOX_BUILD_NPU=0 不编入）"
+        echo "[NPU] 编进 engine/bench/test（运行时 QWENOX_NPU=1 启用；默认不编入）"
     fi
 fi
 
@@ -465,7 +481,8 @@ build_test() {
     "$HIPCC" "${FLAGS[@]}" ${NPU_FLAGS[@]+"${NPU_FLAGS[@]}"} -I src/gpu tools/ktest.cu \
       -o build/ktest-win.exe ${NPU_LINK[@]+"${NPU_LINK[@]}"}
     echo "[运行] ktest-win（预期末尾 ALL PASS）"
-    (cd build && HIP_PATH="$TR_WIN" ROCM_PATH="$TR_WIN" ./ktest-win.exe)
+    # 行不变性用例覆盖 P=1..48；未设置时生产默认上限是 24，会让 P25..48 全部被拒绝。
+    (cd build && HIP_PATH="$TR_WIN" ROCM_PATH="$TR_WIN" QWENOX_GEMVMR_MAXP=48 ./ktest-win.exe)
 }
 
 # NPU 检测工具（仅 Windows）：GUI 版 build/npucheck-win.exe（xclbin/insts 内嵌、
