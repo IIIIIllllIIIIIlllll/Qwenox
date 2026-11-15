@@ -6,997 +6,1540 @@
 <title>Qwenox 启动器</title>
 <style>
 :root{
-  --ink:#e8ecf6; --dim:#9aa6c0; --line:rgba(120,140,190,.28);
-  --card:rgba(13,18,34,.82); --card2:rgba(9,13,26,.88); --inp:rgba(10,14,28,.78);
+  --ink:#e8ecf6; --dim:#9aa6c0; --faint:#6c7893;
+  --line:rgba(120,140,190,.22); --line2:rgba(130,150,200,.42);
+  --card:rgba(12,17,32,.86); --card2:rgba(8,12,24,.9); --inp:rgba(7,10,22,.82);
+  --hover:rgba(80,110,200,.16); --sel:rgba(59,95,184,.32);
   --accent:#7aa2f0; --btn:#3b5fb8; --btn-hi:#4f7ad9;
   --ok:#5fc98a; --bad:#ff7a7a; --warn:#e8b95f;
+  --mono:Consolas,"Cascadia Mono",ui-monospace,monospace;
 }
 *{box-sizing:border-box}
-body{margin:0;height:100vh;overflow:hidden;color:var(--ink);
-  font:14px/1.6 "Segoe UI","Microsoft YaHei",system-ui,sans-serif;
+html,body{height:100%}
+body{margin:0;overflow:hidden;color:var(--ink);
+  font:14px/1.55 "Segoe UI","Microsoft YaHei",system-ui,sans-serif;
   background:#0a0e1a url(/media/panel-bg.png) center/cover fixed no-repeat;
   display:flex;flex-direction:column}
-body::before{content:"";position:fixed;inset:0;background:rgba(8,12,26,.45);
-  pointer-events:none}
-header{position:relative;z-index:2;display:flex;align-items:center;gap:12px;
-  padding:12px 22px;flex:0 0 auto}
-h1{font-size:18px;margin:0;text-shadow:0 1px 6px rgba(0,0,0,.6)}
-.spacer{flex:1}
-main{position:relative;z-index:1;flex:1;min-height:0;width:100%;
-  max-width:1060px;margin:0 auto;padding:4px 20px 20px;display:flex;
-  flex-direction:column}
-.panel{flex:1;min-height:0;display:flex;background:var(--card);
-  border:1px solid var(--line);border-radius:12px;overflow:hidden;
-  box-shadow:0 12px 40px rgba(0,0,0,.45);backdrop-filter:blur(3px)}
-.art{flex:0 0 250px;background:rgba(9,13,26,.35);display:flex;
-  align-items:center;justify-content:center;overflow:hidden}
-.art img{width:250px;filter:drop-shadow(0 0 18px rgba(60,80,160,.45))}
-.content{flex:1;min-width:0;min-height:0;padding:16px 20px 18px;overflow-y:auto}
-/* 低分辨率适配：窄窗先缩立绘、再藏立绘，超窄时标签叠到输入框上方 */
-@media(max-width:1150px){.art{flex-basis:185px}.art img{width:185px}}
-@media(max-width:960px){.art{display:none}.panel{min-height:0}}
-@media(max-width:700px){
-  label.k{flex-basis:100%;margin-bottom:-4px}
-  .help{margin-left:0}
-  .tab{min-width:0;font-size:12px;padding:6px 0}
-  .content{padding:12px 12px 14px}
-}
-
-/* ---- 选项卡 ---- */
-.tabs{display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap}
-.tab{flex:1;min-width:120px;text-align:center;padding:7px 0;border-radius:7px;
-  border:1px solid var(--line);background:rgba(16,22,40,.72);color:var(--dim);
-  cursor:pointer;user-select:none;font-weight:600}
-.tab:hover{border-color:var(--accent)}
-.tab.on{color:var(--ink);border-color:var(--accent);
-  background:rgba(59,95,184,.35);box-shadow:0 0 10px rgba(90,130,230,.25)}
-
-h2{font-size:13px;margin:14px 0 6px;color:var(--dim);font-weight:600;
-  letter-spacing:.08em}
-.row{display:flex;align-items:center;gap:8px;margin:7px 0;flex-wrap:wrap}
-label.k{flex:0 0 200px;color:var(--dim);font-family:Consolas,monospace;
-  font-size:12.5px}
-input[type=text],select{flex:1;min-width:150px;background:var(--inp);
-  border:1px solid var(--line);border-radius:5px;color:var(--ink);
-  padding:5px 9px;font:13px Consolas,monospace}
-input:focus,select:focus{outline:none;border-color:var(--accent)}
-input:disabled,select:disabled{opacity:.42}
-input[type=checkbox]{width:15px;height:15px;accent-color:var(--accent)}
-.help{flex-basis:100%;margin:-2px 0 4px 208px;font-size:12px;color:var(--dim)}
-.radio{display:inline-flex;align-items:center;gap:6px;margin-right:18px;
-  cursor:pointer}
-.radio input{accent-color:var(--accent)}
-.envtag{font-size:11px;color:var(--warn);border:1px solid var(--warn);
-  border-radius:4px;padding:0 5px}
-button{background:var(--btn);color:#fff;border:1px solid rgba(140,165,240,.35);
-  border-radius:6px;padding:7px 18px;font-size:13.5px;cursor:pointer}
-button:hover{background:var(--btn-hi)}
-button:disabled{opacity:.4;cursor:not-allowed}
-button.ghost{background:rgba(16,22,40,.72);color:var(--ink)}
-button.danger{background:#7a3440;border-color:rgba(240,150,150,.3)}
-button.danger:hover{background:#94404d}
-button.mini{padding:3px 10px;font-size:12px;border-radius:5px}
-#langBtn{font-size:14px;padding:7px 18px;border-color:var(--accent);font-weight:600}
+body::before{content:"";position:fixed;inset:0;background:rgba(8,12,26,.5);pointer-events:none}
+button,input,select{font:inherit;color:inherit}
 a{color:var(--accent)}
 
-/* ---- 状态 ---- */
-.state{font-weight:600}
-.s-idle{color:var(--dim)} .s-running{color:var(--ok)}
-.s-failed,.s-exited{color:var(--bad)}
-.s-spawning,.s-waiting_engine,.s-waiting_api,.s-stopping{color:var(--warn)}
-#notice{display:none;position:fixed;top:58px;left:50%;transform:translateX(-50%);
-  z-index:100;max-width:min(680px,92vw);border-radius:6px;padding:8px 14px;
-  font-size:13px;transition:opacity .4s;cursor:pointer;
-  box-shadow:0 6px 24px rgba(0,0,0,.5)}
-#notice.err{display:block;background:rgba(70,26,34,.92);color:#ffc9c9;
-  border:1px solid rgba(240,150,150,.5)}
-#notice.ok{display:block;background:rgba(22,56,38,.92);color:#c9ecd4;
-  border:1px solid rgba(95,201,138,.5)}
+/* ---- 顶栏 ---- */
+header{position:relative;z-index:3;display:flex;align-items:center;gap:12px;
+  padding:10px 20px;flex:0 0 auto;flex-wrap:wrap}
+h1{font-size:17px;margin:0;white-space:nowrap;text-shadow:0 1px 6px rgba(0,0,0,.6)}
+.pill{display:inline-flex;align-items:center;gap:8px;padding:4px 12px;border-radius:999px;
+  background:rgba(10,14,28,.7);border:1px solid var(--line);font-size:13px;min-width:0}
+.pill .dot{width:8px;height:8px;border-radius:50%;background:var(--faint);flex:0 0 auto}
+.pill .stt{font-weight:600;white-space:nowrap}
+.pill .sub{color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:340px}
+.st-running .dot{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+.st-running .stt{color:var(--ok)}
+.st-busy .dot{background:var(--warn);animation:blink 1.1s infinite}
+.st-busy .stt{color:var(--warn)}
+.st-bad .dot{background:var(--bad)} .st-bad .stt{color:var(--bad)}
+@keyframes blink{50%{opacity:.25}}
+.spacer{flex:1}
+.restart-hint{color:var(--warn);font-size:12.5px;white-space:nowrap}
 
-/* ---- 日志 ---- */
-pre#log{background:var(--card2);border:1px solid var(--line);border-radius:8px;
-  padding:10px 12px;height:250px;overflow:auto;font:12px/1.5 Consolas,monospace;
-  white-space:pre-wrap;word-break:break-all;margin:8px 0 0}
-.logbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.logbar select{flex:0 0 auto}
-.small{font-size:12px;color:var(--dim)}
+/* ---- 按钮 ---- */
+.btn{background:var(--btn);color:#fff;border:1px solid rgba(140,165,240,.35);border-radius:6px;
+  padding:6px 16px;font-size:13.5px;cursor:pointer;white-space:nowrap;line-height:1.4}
+.btn:hover{background:var(--btn-hi)}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn.ghost{background:rgba(16,22,40,.72);color:var(--ink);border-color:var(--line2)}
+.btn.ghost:hover{background:rgba(40,56,100,.6)}
+.btn.danger{background:#7a3440;border-color:rgba(240,150,150,.3)}
+.btn.danger:hover{background:#94404d}
+.btn.warnb{background:#8a6420;border-color:rgba(240,200,120,.4)}
+.btn.warnb:hover{background:#a3772a}
+.btn.mini{padding:3px 10px;font-size:12px;border-radius:5px}
+.btn.big{padding:7px 22px;font-weight:600}
+.iconbtn{background:none;border:none;color:var(--dim);cursor:pointer;padding:2px 5px;
+  border-radius:4px;font-size:13px;line-height:1}
+.iconbtn:hover{color:var(--ink);background:var(--hover)}
 
-/* ---- 文件浏览器 ---- */
-.modal{position:fixed;inset:0;background:rgba(4,6,14,.6);z-index:50;
-  display:flex;align-items:center;justify-content:center}
-.modal-card{width:min(680px,92vw);max-height:78vh;display:flex;flex-direction:column;
-  background:var(--card2);border:1px solid var(--line);border-radius:10px;
-  box-shadow:0 18px 60px rgba(0,0,0,.6)}
-.fb-toolbar{display:flex;align-items:center;gap:8px;padding:10px 12px;
-  border-bottom:1px solid var(--line)}
-.fb-toolbar input{flex:1}
-.fb-chips{display:flex;gap:6px;padding:8px 12px;border-bottom:1px solid var(--line);
-  flex-wrap:wrap}
-.fb-chips button{font-size:11.5px;padding:2px 10px}
-.fb-list{flex:1;overflow:auto;padding:4px 6px}
-.fb-item{display:flex;gap:8px;align-items:center;padding:4px 10px;
-  border-radius:5px;cursor:pointer;font:13px Consolas,monospace}
-.fb-item:hover{background:rgba(59,95,184,.3)}
-.fb-item .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
+/* ---- 布局 ---- */
+main{position:relative;z-index:1;flex:1;min-height:0;display:flex;gap:14px;
+  padding:0 20px 18px;width:100%;max-width:1320px;margin:0 auto}
+aside{flex:0 0 250px;display:flex;flex-direction:column;min-height:0;
+  background:var(--card);border:1px solid var(--line);border-radius:12px;
+  box-shadow:0 12px 40px rgba(0,0,0,.45);overflow:hidden}
+.work{flex:1;min-width:0;display:flex;flex-direction:column;min-height:0;
+  background:var(--card);border:1px solid var(--line);border-radius:12px;
+  box-shadow:0 12px 40px rgba(0,0,0,.45);overflow:hidden}
+
+/* ---- 方案栏 ---- */
+.side-head{display:flex;align-items:center;gap:8px;padding:12px 12px 8px 16px}
+.side-head h2{margin:0;font-size:13px;color:var(--dim);letter-spacing:.1em;flex:1}
+.plist{flex:1;min-height:0;overflow-y:auto;padding:2px 8px 8px}
+.pitem{position:relative;padding:8px 10px 8px 12px;border-radius:8px;cursor:pointer;
+  border:1px solid transparent;margin-bottom:4px}
+.pitem:hover{background:var(--hover)}
+.pitem.on{background:var(--sel);border-color:rgba(122,162,240,.55)}
+.pitem.on::before{content:"";position:absolute;left:0;top:9px;bottom:9px;width:3px;
+  border-radius:2px;background:var(--accent)}
+.pname{font-weight:600;display:flex;align-items:center;gap:6px;min-width:0}
+.pname .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pname .tag{font-size:10.5px;font-weight:600;border-radius:4px;padding:0 5px;flex:0 0 auto}
+.tag.run{color:var(--ok);border:1px solid rgba(95,201,138,.6)}
+.tag.mod{color:var(--warn);border:1px solid rgba(232,185,95,.6)}
+.psum{font-size:11.5px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pfile{font:11px var(--mono);color:var(--faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pacts{position:absolute;right:6px;top:6px;display:none;gap:1px;
+  background:rgba(12,17,32,.92);border-radius:5px}
+.pitem:hover .pacts{display:flex}
+.pitem.unsaved{border:1px dashed var(--line2)}
+.pitem.unsaved .pname{color:var(--dim)}
+.pempty{color:var(--dim);font-size:12.5px;padding:8px 10px}
+.side-art{flex:0 0 auto;display:flex;justify-content:center;pointer-events:none;
+  max-height:240px;overflow:hidden}
+.side-art img{width:170px;opacity:.9;filter:drop-shadow(0 0 16px rgba(60,80,160,.45))}
+.side-foot{padding:8px 12px 12px;border-top:1px solid var(--line);display:flex;justify-content:center}
+@media(max-height:760px){.side-art{display:none}}
+
+/* ---- 页签 ---- */
+.tabs{display:flex;gap:2px;padding:10px 14px 0;border-bottom:1px solid var(--line);flex:0 0 auto}
+.tab{padding:7px 16px 8px;cursor:pointer;color:var(--dim);font-weight:600;user-select:none;
+  border-bottom:2px solid transparent;margin-bottom:-1px;display:flex;align-items:center;gap:6px;
   white-space:nowrap}
+.tab:hover{color:var(--ink)}
+.tab.on{color:var(--ink);border-bottom-color:var(--accent)}
+.tab .cnt{font-size:10.5px;background:rgba(232,185,95,.2);color:var(--warn);border-radius:8px;
+  padding:0 6px;font-weight:600}
+.tab .cnt.err{background:rgba(255,122,122,.2);color:var(--bad)}
+.tab.r .dot{width:7px;height:7px;border-radius:50%;background:var(--faint)}
+.tab.r .dot.ok{background:var(--ok)} .tab.r .dot.busy{background:var(--warn)}
+.tab.r .dot.bad{background:var(--bad)}
+.tabs .ctxname{margin-left:auto;align-self:center;font-size:12px;color:var(--dim);
+  padding-bottom:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:40%}
+
+.pane{flex:1;min-height:0;overflow-y:auto;padding:6px 22px 18px}
+.note{font-size:12.5px;color:var(--dim);background:rgba(122,162,240,.08);
+  border:1px solid rgba(122,162,240,.2);border-radius:7px;padding:7px 12px;margin:12px 0 4px}
+h3{font-size:12.5px;margin:18px 0 4px;color:var(--dim);font-weight:600;letter-spacing:.08em;
+  padding-bottom:4px;border-bottom:1px solid var(--line)}
+
+/* ---- 字段行 ---- */
+.frow{display:grid;grid-template-columns:200px minmax(0,1fr);gap:4px 16px;
+  padding:8px 10px;margin:0 -10px;border-radius:7px;position:relative}
+.frow:hover{background:rgba(80,110,200,.06)}
+.frow.dirty{background:rgba(232,185,95,.06)}
+.frow.dirty::before{content:"";position:absolute;left:0;top:8px;bottom:8px;width:3px;
+  border-radius:2px;background:var(--warn)}
+.frow.bad::before{background:var(--bad)}
+.flab{padding-top:4px;min-width:0}
+.fname{font-weight:600;font-size:13.5px}
+.fkey{font:11px var(--mono);color:var(--faint);overflow-wrap:anywhere}
+.fctl{min-width:0}
+.fline{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.fhelp{font-size:12px;color:var(--dim);margin-top:3px}
+.fmsg{font-size:12px;margin-top:3px;display:none}
+.fmsg.err{display:block;color:var(--bad)}
+.fmsg.warn{display:block;color:var(--warn)}
+.fmsg.info{display:block;color:var(--dim)}
+.ex{font-size:12px;white-space:nowrap}
+.ex.ok{color:var(--ok)} .ex.no{color:var(--warn)}
+.reset{visibility:hidden}
+.frow.dirty .reset{visibility:visible}
+input[type=text]{flex:1;min-width:140px;background:var(--inp);border:1px solid var(--line2);
+  border-radius:5px;padding:5px 9px;font:13px var(--mono)}
+input.num{flex:0 0 150px;min-width:0}
+select{background:var(--inp);border:1px solid var(--line2);border-radius:5px;padding:5px 8px;
+  font-size:13px;min-width:180px}
+input:focus,select:focus{outline:none;border-color:var(--accent)}
+input:disabled,select:disabled{opacity:.42}
+.frow.bad input[type=text]{border-color:rgba(255,122,122,.7)}
+.envtag{font-size:11px;color:var(--warn);border:1px solid var(--warn);border-radius:4px;padding:0 5px}
+.unit{color:var(--dim);font-size:12.5px}
+.chips{display:flex;gap:4px;flex-wrap:wrap}
+.chip{border:1px solid var(--line2);background:rgba(16,22,40,.6);border-radius:5px;
+  padding:3px 10px;font-size:12.5px;cursor:pointer}
+.chip:hover{border-color:var(--accent)}
+.chip.on{background:var(--sel);border-color:var(--accent);color:#fff}
+.seg{display:inline-flex;border:1px solid var(--line2);border-radius:6px;overflow:hidden}
+.seg button{background:rgba(16,22,40,.6);border:none;border-right:1px solid var(--line);
+  padding:5px 13px;cursor:pointer;font-size:13px}
+.seg button:last-child{border-right:none}
+.seg button:hover{background:var(--hover)}
+.seg button.on{background:var(--btn);color:#fff}
+.seg button:disabled{opacity:.4;cursor:not-allowed}
+.wvcards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:12px 0 6px}
+.wvc{border:1px solid var(--line2);border-radius:8px;padding:9px 12px;cursor:pointer;
+  background:rgba(16,22,40,.5)}
+.wvc:hover{border-color:var(--accent)}
+.wvc.on{border-color:var(--accent);background:var(--sel);box-shadow:0 0 10px rgba(90,130,230,.22)}
+.wvc b{display:block;font-size:14px}
+.wvc span{font-size:12px;color:var(--dim)}
+/* 开关 */
+.sw{position:relative;display:inline-flex;align-items:center;gap:7px;cursor:pointer;user-select:none}
+.sw input{position:absolute;opacity:0;width:0;height:0}
+.sw .tr{width:34px;height:19px;border-radius:10px;background:rgba(90,100,130,.55);
+  position:relative;transition:background .15s;flex:0 0 auto}
+.sw .tr::after{content:"";position:absolute;left:2px;top:2px;width:15px;height:15px;border-radius:50%;
+  background:#dfe5f3;transition:left .15s}
+.sw input:checked + .tr{background:var(--btn-hi)}
+.sw input:checked + .tr::after{left:17px}
+.sw input:disabled + .tr{opacity:.4}
+.sw input:focus-visible + .tr{outline:2px solid var(--accent);outline-offset:2px}
+.sw .lb{font-size:12.5px;color:var(--dim)}
+
+/* ---- 保存栏 ---- */
+.savebar{flex:0 0 auto;display:flex;align-items:center;gap:10px;padding:10px 18px;
+  border-top:1px solid var(--line);background:var(--card2);flex-wrap:wrap}
+.savebar .msg{flex:1;min-width:180px;font-size:13px;color:var(--dim)}
+.savebar.dirty .msg{color:var(--warn)}
+.savebar.bad .msg{color:var(--bad)}
+.savebar .msg .keys{font:11.5px var(--mono);color:var(--faint);margin-left:6px}
+.kbd{font:11px var(--mono);border:1px solid var(--line2);border-radius:3px;padding:0 4px;color:var(--faint)}
+
+/* ---- 运行页 ---- */
+.runtop{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;margin-top:14px}
+.box{border:1px solid var(--line);border-radius:9px;padding:11px 14px;background:rgba(8,12,24,.45);min-width:0}
+.box h4{margin:0 0 6px;font-size:12.5px;color:var(--dim);font-weight:600;letter-spacing:.06em}
+.bigstate{font-size:20px;font-weight:700}
+.kv{font-size:12.5px;color:var(--dim);overflow-wrap:anywhere}
+.pf{display:grid;grid-template-columns:auto minmax(0,1fr);gap:2px 10px;font-size:12.5px}
+.pf .i{font-weight:700;text-align:center;width:16px}
+.pf .i.ok{color:var(--ok)} .pf .i.bad{color:var(--bad)} .pf .i.skip{color:var(--faint)}
+.pf .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pf .t small{color:var(--faint);font-family:var(--mono)}
+.logbar{display:flex;align-items:center;gap:10px;margin:16px 0 6px;flex-wrap:wrap}
+.logbar .path{font:11.5px var(--mono);color:var(--faint);flex:1;min-width:0;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+pre#log{background:var(--card2);border:1px solid var(--line);border-radius:8px;
+  padding:10px 12px;margin:0;font:12px/1.5 var(--mono);white-space:pre-wrap;
+  word-break:break-all;overflow:auto;height:calc(100vh - 430px);min-height:200px}
+.runpane{display:flex;flex-direction:column}
+
+/* ---- 提示条 ---- */
+#toast{position:fixed;top:60px;left:50%;transform:translateX(-50%);z-index:200;
+  max-width:min(680px,92vw);border-radius:7px;padding:8px 16px;font-size:13px;cursor:pointer;
+  box-shadow:0 6px 24px rgba(0,0,0,.5);display:none;transition:opacity .35s}
+#toast.ok{display:block;background:rgba(22,56,38,.95);color:#c9ecd4;border:1px solid rgba(95,201,138,.5)}
+#toast.err{display:block;background:rgba(70,26,34,.95);color:#ffc9c9;border:1px solid rgba(240,150,150,.5)}
+
+/* ---- 对话框 / 文件浏览器 ---- */
+.modal{position:fixed;inset:0;background:rgba(4,6,14,.62);z-index:100;display:flex;
+  align-items:center;justify-content:center}
+.mcard{width:min(460px,92vw);background:var(--card2);border:1px solid var(--line2);border-radius:11px;
+  box-shadow:0 18px 60px rgba(0,0,0,.6);padding:18px 20px 16px}
+.mcard h4{margin:0 0 8px;font-size:15.5px}
+.mcard .mb{font-size:13px;color:var(--dim);margin-bottom:12px;white-space:pre-line}
+.mcard input[type=text]{width:100%;font-family:inherit;font-size:14px;padding:7px 10px}
+.mcard .mh{font-size:12px;min-height:18px;margin-top:5px;color:var(--dim)}
+.mcard .mh.warn{color:var(--warn)} .mcard .mh.err{color:var(--bad)}
+.mcard .mbtns{display:flex;justify-content:flex-end;gap:8px;margin-top:12px;flex-wrap:wrap}
+.fbcard{width:min(720px,94vw);max-height:80vh;display:flex;flex-direction:column;
+  background:var(--card2);border:1px solid var(--line2);border-radius:11px;box-shadow:0 18px 60px rgba(0,0,0,.6)}
+.fb-toolbar{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--line)}
+.fb-chips{display:flex;gap:6px;padding:8px 12px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.fb-list{flex:1;overflow:auto;padding:4px 6px;min-height:200px}
+.fb-item{display:flex;gap:8px;align-items:center;padding:4px 10px;border-radius:5px;cursor:pointer;
+  font:13px var(--mono)}
+.fb-item:hover{background:var(--sel)}
+.fb-item.cur{background:rgba(122,162,240,.14)}
+.fb-item .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .fb-item .sz,.fb-item .mt{color:var(--dim);font-size:11.5px;flex:0 0 auto}
-.fb-foot{display:flex;gap:8px;justify-content:flex-end;align-items:center;
-  padding:10px 14px;border-top:1px solid var(--line)}
+.fb-foot{display:flex;gap:8px;align-items:center;padding:10px 14px;border-top:1px solid var(--line)}
+.fb-foot .small{font-size:12px;color:var(--dim)}
+
+/* ---- 窄窗 ---- */
+@media(max-width:1060px){aside{flex-basis:210px}.frow{grid-template-columns:160px minmax(0,1fr)}}
+@media(max-width:820px){
+  main{flex-direction:column;overflow-y:auto}
+  aside{flex:0 0 auto;max-height:220px}
+  .side-art{display:none}
+  .work{flex:1 0 520px}
+  .frow{grid-template-columns:1fr}
+  .flab{display:flex;gap:8px;align-items:baseline;padding-top:0}
+  .runtop{grid-template-columns:1fr}
+  .wvcards{grid-template-columns:1fr}
+  .pill .sub{max-width:160px}
+}
 </style>
 </head>
 <body>
 <header>
   <h1>Qwenox <span data-i18n="title">启动器</span></h1>
-  <span id="stateBadge" class="state s-idle">—</span>
-  <span id="saveHint" class="small" style="opacity:.55"></span>
+  <span class="pill" id="pill"><span class="dot"></span><span class="stt">—</span><span class="sub"></span></span>
   <span class="spacer"></span>
-  <span id="consoleLink" class="small"></span>
-  <button class="ghost mini" id="langBtn">EN</button>
+  <span class="restart-hint" id="restartHint" style="display:none"></span>
+  <span id="hdrBtns" style="display:flex;gap:8px"></span>
+  <span id="consoleLink"></span>
+  <button class="btn ghost mini" id="langBtn">EN</button>
 </header>
 <main>
-<div id="notice"></div>
-<div class="panel">
-  <div class="art"><img src="/media/qwen-charactor-alpha.png" alt=""></div>
-  <div class="content">
-    <div class="tabs">
-      <div class="tab on" data-tab="weights">1 <span data-i18n="weights">权重</span></div>
-      <div class="tab" data-tab="infer">2 <span data-i18n="infer">推理设置</span></div>
-      <div class="tab" data-tab="netlog">3 <span data-i18n="netlog">端口与日志</span></div>
-      <div class="tab" data-tab="control">4 <span data-i18n="control">启动控制</span></div>
+  <aside>
+    <div class="side-head">
+      <h2 data-i18n="profiles">方案</h2>
+      <button class="btn ghost mini" id="btnNew" data-i18n="new_pf">＋ 新建</button>
     </div>
-
-    <!-- ============ 权重 ============ -->
-    <section id="tab-weights">
-      <div class="row" style="margin-bottom:12px">
-        <label class="k" data-i18n="profile">方案</label>
-        <select id="profileSel" style="flex:1"></select>
-        <button class="ghost mini" id="btnPfSave" data-i18n="pf_saveas">另存为…</button>
-        <button class="ghost mini" id="btnPfDel" data-i18n="pf_del">删除</button>
-      </div>
-      <div class="help" style="margin:0 0 8px" data-i18n="pf_hint">方案 = 权重 + 推理设置，选中即整体应用</div>
-      <div class="row" style="margin:4px 0 10px">
-        <label class="radio"><input type="radio" name="wv" value="v1"><span data-i18n="wv1">V1 版本</span></label>
-        <label class="radio"><input type="radio" name="wv" value="v2"><span data-i18n="wv2">V2 版本</span></label>
-        <label class="radio"><input type="radio" name="wv" value="gguf"><span>GGUF 版本</span></label>
-      </div>
-      <div id="w-hgn">
-        <div class="row"><label class="k" data-i18n="f_model">主模型</label>
-          <input type="text" data-key="MODEL_FILE">
-          <button class="ghost mini" data-browse="MODEL_FILE" data-i18n="browse">浏览…</button></div>
-        <div class="row" data-wv="v2"><label class="k">n-gram 表</label>
-          <input type="text" data-key="NGRAM_FILE">
-          <button class="ghost mini" data-browse="NGRAM_FILE" data-i18n="browse">浏览…</button></div>
-        <div class="row" data-wv="v1"><label class="k">overlay</label>
-          <input type="checkbox" data-notuse="OVERLAY_FILE" title="不使用"><span class="small" data-i18n="notuse">不使用</span>
-          <input type="text" data-key="OVERLAY_FILE" data-optional="1">
-          <button class="ghost mini" data-browse="OVERLAY_FILE" data-i18n="browse">浏览…</button></div>
-        <div class="row"><label class="k" data-i18n="f_mtp">MTP 草稿</label>
-          <input type="checkbox" data-notuse="MTP_FILE"><span class="small" data-i18n="notuse">不使用</span>
-          <input type="text" data-key="MTP_FILE" data-optional="1">
-          <button class="ghost mini" data-browse="MTP_FILE" data-i18n="browse">浏览…</button></div>
-        <div class="row"><label class="k" data-i18n="f_vision">视觉塔</label>
-          <input type="checkbox" data-notuse="VISION_FILE"><span class="small" data-i18n="notuse">不使用</span>
-          <input type="text" data-key="VISION_FILE" data-optional="1">
-          <button class="ghost mini" data-browse="VISION_FILE" data-i18n="browse">浏览…</button></div>
-      </div>
-      <div id="w-gguf" style="display:none">
-        <div class="row"><label class="k">GGUF_FILE</label>
-          <input type="text" data-key="GGUF_FILE">
-          <button class="ghost mini" data-browse="GGUF_FILE" data-i18n="browse">浏览…</button></div>
-        <div class="help" data-i18n="h_gguf">填第 1 个分片（*-00001-of-0000N.gguf），其余分片须同目录</div>
-        <div class="row"><label class="k">GGUF_MTP_FILE</label>
-          <input type="checkbox" data-notuse="GGUF_MTP_FILE"><span class="small" data-i18n="notuse">不使用</span>
-          <input type="text" data-key="GGUF_MTP_FILE" data-optional="1">
-          <button class="ghost mini" data-browse="GGUF_MTP_FILE" data-i18n="browse">浏览…</button></div>
-        <div class="row"><label class="k">GGUF_VISION_FILE</label>
-          <input type="checkbox" data-notuse="GGUF_VISION_FILE"><span class="small" data-i18n="notuse">不使用</span>
-          <input type="text" data-key="GGUF_VISION_FILE" data-optional="1">
-          <button class="ghost mini" data-browse="GGUF_VISION_FILE" data-i18n="browse">浏览…</button></div>
-      </div>
-      <div class="row" id="row-tokenizer"><label class="k">tokenizer</label>
-        <input type="text" data-key="TOKENIZER_DIR">
-        <button class="ghost mini" data-browse="TOKENIZER_DIR" data-mode="dir" data-i18n="browse">浏览…</button></div>
-      <div class="help" id="help-tokenizer" data-i18n="h_tok">目录内需包含 tokenizer.json</div>
-      <div class="help" id="help-gguf-tok" style="display:none" data-i18n="h_gguftok">GGUF 权重内嵌词表，无需 tokenizer 目录</div>
-    </section>
-
-    <!-- ============ 推理设置 / 端口与日志 ============ -->
-    <section id="tab-infer" style="display:none"><div id="groups-infer"></div></section>
-    <section id="tab-netlog" style="display:none"><div id="groups-netlog"></div></section>
-
-    <!-- ============ 启动控制 ============ -->
-    <section id="tab-control" style="display:none">
-      <div class="row" style="margin-bottom:10px">
-        <button id="btnStart" data-i18n="savestart">保存并启动</button>
-        <button id="btnStop" class="danger" data-i18n="stop">停止</button>
-        <span class="small" data-i18n="autosave" style="align-self:center">改动自动保存</span>
-        <span class="spacer"></span>
-        <button id="btnQuit" class="ghost" data-i18n="quit">退出启动器</button>
-      </div>
-      <div id="statusDetail" class="small"></div>
-      <div class="logbar" style="margin-top:12px">
-        <span class="small" data-i18n="logview">日志：</span>
-        <select id="logWhich">
-          <option value="engine" data-i18n="logengine">引擎</option>
-          <option value="api">API</option>
-          <option value="script" data-i18n="logscript">启动脚本</option>
-          <option value="launcher" data-i18n="loglauncher">启动器</option>
-        </select>
-        <span id="logPath" class="small"></span>
-      </div>
-      <pre id="log"></pre>
-    </section>
-  </div>
-</div>
+    <div class="plist" id="plist"></div>
+    <div class="side-art"><img src="/media/qwen-charactor-alpha.png" alt=""></div>
+    <div class="side-foot"><button class="btn ghost mini" id="btnQuit" data-i18n="quit">退出启动器</button></div>
+  </aside>
+  <section class="work">
+    <div class="tabs" id="tabs"></div>
+    <div class="pane" id="pane"></div>
+    <div class="savebar" id="savebar"></div>
+  </section>
 </main>
-
-<!-- 文件浏览器 -->
-<div class="modal" id="fbModal" style="display:none">
-  <div class="modal-card">
-    <div class="fb-toolbar">
-      <button class="ghost mini" id="fbUp" title="上一级 / up">↑</button>
-      <input type="text" id="fbPath" spellcheck="false">
-      <select id="fbFilter" style="flex:0 0 auto"></select>
-    </div>
-    <div class="fb-chips">
-      <button class="ghost mini" data-fbgo="" data-i18n="fb_root">项目根</button>
-      <button class="ghost mini" data-fbgo="models">models</button>
-      <button class="ghost mini" data-fbgo="@drives" id="fbDrives">计算机</button>
-    </div>
-    <div class="fb-list" id="fbList"></div>
-    <div class="fb-foot">
-      <span class="small" id="fbHint"></span>
-      <span class="spacer"></span>
-      <button id="fbSelectDir" class="ghost" data-i18n="fbpickdir">选择当前目录</button>
-      <button id="fbCancel" data-i18n="fbcancel">取消</button>
-    </div>
-  </div>
-</div>
+<div id="toast"></div>
+<div id="modalHost"></div>
 
 <script>
 "use strict";
-// ---- i18n ------------------------------------------------------------------
+// ============================================================================
+// 文案
+// ============================================================================
 const T = {
-  zh: {
-    title:"启动器", weights:"权重", infer:"推理设置", netlog:"端口与日志",
-    control:"启动控制",
-    save:"保存", savestart:"保存并启动", stop:"停止", quit:"退出启动器",
-    browse:"浏览…", notuse:"不使用",
-    wv1:"V1 版本", wv2:"V2 版本",
-    f_model:"主模型", f_mtp:"MTP 草稿", f_vision:"视觉塔",
-    h_gguf:"填第 1 个分片（*-00001-of-0000N.gguf），其余分片须同目录",
-    h_tok:"目录内需包含 tokenizer.json",
-    h_gguftok:"GGUF 权重内嵌词表，无需 tokenizer 目录",
-    fbroot:"项目根：", fbpickdir:"选择当前目录", fbcancel:"取消",
-    logview:"日志：", logengine:"引擎", logscript:"启动脚本", loglauncher:"启动器",
-    saved:"已保存，下次启动生效", starting:"启动中…", stopping:"停止中…",
-    autosave:"改动自动保存",
-    confirmQuit:"服务还在运行。强制退出会同时停止服务，确定？",
-    confirmStop:"确定停止 API 与引擎？",
-    console:"打开控制台",
-    st:{idle:"未启动",spawning:"启动中",waiting_engine:"引擎加载中",
-        waiting_api:"等待 API",running:"运行中",stopping:"停止中",
-        exited:"已退出",failed:"启动失败"},
-    envOvr:"环境变量覆盖，conf 改动不生效",
-    ck_ok:"通过", ck_bad:"失败", ck_hint:"提示",
-    ck:{model:"主模型", ngram:"n-gram 表", overlay:"overlay", mtp:"MTP 草稿",
-        vision:"视觉塔", tok:"tokenizer", bins:"编译产物", kerneldb:"kernel db",
-        scripts:"启动脚本", eport:"引擎端口", aport:"API 端口"},
-    ck_notfound:"找不到", ck_disabled:"已禁用", ck_busy:"已被占用",
-    ck_missing:"缺少", ck_free:"空闲",
-    profile:"方案", pf_none:"（当前配置）", pf_saveas:"另存为…", pf_del:"删除",
-    pf_switched:"已切换到方案", pf_namewhat:"方案名称：", pf_delq:"删除方案",
-    pf_saved:"方案已保存", pf_deleted:"方案已删除",
-    pf_hint:"方案 = 权重 + 推理设置，选中即整体应用",
-    fb_root:"项目根", fb_all:"全部文件",
-    fb_hint_dir:"点目录进入；选好后点「选择当前目录」",
-    fb_hint_file:"点文件选中；↑ 上一级；路径可手输后回车跳转",
-  },
-  en: {
-    title:"Launcher", weights:"Weights", infer:"Inference", netlog:"Ports & logs",
-    control:"Run",
-    save:"Save", savestart:"Save & start", stop:"Stop", quit:"Quit launcher",
-    browse:"Browse…", notuse:"Disable",
-    wv1:"V1 (w4b single file)", wv2:"V2 (split n-gram)",
-    f_model:"Main model", f_mtp:"MTP draft", f_vision:"Vision tower",
-    h_gguf:"First shard (*-00001-of-0000N.gguf); siblings in same dir",
-    h_tok:"Directory must contain tokenizer.json",
-    h_gguftok:"Tokenizer is embedded in the GGUF; no tokenizer dir needed",
-    fbroot:"Root: ", fbpickdir:"Pick this directory", fbcancel:"Cancel",
-    logview:"Logs: ", logengine:"Engine", logscript:"Launch script",
-    loglauncher:"Launcher",
-    saved:"Saved; applies on next start", starting:"Starting…",
-    stopping:"Stopping…",
-    autosave:"changes auto-saved",
-    confirmQuit:"Service is still running. Quitting forcibly stops it. Continue?",
-    confirmStop:"Stop API and engine?",
-    console:"Open console",
-    st:{idle:"idle",spawning:"starting",waiting_engine:"engine loading",
-        waiting_api:"waiting for API",running:"running",stopping:"stopping",
-        exited:"exited",failed:"failed"},
-    envOvr:"overridden by environment",
-    ck_ok:"OK", ck_bad:"FAIL", ck_hint:"--",
-    ck:{model:"main model", ngram:"n-gram table", overlay:"overlay",
-        mtp:"MTP draft", vision:"vision tower", tok:"tokenizer",
-        bins:"binaries", kerneldb:"kernel db", scripts:"launch scripts",
-        eport:"engine port", aport:"API port"},
-    ck_notfound:"not found", ck_disabled:"disabled", ck_busy:"in use",
-    ck_missing:"missing", ck_free:"free",
-    profile:"Profile", pf_none:"(current config)", pf_saveas:"Save as…",
-    pf_del:"Delete", pf_switched:"Switched to profile",
-    pf_namewhat:"Profile name:", pf_delq:"Delete profile",
-    pf_saved:"Profile saved", pf_deleted:"Profile deleted",
-    pf_hint:"Profile = weights + inference settings; selecting applies both",
-    fb_root:"Project root", fb_all:"All files",
-    fb_hint_dir:"Click a directory to enter; then pick this directory",
-    fb_hint_file:"Click a file to pick; ↑ goes up; type a path and press Enter",
-  }
-};
+zh:{
+  title:"启动器", profiles:"方案", new_pf:"＋ 新建", quit:"退出启动器",
+  tab_w:"权重", tab_i:"推理设置", tab_m:"本机设置", tab_r:"运行与日志",
+  unsaved_name:"当前配置", unsaved_sub:"尚未存为方案", store_pf:"存为方案…",
+  no_pf:"还没有方案。改好配置后点「＋ 新建」存一个。",
+  t_run:"运行中", t_mod:"有修改",
+  act_rename:"重命名", act_dup:"复制", act_del:"删除",
+  editing:"正在编辑：", editing_unsaved:"正在编辑：当前配置（未存为方案）",
+  w_note:"选中的方案就是下次启动用的配置。点左侧方案即切换；这里的修改先存在草稿里，点「保存」才写入。",
+  i_note:"推理设置属于方案，跟权重一起保存、一起切换。",
+  m_note:"本机设置不属于任何方案，所有方案共用（端口、请求日志）。",
+  wv_title:"权重格式",
+  wv_v1:"V1", wv_v1s:"w4b 单文件 + 可选 overlay",
+  wv_v2:"V2", wv_v2s:"主模型 + 独立 n-gram 表",
+  wv_gguf:"GGUF", wv_ggufs:"分片 GGUF，内嵌词表",
+  gguf_tok:"GGUF 权重内嵌词表，不需要 tokenizer 目录。",
+  browse:"浏览…", enable:"启用", env_tag:"环境变量",
+  env_help:"该项被同名环境变量覆盖，这里改了也不生效",
+  ex_ok:"✓ 已找到", ex_no:"找不到", ex_nodir:"目录不存在", ex_notok:"目录里没有 tokenizer.json",
+  reset:"恢复为已保存的值",
+  save:"保存", save_to:"保存到「{n}」", save_as:"另存为新方案…", revert:"撤销修改",
+  sb_clean:"所有修改已保存", sb_dirty:"{n} 处修改未保存", sb_bad:"{n} 处需要修正，修正后才能保存",
+  sb_note_m:"（含本机设置）",
+  start:"启动", save_start:"保存并启动", stop:"停止", restart:"重启", restart_apply:"重启以应用",
+  restart_hint:"配置已改，重启后生效", console:"控制台 →", cleanup:"清理残留",
+  st:{idle:"未启动",spawning:"启动中",waiting_engine:"引擎加载中",waiting_api:"等待 API",
+      running:"运行中",stopping:"停止中",exited:"已退出",failed:"启动失败"},
+  ext_engine:"引擎由外部启动", ext_api:"API 为外部进程",
+  run_state:"服务状态", run_pf:"方案：", run_pf_none:"（未存为方案的配置）",
+  pre_title:"启动前检查", pre_note:"按已保存的配置检查", pre_busy:"服务运行中，端口检查略过",
+  pre_fail:"以下检查没通过：\n{list}\n\n仍要启动吗？",
+  ck:{MODEL_FILE:"主模型",NGRAM_FILE:"n-gram 表",OVERLAY_FILE:"overlay",MTP_FILE:"MTP 草稿",
+      VISION_FILE:"视觉塔",GGUF_FILE:"GGUF 主模型",GGUF_MTP_FILE:"MTP 草稿",GGUF_VISION_FILE:"视觉塔",
+      TOKENIZER_JSON:"tokenizer.json",api:"API 程序",engine:"引擎程序",kernel_db:"kernel 库",
+      scripts:"启动脚本",eport:"引擎端口",aport:"API 端口"},
+  ck_off:"未启用", ck_empty:"未填写", ck_free:"空闲", ck_busy:"被占用", ck_missing:"缺少",
+  log:"日志", log_engine:"引擎", log_api:"API", log_script:"启动脚本", log_launcher:"启动器",
+  follow:"跟随最新",
+  // 对话框
+  b_cancel:"取消", b_ok:"确定", b_create:"创建", b_overwrite:"覆盖", b_delete:"删除",
+  b_rename:"重命名", b_discard:"放弃修改", b_save_go:"保存后切换", b_start_anyway:"仍要启动",
+  b_stop:"停止", b_restart:"重启", b_quit:"退出",
+  d_new:"新建方案", d_new_b:"用当前编辑中的权重和推理设置建一个新方案，并切换到它。",
+  d_store:"存为方案", d_store_b:"把当前配置存成一个方案。",
+  d_rename:"重命名方案", d_dup:"复制方案", d_dup_b:"复制「{n}」，不切换当前方案。",
+  dup_suffix:" 副本", name_ph:"方案名称",
+  n_empty:"请输入名称", n_long:"名称不超过 64 个字符", n_dup:"已有同名方案，确定后会覆盖它", n_same:"名称没变",
+  d_del:"删除方案「{n}」？", d_del_b:"只删除方案记录，service.conf 和权重文件都不动。",
+  d_switch:"有未保存的修改", d_switch_b:"「{a}」有 {n} 处修改还没保存，切换到「{b}」前要怎么处理？",
+  d_stop:"停止服务？", d_stop_b:"API 与引擎都会停止，正在进行的请求会中断。",
+  d_restart:"重启服务？", d_restart_b:"先停止再按当前配置启动，正在进行的请求会中断。",
+  d_quit:"退出启动器？", d_quit_b:"服务还在运行，退出启动器会同时停止服务。",
+  leave:"有未保存的修改",
+  // 提示
+  m_saved:"已保存", m_saved_pf:"已保存到「{n}」", m_saved_run:"，重启后生效",
+  m_switched:"已切换到「{n}」", m_created:"已新建方案「{n}」", m_renamed:"已重命名为「{n}」",
+  m_dup:"已复制为「{n}」", m_deleted:"已删除方案「{n}」", m_starting:"启动中…", m_stopping:"停止中…",
+  m_restart_to:"重启超时：服务没有在 60 秒内停下", m_fixfirst:"有字段需要修正，先改好再保存",
+  quit_done:"启动器已退出，本页可以关闭（托盘图标可能还在，可一并退出）。",
+  // 文件浏览器
+  fb_root:"项目根", fb_drives:"计算机", fb_all:"全部文件", fb_pick:"选择此目录",
+  fb_hint_dir:"点目录进入，选好后点「选择此目录」", fb_hint_file:"点文件选中；↑ 上一级；路径可手输后回车",
+  fb_empty:"（空目录或过滤后无匹配）",
+  // 校验
+  v_int:"需要整数", v_range:"范围 {a}–{b}", v_req:"必填", v_port:"不能和引擎端口相同",
+  v_par:"并发大于 1 需要开启分页 KV", v_pool:"有效 KV 池不能超过 512K（524288）",
+  v_ip:"需要 IPv4 地址", v_aff:"需要非零整数掩码（如 0xFFFF）",
+  // 字段补充
+  yarn:"超过 256K，自动开启 YaRN", pool_auto:"0 = 一条最大上下文",
+  aff_unset:"不设置（默认）", aff_custom:"自定义掩码…", aff_ph:"掩码，如 0xFFFF",
+  sum_par:"并发 {n}",
+},
+en:{
+  title:"Launcher", profiles:"Profiles", new_pf:"＋ New", quit:"Quit launcher",
+  tab_w:"Weights", tab_i:"Inference", tab_m:"This machine", tab_r:"Run & logs",
+  unsaved_name:"Current config", unsaved_sub:"not saved as a profile", store_pf:"Save as profile…",
+  no_pf:"No profiles yet. Set things up, then click “＋ New”.",
+  t_run:"running", t_mod:"edited",
+  act_rename:"Rename", act_dup:"Duplicate", act_del:"Delete",
+  editing:"Editing: ", editing_unsaved:"Editing: current config (not a profile)",
+  w_note:"The selected profile is what the next start uses. Click a profile on the left to switch; edits here stay in a draft until you click Save.",
+  i_note:"Inference settings belong to the profile and switch together with the weights.",
+  m_note:"Machine settings are shared by all profiles (ports, request logging).",
+  wv_title:"Weight format",
+  wv_v1:"V1", wv_v1s:"w4b single file + optional overlay",
+  wv_v2:"V2", wv_v2s:"main model + separate n-gram table",
+  wv_gguf:"GGUF", wv_ggufs:"sharded GGUF, embedded tokenizer",
+  gguf_tok:"GGUF embeds the tokenizer; no tokenizer directory needed.",
+  browse:"Browse…", enable:"Enable", env_tag:"env",
+  env_help:"Overridden by an environment variable; edits here have no effect",
+  ex_ok:"✓ found", ex_no:"not found", ex_nodir:"directory missing", ex_notok:"no tokenizer.json in this directory",
+  reset:"Revert to saved value",
+  save:"Save", save_to:"Save to “{n}”", save_as:"Save as new…", revert:"Discard changes",
+  sb_clean:"All changes saved", sb_dirty:"{n} unsaved change(s)", sb_bad:"{n} field(s) need fixing before saving",
+  sb_note_m:" (incl. machine settings)",
+  start:"Start", save_start:"Save & start", stop:"Stop", restart:"Restart", restart_apply:"Restart to apply",
+  restart_hint:"Config changed; applies after restart", console:"Console →", cleanup:"Clean up",
+  st:{idle:"idle",spawning:"starting",waiting_engine:"engine loading",waiting_api:"waiting for API",
+      running:"running",stopping:"stopping",exited:"exited",failed:"failed"},
+  ext_engine:"engine started externally", ext_api:"API is external",
+  run_state:"Service", run_pf:"Profile: ", run_pf_none:"(unsaved config)",
+  pre_title:"Pre-flight", pre_note:"checks the saved config", pre_busy:"service running; port check skipped",
+  pre_fail:"These checks failed:\n{list}\n\nStart anyway?",
+  ck:{MODEL_FILE:"main model",NGRAM_FILE:"n-gram table",OVERLAY_FILE:"overlay",MTP_FILE:"MTP draft",
+      VISION_FILE:"vision tower",GGUF_FILE:"GGUF model",GGUF_MTP_FILE:"MTP draft",GGUF_VISION_FILE:"vision tower",
+      TOKENIZER_JSON:"tokenizer.json",api:"API binary",engine:"engine binary",kernel_db:"kernel db",
+      scripts:"launch scripts",eport:"engine port",aport:"API port"},
+  ck_off:"disabled", ck_empty:"empty", ck_free:"free", ck_busy:"in use", ck_missing:"missing",
+  log:"Logs", log_engine:"Engine", log_api:"API", log_script:"Launch script", log_launcher:"Launcher",
+  follow:"Follow tail",
+  b_cancel:"Cancel", b_ok:"OK", b_create:"Create", b_overwrite:"Overwrite", b_delete:"Delete",
+  b_rename:"Rename", b_discard:"Discard", b_save_go:"Save, then switch", b_start_anyway:"Start anyway",
+  b_stop:"Stop", b_restart:"Restart", b_quit:"Quit",
+  d_new:"New profile", d_new_b:"Create a profile from the weights and inference settings being edited, and switch to it.",
+  d_store:"Save as profile", d_store_b:"Store the current config as a profile.",
+  d_rename:"Rename profile", d_dup:"Duplicate profile", d_dup_b:"Copy “{n}” without switching.",
+  dup_suffix:" copy", name_ph:"Profile name",
+  n_empty:"Enter a name", n_long:"At most 64 characters", n_dup:"A profile with this name exists and will be overwritten", n_same:"Name unchanged",
+  d_del:"Delete profile “{n}”?", d_del_b:"Only the profile record is removed; service.conf and weight files are untouched.",
+  d_switch:"Unsaved changes", d_switch_b:"“{a}” has {n} unsaved change(s). What to do before switching to “{b}”?",
+  d_stop:"Stop the service?", d_stop_b:"API and engine will stop; in-flight requests are aborted.",
+  d_restart:"Restart the service?", d_restart_b:"Stops and starts again with the current config; in-flight requests are aborted.",
+  d_quit:"Quit the launcher?", d_quit_b:"The service is running; quitting also stops it.",
+  leave:"You have unsaved changes",
+  m_saved:"Saved", m_saved_pf:"Saved to “{n}”", m_saved_run:"; applies after restart",
+  m_switched:"Switched to “{n}”", m_created:"Created “{n}”", m_renamed:"Renamed to “{n}”",
+  m_dup:"Duplicated as “{n}”", m_deleted:"Deleted “{n}”", m_starting:"Starting…", m_stopping:"Stopping…",
+  m_restart_to:"Restart timed out: service did not stop within 60 s", m_fixfirst:"Fix the highlighted fields first",
+  quit_done:"The launcher has exited; this page can be closed.",
+  fb_root:"Project root", fb_drives:"Computer", fb_all:"All files", fb_pick:"Pick this directory",
+  fb_hint_dir:"Click a directory to enter, then pick it", fb_hint_file:"Click a file to pick; ↑ goes up; type a path + Enter",
+  fb_empty:"(empty or filtered out)",
+  v_int:"Integer required", v_range:"Range {a}–{b}", v_req:"Required", v_port:"Must differ from engine port",
+  v_par:"Concurrency > 1 needs paged KV", v_pool:"Effective KV pool must be ≤ 512K (524288)",
+  v_ip:"IPv4 address required", v_aff:"Non-zero integer mask required (e.g. 0xFFFF)",
+  yarn:"Above 256K — YaRN turns on automatically", pool_auto:"0 = one max context",
+  aff_unset:"(unset)", aff_custom:"Custom mask…", aff_ph:"mask, e.g. 0xFFFF",
+  sum_par:"×{n}",
+}};
 let LANG = "zh";
-const t = k => T[LANG][k] || k;
+function t(k, vars){
+  let s = T[LANG][k]; if (s === undefined) s = T.zh[k]; if (s === undefined) s = k;
+  if (vars && typeof s === "string") s = s.replace(/\{(\w+)\}/g, (_, v) => vars[v] ?? "");
+  return s;
+}
+const L = (o, base) => (LANG === "en" ? o[base + "En"] : o[base + "Zh"]) ?? o[base + "Zh"] ?? "";
 
-// ---- 参数分组定义 -------------------------------------------------------------
-const GROUPS = [
-  {id:"ctx", tab:"infer", zh:"上下文与并发", en:"Context & concurrency", keys:[
-    {k:"MAX_CONTEXT",type:"int"},{k:"PARALLEL",type:"int"},
-    {k:"KV_PAGED",type:"check"},{k:"KV_POOL_TOKENS",type:"int"},
-    {k:"PREFILL_CHUNK",type:"int"},{k:"CONC_PREFILL_CHUNK",type:"int",plat:"linux"},
-    {k:"QSA_INDEXER_BUDGET",type:"select",opts:["0","4096"]}]},
-  {id:"cache", tab:"infer", zh:"缓存（SSD/内存 prompt cache）", en:"Caches", keys:[
-    {k:"KVSNAP_MAX_GB",type:"int"},
-    {k:"KVSNAP_DIR",browse:"dir"}]},
-  {id:"misc", tab:"infer", zh:"推理与杂项", en:"Inference & misc", keys:[
-    {k:"MOE_A4",type:"select",opts:["0","1","2","3"]},
-    {k:"MAX_IMAGES",type:"int"},{k:"VIZ",type:"check"},
-    {k:"AFFINITY",type:"affinity",plat:"windows"},{k:"PLE_URING",type:"check",plat:"linux"},
-    {k:"MEMORY_CAP_GB",type:"int",plat:"linux"},
-    {k:"MIN_AVAILABLE_GB",type:"int",plat:"linux"},
-    {k:"START_TIMEOUT",type:"int"},{k:"STALL_TIMEOUT",type:"int",plat:"linux"}]},
-  {id:"net", tab:"netlog", zh:"网络与端口", en:"Network & ports", keys:[
-    {k:"ENGINE_HOST"},{k:"ENGINE_PORT",type:"int"},
-    {k:"API_HOST"},{k:"API_PORT",type:"int"}]},
-  {id:"reqlog", tab:"netlog", zh:"请求日志（隐私注意）", en:"Request logging (privacy!)", keys:[
-    {k:"REQLOG",type:"check"},
-    {k:"REQLOG_DIR",browse:"dir"},
-    {k:"REQLOG_LEVEL",type:"int"}]},
+// ============================================================================
+// 字段表：tab = w 权重 / i 推理 / m 本机；wv = 适用的权重格式；plat = 仅某平台
+// ============================================================================
+const FIELDS = [
+  // ---- 权重 ----
+  {k:"MODEL_FILE", tab:"w", wv:["v1","v2"], type:"file", ext:[".hgn"], req:1, nameZh:"主模型", nameEn:"Main model"},
+  {k:"NGRAM_FILE", tab:"w", wv:["v2"], type:"file", ext:[".hgn"], req:1, nameZh:"n-gram 表", nameEn:"n-gram table"},
+  {k:"OVERLAY_FILE", tab:"w", wv:["v1"], type:"file", opt:1, ext:[".hgn"], nameZh:"overlay", nameEn:"Overlay"},
+  {k:"MTP_FILE", tab:"w", wv:["v1","v2"], type:"file", opt:1, ext:[".hgn"], nameZh:"MTP 草稿", nameEn:"MTP draft",
+   helpZh:"推测解码草稿头；关闭后不做 MTP", helpEn:"Speculative-decoding draft head; off = no MTP"},
+  {k:"VISION_FILE", tab:"w", wv:["v1","v2"], type:"file", opt:1, ext:[".hgn"], nameZh:"视觉塔", nameEn:"Vision tower",
+   helpZh:"关闭后不支持图片输入", helpEn:"Off = no image input"},
+  {k:"GGUF_FILE", tab:"w", wv:["gguf"], type:"file", ext:[".gguf"], req:1, nameZh:"主模型", nameEn:"Main model",
+   helpZh:"填第 1 个分片（*-00001-of-0000N.gguf），其余分片须在同目录", helpEn:"First shard (*-00001-of-0000N.gguf); siblings in the same directory"},
+  {k:"GGUF_MTP_FILE", tab:"w", wv:["gguf"], type:"file", opt:1, ext:[".gguf"], nameZh:"MTP 草稿", nameEn:"MTP draft",
+   helpZh:"推测解码草稿头；关闭后不做 MTP", helpEn:"Speculative-decoding draft head; off = no MTP"},
+  {k:"GGUF_VISION_FILE", tab:"w", wv:["gguf"], type:"file", opt:1, ext:[".gguf"], nameZh:"视觉塔（mmproj）", nameEn:"Vision (mmproj)",
+   helpZh:"关闭后不支持图片输入", helpEn:"Off = no image input"},
+  {k:"TOKENIZER_DIR", tab:"w", wv:["v1","v2"], type:"dir", req:1, tok:1, nameZh:"词表目录", nameEn:"Tokenizer dir",
+   helpZh:"目录内需包含 tokenizer.json", helpEn:"Must contain tokenizer.json"},
+  // ---- 推理：上下文与并发 ----
+  {k:"MAX_CONTEXT", tab:"i", grp:"ctx", type:"ctx", nameZh:"最大上下文", nameEn:"Max context",
+   helpZh:"单条请求输入+输出上限，也是 KV 池默认大小", helpEn:"Per-request input+output cap; also the default KV pool size"},
+  {k:"PARALLEL", tab:"i", grp:"ctx", type:"par", nameZh:"并发请求数", nameEn:"Concurrency",
+   helpZh:"同时处理的请求数；大于 1 需要分页 KV", helpEn:"Requests served at once; >1 needs paged KV"},
+  {k:"KV_PAGED", tab:"i", grp:"ctx", type:"check", nameZh:"分页 KV", nameEn:"Paged KV", helpZh:"推荐开启", helpEn:"Recommended"},
+  {k:"KV_POOL_TOKENS", tab:"i", grp:"ctx", type:"int", unit:"tokens", nameZh:"KV 池总量", nameEn:"KV pool size",
+   helpZh:"全部并发共享；0 = 一条最大上下文，小于最大上下文时按最大上下文算", helpEn:"Shared by all requests; 0 = one max context; smaller values round up"},
+  {k:"PREFILL_CHUNK", tab:"i", grp:"ctx", type:"int", unit:"tokens", nameZh:"prefill 分段", nameEn:"Prefill chunk",
+   helpZh:"0 = 引擎默认（Windows 6144 / Linux 16384）", helpEn:"0 = engine default (Windows 6144 / Linux 16384)"},
+  {k:"CONC_PREFILL_CHUNK", tab:"i", grp:"ctx", type:"int", unit:"tokens", plat:"linux", nameZh:"并发 prefill 分段", nameEn:"Concurrent prefill chunk",
+   helpZh:"0 = 不另设", helpEn:"0 = unset"},
+  {k:"QSA_INDEXER_BUDGET", tab:"i", grp:"ctx", type:"select", nameZh:"QSA 检索预算", nameEn:"QSA indexer budget",
+   opts:[["0","2048（默认）","2048 (default)"],["4096","4096（扩大）","4096 (extended)"]]},
+  // ---- 推理：缓存 ----
+  {k:"KVSNAP_MAX_GB", tab:"i", grp:"cache", type:"int", unit:"GiB", nameZh:"SSD 缓存上限", nameEn:"SSD cache cap",
+   helpZh:"0 = 关闭 SSD prompt cache", helpEn:"0 = SSD prompt cache off"},
+  {k:"KVSNAP_DIR", tab:"i", grp:"cache", type:"dir", nameZh:"SSD 缓存目录", nameEn:"SSD cache dir",
+   helpZh:"留空 = data/kvsnap", helpEn:"Empty = data/kvsnap"},
+  // ---- 推理：选项 ----
+  {k:"MOE_A4", tab:"i", grp:"misc", type:"select", nameZh:"prefill 4-bit 加速", nameEn:"Prefill 4-bit act",
+   helpZh:"仅 hgn v2；快约 9%，精度略降", helpEn:"hgn v2 only; ~9% faster, slightly less precise",
+   opts:[["0","关闭","Off"],["1","gate/up","gate/up"],["2","down","down"],["3","两者","Both"]]},
+  {k:"MAX_IMAGES", tab:"i", grp:"misc", type:"int", nameZh:"单请求图片上限", nameEn:"Images per request", helpZh:"1–256", helpEn:"1–256"},
+  {k:"VIZ", tab:"i", grp:"misc", type:"check", nameZh:"运行时可视化", nameEn:"Runtime viz",
+   helpZh:"开启后局域网可看到生成内容", helpEn:"LAN can see generated content when on"},
+  {k:"AFFINITY", tab:"i", grp:"misc", type:"affinity", plat:"windows", nameZh:"处理器亲和性", nameEn:"CPU affinity"},
+  {k:"PLE_URING", tab:"i", grp:"misc", type:"check", plat:"linux", nameZh:"PLE io_uring 聚集读", nameEn:"PLE io_uring"},
+  // ---- 推理：启动保护 ----
+  {k:"MEMORY_CAP_GB", tab:"i", grp:"guard", type:"int", unit:"GiB", plat:"linux", nameZh:"内存上限（cgroup）", nameEn:"Memory cap (cgroup)"},
+  {k:"MIN_AVAILABLE_GB", tab:"i", grp:"guard", type:"int", unit:"GiB", plat:"linux", nameZh:"启动前可用内存下限", nameEn:"Min free RAM to start"},
+  {k:"START_TIMEOUT", tab:"i", grp:"guard", type:"int", unit:"s", nameZh:"启动超时", nameEn:"Start timeout"},
+  {k:"STALL_TIMEOUT", tab:"i", grp:"guard", type:"int", unit:"s", plat:"linux", nameZh:"加载停滞超时", nameEn:"Load stall timeout"},
+  // ---- 本机：网络 ----
+  {k:"API_HOST", tab:"m", grp:"net", type:"text", nameZh:"API 监听地址", nameEn:"API bind address",
+   helpZh:"0.0.0.0 = 所有网卡；127.0.0.1 = 仅本机", helpEn:"0.0.0.0 = all interfaces; 127.0.0.1 = local only"},
+  {k:"API_PORT", tab:"m", grp:"net", type:"int", nameZh:"API 端口", nameEn:"API port"},
+  {k:"ENGINE_HOST", tab:"m", grp:"net", type:"text", nameZh:"引擎监听地址", nameEn:"Engine bind address",
+   helpZh:"引擎行协议，默认仅本机", helpEn:"Engine line protocol; local only by default"},
+  {k:"ENGINE_PORT", tab:"m", grp:"net", type:"int", nameZh:"引擎端口", nameEn:"Engine port"},
+  // ---- 本机：请求日志 ----
+  {k:"REQLOG", tab:"m", grp:"reqlog", type:"check", nameZh:"记录请求", nameEn:"Log requests",
+   helpZh:"完整请求/响应写入 ZIP，注意隐私和磁盘占用", helpEn:"Full requests/responses to ZIP — mind privacy and disk"},
+  {k:"REQLOG_DIR", tab:"m", grp:"reqlog", type:"dir", nameZh:"日志目录", nameEn:"Log directory"},
+  {k:"REQLOG_LEVEL", tab:"m", grp:"reqlog", type:"int", nameZh:"详细度", nameEn:"Verbosity", helpZh:"0–9", helpEn:"0–9"},
 ];
-const HELP = {
-  zh: {
-    ENGINE_HOST:"引擎行协议监听地址（默认仅本机）", ENGINE_PORT:"引擎端口（默认 8730）",
-    API_HOST:"API 对外监听地址（0.0.0.0 = 所有网卡）", API_PORT:"API 端口（默认 8731）",
-    MAX_CONTEXT:"单条请求输入+输出上限（token），同时是 KV 池默认大小；超过 256K 时自动开启 YaRN（无需手动设置）",
-    PARALLEL:"并发请求数 1–8（需 KV_PAGED）", KV_PAGED:"分页 KV（推荐开启）",
-    KV_POOL_TOKENS:"全部并发共享的 KV 总量；0 = 一条 MAX_CONTEXT，小于 MAX_CONTEXT 时按 MAX_CONTEXT 算",
-    PREFILL_CHUNK:"prefill 分段，0 = 引擎默认（Win 6144 / Linux 16384）",
-    CONC_PREFILL_CHUNK:"并发分段，仅 Linux；0 = 不另设",
-    QSA_INDEXER_BUDGET:"QSA 检索预算：0 = 2048，4096 = 扩大",
-    ROPE_FACTOR:"YaRN 因子，1 = 关；>1 时 MAX_CONTEXT ≤ 因子×原生上下文",
-    KVSNAP_MAX_GB:"SSD prompt cache 上限 GiB，0 = 关",
-    KVSNAP_DIR:"SSD 缓存目录，留空 = data/kvsnap",
-    RCKPT_MAX:"RAM 检查点个数，0 = 关", MTP_GAMMA:"MTP gamma 1–8，0 = 引擎自选",
-    MOE_A4:"prefill 4-bit 加速（仅 hgn v2，快约 9%，会降低精度）：0 关 / 1 gate/up / 2 down / 3 两者",
-    MAX_IMAGES:"单请求图片数上限 1–256", VIZ:"运行时可视化（局域网可见生成内容）",
-    AFFINITY:"处理器亲和性：lower-half / upper-half / mask（仅 Windows）",
-    PLE_URING:"PLE io_uring 聚集读（仅 Linux）",
-    MEMORY_CAP_GB:"cgroup 内存上限 GiB（仅 Linux）",
-    MIN_AVAILABLE_GB:"启动前可用内存下限 GiB（仅 Linux）",
-    START_TIMEOUT:"引擎启动超时秒", STALL_TIMEOUT:"加载停滞超时秒（仅 Linux）",
-    REQLOG:"记录完整请求/响应到 ZIP（注意隐私与磁盘）",
-    REQLOG_DIR:"请求日志目录", REQLOG_LEVEL:"请求日志详细度 0–9",
-  },
-  en: {
-    ENGINE_HOST:"Engine line-protocol bind IP (localhost by default)",
-    ENGINE_PORT:"Engine port (8730)",
-    API_HOST:"API bind IP (0.0.0.0 = all interfaces)", API_PORT:"API port (8731)",
-    MAX_CONTEXT:"Per-request input+output cap (tokens); also default KV pool size. YaRN turns on automatically above 256K",
-    PARALLEL:"Concurrent requests 1–8 (needs KV_PAGED)", KV_PAGED:"Paged KV (recommended)",
-    KV_POOL_TOKENS:"Shared KV pool tokens; 0 = one MAX_CONTEXT; smaller values round up to MAX_CONTEXT",
-    PREFILL_CHUNK:"Prefill chunk; 0 = engine default (Win 6144 / Linux 16384)",
-    CONC_PREFILL_CHUNK:"Concurrent prefill chunk, Linux only; 0 = unset",
-    QSA_INDEXER_BUDGET:"QSA retrieval budget: 0 = 2048, 4096 = extended",
-    ROPE_FACTOR:"YaRN factor; 1 = off. MAX_CONTEXT ≤ factor × native ctx",
-    KVSNAP_MAX_GB:"SSD prompt cache cap GiB; 0 = off",
-    KVSNAP_DIR:"SSD cache dir; empty = data/kvsnap",
-    RCKPT_MAX:"RAM checkpoints; 0 = off", MTP_GAMMA:"MTP gamma 1–8; 0 = auto",
-    MOE_A4:"Prefill 4-bit act (hgn v2 only, ~9% faster, less precise): 0/1/2/3",
-    MAX_IMAGES:"Images per request 1–256", VIZ:"Runtime viz (LAN can see output!)",
-    AFFINITY:"CPU affinity: lower-half / upper-half / mask (Windows only)",
-    PLE_URING:"PLE io_uring batched read (Linux only)",
-    MEMORY_CAP_GB:"cgroup memory cap GiB (Linux)",
-    MIN_AVAILABLE_GB:"Min free RAM GiB before start (Linux)",
-    START_TIMEOUT:"Engine start timeout (s)", STALL_TIMEOUT:"Load stall timeout (s, Linux)",
-    REQLOG:"Dump full requests/responses to ZIP (privacy & disk!)",
-    REQLOG_DIR:"Request log dir", REQLOG_LEVEL:"Request log verbosity 0–9",
-  }
+const GROUPS = {
+  ctx:["上下文与并发","Context & concurrency"], cache:["SSD prompt 缓存","SSD prompt cache"],
+  misc:["推理选项","Inference options"], guard:["启动保护","Startup guards"],
+  net:["网络与端口","Network & ports"], reqlog:["请求日志（注意隐私）","Request logging (privacy)"],
 };
+const FMAP = Object.fromEntries(FIELDS.map(f => [f.k, f]));
+const RANGES = {ENGINE_PORT:[1,65535], API_PORT:[1,65535], MAX_CONTEXT:[1024,1048576], PARALLEL:[1,8],
+  KV_POOL_TOKENS:[0,16777216], PREFILL_CHUNK:[0,1048576], CONC_PREFILL_CHUNK:[0,1048576],
+  KVSNAP_MAX_GB:[0,65536], MAX_IMAGES:[1,256], REQLOG_LEVEL:[0,9], MEMORY_CAP_GB:[1,2048],
+  MIN_AVAILABLE_GB:[1,4096], START_TIMEOUT:[30,86400], STALL_TIMEOUT:[5,3600]};
+// 方案收哪些键（与后端 kProfileKeys 一致；网络/请求日志属本机，不进方案）
+const PF_WKEYS = {
+  v1:["MODEL_FILE","OVERLAY_FILE","MTP_FILE","VISION_FILE","TOKENIZER_DIR"],
+  v2:["MODEL_FILE","NGRAM_FILE","MTP_FILE","VISION_FILE","TOKENIZER_DIR"],
+  gguf:["GGUF_FILE","GGUF_MTP_FILE","GGUF_VISION_FILE","TOKENIZER_DIR"],
+};
+const PF_IKEYS = FIELDS.filter(f => f.tab === "i").map(f => f.k);
+const ACTIVE = ["spawning","waiting_engine","waiting_api","running","stopping"];
 
-// ---- 状态 ---------------------------------------------------------------------
-let CFG = null;
-let SVC = {state:"idle"};
-let PLATFORM = "windows";
+// ============================================================================
+// 状态
+// ============================================================================
+const S = {
+  cfg:null, plat:"windows", prof:{}, sel:"",   // sel = 选中方案名；"" = 未存为方案的当前配置
+  base:null, draft:null,                       // {wv, v:{k:值}, on:{k:启用}}；base = 已保存
+  tab:"w", svc:{state:"idle"}, ex:{}, logWhich:"engine", follow:true,
+};
+const LS = {
+  get(k){ try{ return localStorage.getItem("qxl." + k); }catch(e){ return null; } },
+  set(k, v){ try{ v == null ? localStorage.removeItem("qxl." + k) : localStorage.setItem("qxl." + k, v); }catch(e){} },
+};
 
 const $ = s => document.querySelector(s);
-const $$ = s => Array.from(document.querySelectorAll(s));
-
-let noticeTimer = null;
-function notice(msg, isErr){
-  const n = $("#notice");
-  clearTimeout(noticeTimer);
-  n.className = isErr ? "err" : "ok";
-  n.textContent = msg;
-  if (!msg) n.className = "";
-  // 成功提示 4s 自动淡出；错误常留（点击任意提示可立即关闭）
-  if (msg && !isErr) noticeTimer = setTimeout(() => {
-    n.style.opacity = "0";
-    setTimeout(() => { n.className = ""; n.style.opacity = ""; }, 450);
-  }, 4000);
+function el(tag, attrs, kids){
+  const e = document.createElement(tag);
+  if (attrs) for (const [k, v] of Object.entries(attrs)){
+    if (v == null || v === false) continue;
+    if (k === "class") e.className = v;
+    else if (k === "text") e.textContent = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else if (k in e && typeof v !== "string") e[k] = v;
+    else e.setAttribute(k, v === true ? "" : v);
+  }
+  for (const c of [].concat(kids ?? [])){
+    if (c == null || c === false) continue;
+    e.append(c.nodeType ? c : document.createTextNode(String(c)));
+  }
+  return e;
 }
-$("#notice").addEventListener("click", () => {
-  clearTimeout(noticeTimer);
-  const n = $("#notice");
-  n.className = ""; n.style.opacity = "";
-});
 
 async function api(path, method, body){
   const opt = {method: method || "GET"};
   if (body !== undefined) opt.body = JSON.stringify(body);
   const r = await fetch(path, opt);
   const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(j.error && j.error.message || (path + " → " + r.status));
+  if (!r.ok) throw new Error((j.error && j.error.message) || (path + " → " + r.status));
   return j;
 }
 
-// ---- 选项卡 ---------------------------------------------------------------------
-$$(".tab").forEach(el => el.addEventListener("click", () => {
-  $$(".tab").forEach(x => x.classList.toggle("on", x === el));
-  for (const id of ["weights","infer","netlog","control"])
-    $("#tab-"+id).style.display = id === el.dataset.tab ? "" : "none";
-}));
-function gotoTab(id){ $(`.tab[data-tab="${id}"]`)?.click(); }
+let toastTimer = null;
+function toast(msg, isErr){
+  const n = $("#toast");
+  clearTimeout(toastTimer);
+  n.style.opacity = "";
+  n.className = msg ? (isErr ? "err" : "ok") : "";
+  n.textContent = msg || "";
+  if (msg && !isErr) toastTimer = setTimeout(() => {
+    n.style.opacity = "0";
+    setTimeout(() => { n.className = ""; n.style.opacity = ""; }, 380);
+  }, 3500);
+}
+$("#toast").addEventListener("click", () => toast(""));
 
-// ---- 参数表单 -------------------------------------------------------------------
-function buildParams(){
-  const hosts = {infer: $("#groups-infer"), netlog: $("#groups-netlog")};
-  for (const h of Object.values(hosts)) h.innerHTML = "";
-  for (const g of GROUPS){
-    const host = hosts[g.tab];
-    if (!host) continue;
-    const keys = g.keys.filter(f => !f.plat || f.plat === PLATFORM);
-    if (!keys.length) continue;
-    const h = document.createElement("h2");
-    h.textContent = LANG === "zh" ? g.zh : g.en;
-    host.appendChild(h);
-    for (const f of keys){
-      const row = document.createElement("div");
-      row.className = "row";
-      const lab = document.createElement("label");
-      lab.className = "k"; lab.textContent = f.k;
-      row.appendChild(lab);
-      let inp;
-      if (f.type === "check"){
-        inp = document.createElement("input");
-        inp.type = "checkbox"; inp.dataset.key = f.k; inp.dataset.check = "1";
-        inp.style.flex = "0 0 auto";
-      } else if (f.type === "select"){
-        inp = document.createElement("select");
-        inp.dataset.key = f.k;
-        for (const o of f.opts){
-          const op = document.createElement("option");
-          op.value = o; op.textContent = o; inp.appendChild(op);
-        }
-      } else if (f.type === "affinity"){
-        inp = document.createElement("select");
-        inp.dataset.key = f.k; inp.dataset.affinity = "1";
-        for (const [v, l] of [["", LANG==="zh"?"不设置（默认）":"(unset)"],
-                              ["lower-half","lower-half（CCD0）"],
-                              ["upper-half","upper-half（CCD1）"],
-                              ["custom", LANG==="zh"?"自定义 mask…":"custom mask…"]]){
-          const op = document.createElement("option");
-          op.value = v; op.textContent = l; inp.appendChild(op);
-        }
-        row.appendChild(inp);
-        const cust = document.createElement("input");
-        cust.type = "text"; cust.id = "affinity-custom";
-        cust.placeholder = LANG==="zh" ? "掩码，如 0xFFFF" : "mask, e.g. 0xFFFF";
-        cust.style.display = "none";
-        inp.addEventListener("change", () => {
-          cust.style.display = inp.value === "custom" ? "" : "none";
-        });
-        row.appendChild(cust);
-      } else {
-        inp = document.createElement("input");
-        inp.type = "text"; inp.dataset.key = f.k;
-        if (f.type === "int") inp.inputMode = "numeric";
-      }
-      if (!inp.parentNode) row.appendChild(inp);
-      if (f.browse){
-        const b = document.createElement("button");
-        b.className = "ghost mini"; b.textContent = t("browse");
-        b.dataset.browse = f.k; b.dataset.mode = f.browse;
-        row.appendChild(b);
-      }
-      const env = document.createElement("span");
-      env.className = "envtag"; env.style.display = "none";
-      env.textContent = "env"; env.title = t("envOvr");
-      row.appendChild(env);
-      host.appendChild(row);
-      const helpText = HELP[LANG][f.k];
-      if (helpText){
-        const hp = document.createElement("div");
-        hp.className = "help"; hp.textContent = helpText;
-        host.appendChild(hp);
-      }
-    }
+// ============================================================================
+// 草稿与比较
+// ============================================================================
+const isEnv = k => (S.cfg?.env_overridden || []).includes(k);
+const fieldOn = f => (!f.plat || f.plat === S.plat);
+const fieldVisible = (f, wv) => fieldOn(f) && (!f.wv || f.wv.includes(wv));
+
+function draftFromCfg(){
+  const c = S.cfg, d = {wv: c.weights_ver || "v2", v:{}, on:{}};
+  for (const f of FIELDS){
+    const v = (c.values && f.k in c.values) ? String(c.values[f.k]) : "";
+    d.v[f.k] = v;
+    if (f.opt){ d.on[f.k] = v !== ""; if (!v) d.v[f.k] = (c.defaults && c.defaults[f.k]) || ""; }
   }
-  // 动态生成的浏览按钮绑定
-  for (const h of Object.values(hosts))
-    h.querySelectorAll("[data-browse]").forEach(b =>
-      b.addEventListener("click", () => openBrowser2(b.dataset.browse, b.dataset.mode || "file")));
+  return d;
+}
+const clone = d => ({wv:d.wv, v:{...d.v}, on:{...d.on}});
+
+// 字段的生效值（落盘值）
+function eff(d, k){
+  const f = FMAP[k];
+  if (f.opt && !d.on[k]) return "";
+  let v = String(d.v[k] ?? "").trim();
+  if (v === "" && (f.type === "int" || f.type === "ctx" || f.type === "par"))
+    v = (S.cfg?.defaults && S.cfg.defaults[k]) || "";
+  return v;
 }
 
-// ---- 配置载入/收集 ---------------------------------------------------------------
-const OPTIONAL_FILE_KEYS = ["OVERLAY_FILE","MTP_FILE","VISION_FILE",
-                            "GGUF_MTP_FILE","GGUF_VISION_FILE"];
-
-function fillConfig(){
-  const c = CFG;
-  document.documentElement.lang = LANG === "zh" ? "zh-CN" : "en";
-  const wv = c.weights_ver || "v2";
-  $$(`input[name=wv]`).forEach(r => { r.checked = r.value === wv; });
-  applyWv(wv);
-  for (const inp of $$(`[data-key]`)){
-    const k = inp.dataset.key;
-    const v = (c.values && k in c.values) ? c.values[k] : "";
-    if (inp.dataset.check) inp.checked = v === "1";
-    else if (inp.dataset.affinity){
-      const cust = $("#affinity-custom");
-      if (v === "" || v === "lower-half" || v === "upper-half"){
-        inp.value = v;
-        if (cust) cust.style.display = "none";
-      } else {
-        inp.value = "custom";
-        if (cust){ cust.value = v; cust.style.display = ""; }
-      }
-    }
-    else inp.value = v;
-    if (inp.placeholder !== undefined)
-      inp.placeholder = (c.defaults && c.defaults[k]) || "";
-    const envov = (c.env_overridden || []).includes(k);
-    inp.disabled = envov;
-    const tag = inp.parentElement.querySelector(".envtag");
-    if (tag) tag.style.display = envov ? "" : "none";
+function dirtyKeys(){
+  if (!S.base || !S.draft) return [];
+  const out = [];
+  if (S.draft.wv !== S.base.wv) out.push("weights_ver");
+  for (const f of FIELDS){
+    if (!fieldVisible(f, S.draft.wv) || isEnv(f.k)) continue;
+    if (eff(S.draft, f.k) !== eff(S.base, f.k)) out.push(f.k);
   }
-  // 可选文件键：「不使用」勾选
-  for (const k of OPTIONAL_FILE_KEYS){
-    const cb = $(`input[data-notuse="${k}"]`);
-    const inp = $(`input[data-key="${k}"]`);
-    if (!cb || !inp) continue;
-    const v = (c.values && c.values[k]) || "";
-    cb.checked = v === "";
-    if (!inp.disabled) inp.disabled = cb.checked;
-    const envov = (c.env_overridden || []).includes(k);
-    if (envov){ cb.disabled = true; }
+  return out;
+}
+const isDirty = () => dirtyKeys().length > 0;
+
+// ---- 校验 ----
+const parseIntStrict = s => /^-?\d+$/.test(s) ? parseInt(s, 10) : NaN;
+const IPV4 = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
+function validate(d){
+  const err = {};
+  const vis = f => fieldVisible(f, d.wv) && !isEnv(f.k);
+  for (const f of FIELDS){
+    if (!vis(f)) continue;
+    const v = eff(d, f.k);
+    if (["int","ctx","par"].includes(f.type)){
+      const n = parseIntStrict(v);
+      if (Number.isNaN(n)){ err[f.k] = t("v_int"); continue; }
+      const r = RANGES[f.k];
+      if (r && (n < r[0] || n > r[1])) err[f.k] = t("v_range", {a:r[0], b:r[1]});
+    } else if ((f.type === "file" || f.type === "dir") && f.req && !v){
+      err[f.k] = t("v_req");
+    } else if (f.k === "API_HOST" || f.k === "ENGINE_HOST"){
+      if (!IPV4.test(v)) err[f.k] = t("v_ip");
+    } else if (f.type === "affinity" && v && v !== "lower-half" && v !== "upper-half"){
+      const n = /^0x[0-9a-f]+$/i.test(v) ? parseInt(v, 16) : parseIntStrict(v);
+      if (!n || n < 0) err[f.k] = t("v_aff");
+    }
+  }
+  const n = k => parseIntStrict(eff(d, k));
+  if (!err.API_PORT && !err.ENGINE_PORT && n("API_PORT") === n("ENGINE_PORT")) err.API_PORT = t("v_port");
+  if (!err.PARALLEL && n("PARALLEL") > 1 && eff(d, "KV_PAGED") !== "1") err.PARALLEL = t("v_par");
+  if (!err.MAX_CONTEXT && !err.KV_POOL_TOKENS && Math.max(n("MAX_CONTEXT"), n("KV_POOL_TOKENS")) > 524288)
+    err[n("MAX_CONTEXT") > 524288 ? "MAX_CONTEXT" : "KV_POOL_TOKENS"] = t("v_pool");
+  return err;
+}
+
+// ============================================================================
+// 方案
+// ============================================================================
+function profileFromCfg(){
+  const c = S.cfg, wv = c.weights_ver || "v2", data = {weights_ver: wv};
+  for (const k of [...PF_WKEYS[wv], ...PF_IKEYS]){
+    const f = FMAP[k];
+    if (f && !fieldOn(f)) continue;
+    if (c.values && k in c.values) data[k] = String(c.values[k]);
+  }
+  return data;
+}
+function profileMatches(data){
+  const c = S.cfg;
+  if (!c || (data.weights_ver || "v2") !== (c.weights_ver || "v2")) return false;
+  for (const [k, v] of Object.entries(data)){
+    if (k === "weights_ver") continue;
+    if (String(c.values?.[k] ?? "") !== String(v)) return false;
+  }
+  return true;
+}
+function pickSel(){
+  const pref = LS.get("sel");
+  if (pref && S.prof[pref] && profileMatches(S.prof[pref])) return pref;
+  for (const n of Object.keys(S.prof)) if (profileMatches(S.prof[n])) return n;
+  return "";
+}
+function setSel(n){ S.sel = n; LS.set("sel", n || null); }
+
+function fmtK(n){
+  n = parseInt(n, 10);
+  if (!n) return "—";
+  if (n >= 1048576 && n % 1048576 === 0) return (n / 1048576) + "M";
+  if (n % 1024 === 0) return (n / 1024) + "K";
+  return String(n);
+}
+const baseName = p => String(p || "").replace(/\\/g, "/").split("/").pop();
+function summarize(data){
+  const wv = data.weights_ver || "v2";
+  const main = wv === "gguf" ? data.GGUF_FILE : data.MODEL_FILE;
+  return {
+    line: `${t("wv_" + wv)} · ${fmtK(data.MAX_CONTEXT)} · ${t("sum_par", {n: data.PARALLEL || "?"})}`,
+    file: baseName(main),
+  };
+}
+
+// ============================================================================
+// 渲染：方案栏
+// ============================================================================
+function renderSide(){
+  const host = $("#plist");
+  host.innerHTML = "";
+  const runPf = LS.get("runpf");
+  const running = ACTIVE.includes(S.svc.state) && !S.svc.engine?.external;
+  const dirty = isDirty();
+  if (!S.sel){
+    const d = S.cfg ? {weights_ver:S.cfg.weights_ver, ...S.cfg.values} : {};
+    const sm = summarize(d);
+    host.append(el("div", {class:"pitem on unsaved"}, [
+      el("div", {class:"pname"}, [el("span", {class:"nm", text:t("unsaved_name")}),
+        running && runPf === "" ? el("span", {class:"tag run", text:t("t_run")}) : null,
+        dirty ? el("span", {class:"tag mod", text:t("t_mod")}) : null]),
+      el("div", {class:"psum", text:t("unsaved_sub") + " · " + sm.line}),
+      el("div", {style:"margin-top:6px"}, el("button", {class:"btn mini", text:t("store_pf"),
+        onclick: ev => { ev.stopPropagation(); doStoreUnsaved(); }})),
+    ]));
+  }
+  const names = Object.keys(S.prof).sort((a, b) => a.localeCompare(b, "zh"));
+  if (!names.length && S.sel === "")
+    host.append(el("div", {class:"pempty", text:t("no_pf")}));
+  for (const n of names){
+    const sm = summarize(S.prof[n]);
+    const on = n === S.sel;
+    host.append(el("div", {class:"pitem" + (on ? " on" : ""), title:n, onclick:() => doSwitch(n)}, [
+      el("div", {class:"pname"}, [el("span", {class:"nm", text:n}),
+        running && runPf === n ? el("span", {class:"tag run", text:t("t_run")}) : null,
+        on && dirty ? el("span", {class:"tag mod", text:t("t_mod")}) : null]),
+      el("div", {class:"psum", text:sm.line}),
+      el("div", {class:"pfile", text:sm.file}),
+      el("div", {class:"pacts"}, [
+        el("button", {class:"iconbtn", title:t("act_rename"), text:"✎", onclick:ev => { ev.stopPropagation(); doRename(n); }}),
+        el("button", {class:"iconbtn", title:t("act_dup"), text:"⧉", onclick:ev => { ev.stopPropagation(); doDup(n); }}),
+        el("button", {class:"iconbtn", title:t("act_del"), text:"✕", onclick:ev => { ev.stopPropagation(); doDelete(n); }}),
+      ]),
+    ]));
+  }
+  // 选中项变化时滚进可见区（列表长或窄窗时选中项可能在视野外）
+  if (host._shown !== S.sel){
+    host._shown = S.sel;
+    const on = host.querySelector(".pitem.on");
+    if (on) host.scrollTop = Math.max(0, on.offsetTop - host.offsetTop - 4);
   }
 }
 
-function applyWv(wv){
-  $("#w-hgn").style.display = wv === "gguf" ? "none" : "";
-  $("#w-gguf").style.display = wv === "gguf" ? "" : "none";
-  $$(`#w-hgn [data-wv]`).forEach(el => {
-    el.style.display = el.dataset.wv === wv ? "" : "none";
+// ============================================================================
+// 渲染：页签 + 表单
+// ============================================================================
+function renderTabs(){
+  const host = $("#tabs");
+  host.innerHTML = "";
+  const dk = dirtyKeys(), errs = validate(S.draft);
+  const cnt = tab => {
+    const ks = dk.filter(k => tab === "w" ? (k === "weights_ver" || FMAP[k]?.tab === "w") : FMAP[k]?.tab === tab);
+    const es = Object.keys(errs).filter(k => FMAP[k]?.tab === tab);
+    if (es.length) return el("span", {class:"cnt err", text:es.length});
+    if (ks.length) return el("span", {class:"cnt", text:ks.length});
+    return null;
+  };
+  for (const id of ["w","i","m"])
+    host.append(el("div", {class:"tab" + (S.tab === id ? " on" : ""), "data-tab":id,
+      onclick:() => gotoTab(id)}, [t("tab_" + id), cnt(id)]));
+  const st = S.svc.state;
+  const dc = st === "running" ? "ok" : ACTIVE.includes(st) ? "busy" : (st === "failed" || st === "exited") ? "bad" : "";
+  host.append(el("div", {class:"tab r" + (S.tab === "r" ? " on" : ""), "data-tab":"r",
+    onclick:() => gotoTab("r")}, [el("span", {class:"dot " + dc}), t("tab_r")]));
+  host.append(el("span", {class:"ctxname", text: S.sel ? t("editing") + S.sel : t("editing_unsaved")}));
+}
+
+function gotoTab(id){
+  S.tab = id;
+  renderTabs(); renderPane(); renderSavebar();
+  if (id === "r") refreshLog(true);
+}
+
+function renderPane(){
+  const pane = $("#pane");
+  pane.innerHTML = "";
+  pane.className = "pane" + (S.tab === "r" ? " runpane" : "");
+  if (!S.draft) return;
+  if (S.tab === "r") return renderRun(pane);
+  if (S.tab === "w"){
+    pane.append(el("div", {class:"note", text:t("w_note")}));
+    pane.append(el("h3", {text:t("wv_title")}));
+    const cards = el("div", {class:"wvcards"});
+    for (const wv of ["v1","v2","gguf"])
+      cards.append(el("div", {class:"wvc" + (S.draft.wv === wv ? " on" : ""), onclick:() => {
+        if (S.draft.wv === wv) return;
+        S.draft.wv = wv; renderPane(); changed(); }},
+        [el("b", {text:t("wv_" + wv)}), el("span", {text:t("wv_" + wv + "s")})]));
+    pane.append(cards);
+    pane.append(el("h3", {text: LANG === "zh" ? "权重文件" : "Weight files"}));
+    for (const f of FIELDS) if (f.tab === "w" && fieldVisible(f, S.draft.wv)) pane.append(mkRow(f));
+    if (S.draft.wv === "gguf") pane.append(el("div", {class:"fhelp", style:"margin-top:8px", text:t("gguf_tok")}));
+  } else {
+    pane.append(el("div", {class:"note", text:t(S.tab + "_note")}));
+    let g = null;
+    for (const f of FIELDS){
+      if (f.tab !== S.tab || !fieldOn(f)) continue;
+      if (f.grp !== g){ g = f.grp; pane.append(el("h3", {text:GROUPS[g][LANG === "zh" ? 0 : 1]})); }
+      pane.append(mkRow(f));
+    }
+  }
+  refreshMarks();
+}
+
+function setVal(k, v){ S.draft.v[k] = v; changed(); }
+
+function mkRow(f){
+  const k = f.k, env = isEnv(k), d = S.draft;
+  const line = el("div", {class:"fline"});
+  const ctl = el("div", {class:"fctl"}, line);
+  const row = el("div", {class:"frow", "data-k":k}, [
+    el("div", {class:"flab"}, [el("div", {class:"fname", text:L(f, "name")}), el("div", {class:"fkey", text:k})]),
+    ctl]);
+  const textInput = (cls) => el("input", {type:"text", class:cls || "", value:d.v[k] ?? "", spellcheck:"false",
+    disabled:env, placeholder:(S.cfg.defaults && S.cfg.defaults[k]) || "",
+    oninput:ev => setVal(k, ev.target.value)});
+
+  if (f.type === "check"){
+    line.append(mkSwitch(d.v[k] === "1", env, on => setVal(k, on ? "1" : "0")));
+  } else if (f.type === "select"){
+    const s = el("select", {disabled:env, onchange:ev => setVal(k, ev.target.value)},
+      f.opts.map(o => el("option", {value:o[0], text: LANG === "zh" ? o[1] : o[2]})));
+    if (!f.opts.some(o => o[0] === d.v[k])) s.append(el("option", {value:d.v[k], text:d.v[k]}));
+    s.value = d.v[k];
+    line.append(s);
+  } else if (f.type === "par"){
+    const seg = el("div", {class:"seg"});
+    for (let i = 1; i <= 8; i++)
+      seg.append(el("button", {class: String(i) === d.v[k] ? "on" : "", text:i, disabled:env, onclick:() => {
+        seg.querySelectorAll("button").forEach(b => b.classList.toggle("on", b.textContent === String(i)));
+        setVal(k, String(i)); }}));
+    line.append(seg);
+  } else if (f.type === "ctx"){
+    const inp = textInput("num"); inp.inputMode = "numeric";
+    const human = el("span", {class:"unit"});
+    const chips = el("div", {class:"chips"});
+    const sync = () => {
+      const n = parseIntStrict(String(d.v[k]).trim());
+      human.textContent = Number.isNaN(n) ? "tokens" : "tokens = " + fmtK(n);
+      chips.querySelectorAll(".chip").forEach(c => c.classList.toggle("on", c.dataset.v === String(n)));
+    };
+    for (const [lab, v] of [["32K",32768],["64K",65536],["128K",131072],["256K",262144],["512K",524288]])
+      chips.append(el("span", {class:"chip", "data-v":String(v), text:lab, onclick:() => {
+        if (env) return; inp.value = String(v); setVal(k, String(v)); sync(); }}));
+    inp.addEventListener("input", sync);
+    line.append(inp, human, chips);
+    sync();
+  } else if (f.type === "affinity"){
+    const v = d.v[k] || "";
+    const std = v === "" || v === "lower-half" || v === "upper-half";
+    const cust = el("input", {type:"text", class:"num", value:std ? "" : v, placeholder:t("aff_ph"),
+      disabled:env, style:std ? "display:none" : "", oninput:ev => setVal(k, ev.target.value)});
+    const s = el("select", {disabled:env, onchange:ev => {
+      const x = ev.target.value;
+      cust.style.display = x === "custom" ? "" : "none";
+      setVal(k, x === "custom" ? cust.value : x);
+      if (x === "custom") cust.focus();
+    }}, [["", t("aff_unset")], ["lower-half","lower-half（CCD0）"], ["upper-half","upper-half（CCD1）"],
+         ["custom", t("aff_custom")]].map(o => el("option", {value:o[0], text:o[1]})));
+    s.value = std ? v : "custom";
+    line.append(s, cust);
+  } else if (f.type === "file" || f.type === "dir"){
+    const inp = textInput();
+    const br = el("button", {class:"btn ghost mini", text:t("browse"), disabled:env,
+      onclick:() => openBrowser(k, f.type)});
+    if (f.opt){
+      const enable = on => { d.on[k] = on; inp.disabled = env || !on; br.disabled = env || !on; changed(); };
+      line.append(mkSwitch(!!d.on[k], env, enable, t("enable")));
+      inp.disabled = env || !d.on[k]; br.disabled = env || !d.on[k];
+    }
+    line.append(inp, br, el("span", {class:"ex"}));
+  } else {
+    const inp = textInput(f.type === "int" ? "num" : "");
+    if (f.type === "int") inp.inputMode = "numeric";
+    line.append(inp);
+    if (f.unit) line.append(el("span", {class:"unit", text:f.unit}));
+  }
+  if (env) line.append(el("span", {class:"envtag", text:t("env_tag"), title:t("env_help")}));
+  line.append(el("button", {class:"iconbtn reset", title:t("reset"), text:"↺", onclick:() => resetField(k)}));
+  ctl.append(el("div", {class:"fmsg"}));
+  const help = L(f, "help");
+  if (help) ctl.append(el("div", {class:"fhelp", text:help}));
+  return row;
+}
+
+function mkSwitch(on, disabled, cb, label){
+  const inp = el("input", {type:"checkbox", checked:on, disabled, onchange:ev => cb(ev.target.checked)});
+  return el("label", {class:"sw"}, [inp, el("span", {class:"tr"}), label ? el("span", {class:"lb", text:label}) : null]);
+}
+
+function resetField(k){
+  S.draft.v[k] = S.base.v[k];
+  if (k in S.base.on) S.draft.on[k] = S.base.on[k];
+  renderPane(); changed();
+}
+
+// 只刷新标记（不重建 DOM，避免打字时丢焦点）
+function refreshMarks(){
+  if (!S.draft) return;
+  const dk = new Set(dirtyKeys()), errs = validate(S.draft);
+  document.querySelectorAll(".frow[data-k]").forEach(row => {
+    const k = row.dataset.k, f = FMAP[k];
+    row.classList.toggle("dirty", dk.has(k));
+    row.classList.toggle("bad", !!errs[k]);
+    const msg = row.querySelector(".fmsg");
+    msg.className = "fmsg"; msg.textContent = "";
+    if (errs[k]){ msg.className = "fmsg err"; msg.textContent = errs[k]; }
+    else if (k === "MAX_CONTEXT" && parseIntStrict(eff(S.draft, k)) > 262144){
+      msg.className = "fmsg info"; msg.textContent = t("yarn");
+    }
+    const ex = row.querySelector(".ex");
+    if (ex){
+      ex.className = "ex"; ex.textContent = "";
+      const p = eff(S.draft, k);
+      const q = f.tok ? p.replace(/[\\/]+$/, "") + "/tokenizer.json" : p;
+      const r = p ? S.ex[q] : null;
+      if (r && !errs[k]){
+        const good = f.type === "dir" && !f.tok ? r.is_dir : (r.exists && !r.is_dir);
+        ex.className = "ex " + (good ? "ok" : "no");
+        ex.textContent = good ? t("ex_ok") : (f.tok ? t("ex_notok") : f.type === "dir" ? t("ex_nodir") : t("ex_no"));
+      }
+    }
   });
-  // GGUF 权重自带 tokenizer，不需要单独的词表目录
-  $("#row-tokenizer").style.display = wv === "gguf" ? "none" : "";
-  $("#help-tokenizer").style.display = wv === "gguf" ? "none" : "";
-  $("#help-gguf-tok").style.display = wv === "gguf" ? "" : "none";
 }
 
-function collectValues(){
+let checkTimer = null;
+function scheduleCheck(){
+  clearTimeout(checkTimer);
+  checkTimer = setTimeout(async () => {
+    const paths = new Set();
+    for (const f of FIELDS){
+      if ((f.type !== "file" && f.type !== "dir") || !fieldVisible(f, S.draft.wv)) continue;
+      const p = eff(S.draft, f.k);
+      if (!p) continue;
+      paths.add(f.tok ? p.replace(/[\\/]+$/, "") + "/tokenizer.json" : p);
+    }
+    const list = [...paths].filter(p => !(p in S.ex));
+    if (!list.length){ refreshMarks(); return; }
+    try{
+      const res = await api("/api/check", "POST", {paths:list});
+      for (const r of res) S.ex[r.path] = {exists:!!r.exists, is_dir:!!r.is_dir};
+    }catch(e){}
+    refreshMarks();
+  }, 350);
+}
+
+function changed(){
+  refreshMarks(); renderTabs(); renderSavebar(); renderSide(); renderHeader(); scheduleCheck();
+}
+
+// ============================================================================
+// 保存栏
+// ============================================================================
+function renderSavebar(){
+  const bar = $("#savebar");
+  bar.innerHTML = "";
+  if (!S.draft) return;
+  const dk = dirtyKeys(), nErr = Object.keys(validate(S.draft)).length;
+  if (S.tab === "r" && !dk.length){ bar.style.display = "none"; return; }
+  bar.style.display = "";
+  bar.className = "savebar" + (nErr ? " bad" : dk.length ? " dirty" : "");
+  const hasM = dk.some(k => FMAP[k]?.tab === "m");
+  let msg;
+  if (nErr) msg = [t("sb_bad", {n:nErr})];
+  else if (dk.length) msg = ["● " + t("sb_dirty", {n:dk.length}) + (hasM ? t("sb_note_m") : ""),
+    el("span", {class:"keys", text: dk.slice(0, 4).map(k => k === "weights_ver" ? "WEIGHTS" : k).join(", ") + (dk.length > 4 ? " …" : "")})];
+  else msg = ["✓ " + t("sb_clean")];
+  bar.append(el("div", {class:"msg"}, msg));
+  bar.append(el("button", {class:"btn ghost", text:t("revert"), disabled:!dk.length, onclick:doRevert}));
+  bar.append(el("button", {class:"btn ghost", text:t("save_as"), disabled:!!nErr, onclick:doNew}));
+  bar.append(el("button", {class:"btn big", disabled:!dk.length || !!nErr, onclick:() => doSave(),
+    title:"Ctrl+S"}, [S.sel ? t("save_to", {n:S.sel}) : t("save"), " ", el("span", {class:"kbd", text:"Ctrl+S"})]));
+}
+
+// ============================================================================
+// 顶栏
+// ============================================================================
+function renderHeader(){
+  const st = S.svc.state || "idle";
+  const pill = $("#pill");
+  pill.className = "pill " + (st === "running" ? "st-running" : ACTIVE.includes(st) ? "st-busy" :
+    (st === "failed" || st === "exited") ? "st-bad" : "");
+  pill.querySelector(".stt").textContent = t("st")[st] || st;
+  const sub = [];
+  if (ACTIVE.includes(st)){
+    const rp = LS.get("runpf");
+    if (S.svc.engine?.external) sub.push(t("ext_engine"));
+    else if (rp !== null) sub.push(rp || t("unsaved_name"));
+  } else if (S.svc.detail) sub.push(S.svc.detail);
+  pill.querySelector(".sub").textContent = sub.join(" · ");
+  pill.title = S.svc.detail || "";
+
+  const active = ACTIVE.includes(st);
+  const leftover = (st === "failed" || st === "exited") && S.svc.api && S.svc.api.up;
+  const need = active && LS.get("restart") === "1";
+  $("#restartHint").style.display = need ? "" : "none";
+  $("#restartHint").textContent = need ? t("restart_hint") : "";
+  const host = $("#hdrBtns");
+  const dirty = isDirty(), bad = !!S.draft && Object.keys(validate(S.draft)).length > 0;
+  const consoleUrl = (S.svc.api && S.svc.api.up && S.svc.console_url) || "";
+  // 轮询每 2 s 调一次：内容没变就不重建按钮，免得按下与松开之间被换掉而丢点击
+  const sig = [LANG, st, active, leftover, need, dirty, bad, consoleUrl].join("|");
+  if (host._sig === sig) return;
+  host._sig = sig;
+  host.innerHTML = "";
+  if (!active && !leftover){
+    host.append(el("button", {class:"btn big", disabled:dirty && bad, text: dirty ? t("save_start") : t("start"),
+      onclick:doStart}));
+  } else {
+    if (st !== "stopping" && !leftover)
+      host.append(el("button", {class:"btn " + (need ? "warnb big" : "ghost"), text: need ? t("restart_apply") : t("restart"),
+        onclick:doRestart}));
+    host.append(el("button", {class:"btn danger", disabled:st === "stopping",
+      text: leftover ? t("cleanup") : t("stop"), onclick:doStop}));
+  }
+  $("#consoleLink").innerHTML = "";
+  if (consoleUrl) $("#consoleLink").append(el("a", {href:consoleUrl, target:"_blank", text:t("console")}));
+}
+
+// ============================================================================
+// 运行页
+// ============================================================================
+function preflight(){
+  const c = S.cfg, out = [];
+  if (!c) return out;
+  const wv = c.weights_ver || "v2", fl = c.files || {};
+  for (const k of PF_WKEYS[wv]){
+    if (k === "TOKENIZER_DIR") continue;
+    const f = fl[k]; if (!f) continue;
+    if (!f.path) out.push({k, st: f.optional ? "skip" : "bad", note: f.optional ? t("ck_off") : t("ck_empty")});
+    else out.push({k, st: f.exists ? "ok" : "bad", note: f.path});
+  }
+  if (wv !== "gguf" && fl.TOKENIZER_JSON)
+    out.push({k:"TOKENIZER_JSON", st: fl.TOKENIZER_JSON.exists ? "ok" : "bad", note: fl.TOKENIZER_JSON.path});
+  for (const [k, v] of Object.entries(c.binaries || {}))
+    out.push({k, st: v ? "ok" : "bad", note: v ? "" : t("ck_missing")});
+  if (!ACTIVE.includes(S.svc.state) && c.ports){
+    out.push({k:"eport", st: c.ports.engine_free ? "ok" : "bad", note: c.ports.engine + " " + (c.ports.engine_free ? t("ck_free") : t("ck_busy"))});
+    out.push({k:"aport", st: c.ports.api_free ? "ok" : "bad", note: c.ports.api + " " + (c.ports.api_free ? t("ck_free") : t("ck_busy"))});
+  }
+  return out;
+}
+
+// 运行页：结构只建一次，状态与预检由 fillRun() 原地刷新（不动日志区，保住滚动位置）
+function fillRun(){
+  const box = $("#runStatus"), pre = $("#runPre");
+  if (!box || !pre) return;
+  const st = S.svc.state || "idle";
+  const det = [];
+  if (S.svc.detail) det.push(S.svc.detail);
+  if (S.svc.engine?.external) det.push(t("ext_engine"));
+  if (S.svc.engine?.log) det.push(S.svc.engine.log);
+  if (S.svc.api?.external && S.svc.api?.up) det.push(t("ext_api"));
+  const rp = LS.get("runpf");
+  const stCls = st === "running" ? "var(--ok)" : ACTIVE.includes(st) ? "var(--warn)" :
+                (st === "failed" || st === "exited") ? "var(--bad)" : "var(--dim)";
+  box.replaceChildren(
+    el("h4", {text:t("run_state")}),
+    el("div", {class:"bigstate", style:"color:" + stCls, text:t("st")[st] || st}),
+    ACTIVE.includes(st) && rp !== null && !S.svc.engine?.external
+      ? el("div", {class:"kv", text:t("run_pf") + (rp || t("run_pf_none"))}) : "",
+    el("div", {class:"kv", text:det.join("；")}),
+    S.svc.api?.up && S.svc.console_url
+      ? el("div", {class:"kv", style:"margin-top:6px"}, el("a", {href:S.svc.console_url, target:"_blank", text:S.svc.console_url})) : "");
+  const pfBox = el("div", {class:"pf"});
+  for (const it of preflight())
+    pfBox.append(el("span", {class:"i " + it.st, text: it.st === "ok" ? "✓" : it.st === "bad" ? "✗" : "–"}),
+      el("span", {class:"t", title:it.note}, [t("ck")[it.k] || it.k, " ", el("small", {text:it.note})]));
+  pre.replaceChildren(
+    el("h4", {}, [t("pre_title"), el("span", {style:"font-weight:400;color:var(--faint);margin-left:8px",
+      text: ACTIVE.includes(st) ? t("pre_busy") : t("pre_note")})]),
+    pfBox);
+}
+
+function renderRun(pane){
+  pane.append(el("div", {class:"runtop"}, [el("div", {class:"box", id:"runStatus"}), el("div", {class:"box", id:"runPre"})]));
+  fillRun();
+  const seg = el("div", {class:"seg"});
+  for (const w of ["engine","api","script","launcher"]){
+    const b = el("button", {class: S.logWhich === w ? "on" : "", text:t("log_" + w), onclick:() => {
+      S.logWhich = w; seg.querySelectorAll("button").forEach(x => x.classList.toggle("on", x === b));
+      S.follow = true; refreshLog(true); }});
+    seg.append(b);
+  }
+  pane.append(el("div", {class:"logbar"}, [seg, el("span", {class:"path", id:"logPath"}),
+    mkSwitch(S.follow, false, on => { S.follow = on; if (on) scrollLogEnd(); }, t("follow"))]));
+  const pre = el("pre", {id:"log"});
+  pre.addEventListener("scroll", () => {
+    const atEnd = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 24;
+    if (S.follow !== atEnd && !pre._prog){ S.follow = atEnd; const cb = pane.querySelector(".logbar .sw input"); if (cb) cb.checked = atEnd; }
+  });
+  pane.append(pre);
+}
+
+function scrollLogEnd(){
+  const pre = $("#log"); if (!pre) return;
+  pre._prog = true; pre.scrollTop = pre.scrollHeight;
+  setTimeout(() => { pre._prog = false; }, 50);
+}
+let logBusy = false;
+async function refreshLog(force){
+  if (S.tab !== "r" || logBusy) return;
+  logBusy = true;
+  try{
+    const j = await api("/api/logs?which=" + S.logWhich);
+    const pre = $("#log");
+    if (pre){
+      const text = j.text || "";
+      if (force || pre.textContent !== text){
+        pre.textContent = text;
+        if (S.follow || force) scrollLogEnd();
+      }
+      const lp = $("#logPath"); if (lp) lp.textContent = j.path || "";
+    }
+  }catch(e){}
+  logBusy = false;
+}
+
+// ============================================================================
+// 对话框
+// ============================================================================
+function dialog({title, body, input, buttons}){
+  return new Promise(resolve => {
+    const host = $("#modalHost");
+    let inp = null, hint = null;
+    const close = v => { host.innerHTML = ""; document.removeEventListener("keydown", onKey, true); resolve(v); };
+    const btnEls = buttons.map(b => el("button", {class:"btn " + (b.kind || "ghost"), text:b.label,
+      onclick:() => { if (b.primary && inp && validateInput()) return; close(inp && b.primary ? inp.value.trim() : b.value); }}));
+    const primary = buttons.findIndex(b => b.primary);
+    const validateInput = () => {
+      if (!inp) return false;
+      const r = input.check(inp.value.trim()) || {};
+      hint.className = "mh " + (r.level || "");
+      hint.textContent = r.msg || "";
+      if (primary >= 0){
+        btnEls[primary].disabled = r.level === "err";
+        if (r.label) btnEls[primary].textContent = r.label;
+        else btnEls[primary].textContent = buttons[primary].label;
+      }
+      return r.level === "err";
+    };
+    const card = el("div", {class:"mcard"}, [el("h4", {text:title}), body ? el("div", {class:"mb", text:body}) : null]);
+    if (input){
+      inp = el("input", {type:"text", value:input.value || "", placeholder:input.placeholder || "",
+        spellcheck:"false", oninput:validateInput});
+      hint = el("div", {class:"mh"});
+      card.append(inp, hint);
+    }
+    card.append(el("div", {class:"mbtns"}, btnEls));
+    const modal = el("div", {class:"modal", onmousedown:ev => { if (ev.target === modal) close(null); }}, card);
+    host.append(modal);
+    const onKey = ev => {
+      if (ev.key === "Escape"){ ev.preventDefault(); close(null); }
+      else if (ev.key === "Enter" && primary >= 0 && !btnEls[primary].disabled &&
+               (inp ? document.activeElement === inp : true)){ ev.preventDefault(); btnEls[primary].click(); }
+    };
+    document.addEventListener("keydown", onKey, true);
+    if (inp){ validateInput(); inp.focus(); inp.select(); }
+    else if (primary >= 0) btnEls[primary].focus();
+  });
+}
+const confirmDlg = (title, body, okLabel, kind) => dialog({title, body,
+  buttons:[{label:t("b_cancel"), value:false}, {label:okLabel || t("b_ok"), value:true, kind:kind || "", primary:true}]})
+  .then(v => v === true);
+
+function askName(title, body, init, exclude){
+  return dialog({title, body,
+    input:{value:init, placeholder:t("name_ph"), check:v => {
+      if (!v) return {level:"err", msg:t("n_empty")};
+      if (v.length > 64) return {level:"err", msg:t("n_long")};
+      if (exclude !== undefined && v === exclude) return {level:"err", msg:t("n_same")};
+      if (S.prof[v]) return {level:"warn", msg:t("n_dup"), label:t("b_overwrite")};
+      return null;
+    }},
+    buttons:[{label:t("b_cancel"), value:null}, {label:t("b_ok"), kind:"", primary:true}]});
+}
+
+// ============================================================================
+// 动作
+// ============================================================================
+async function reloadCfg(){
+  S.cfg = await api("/api/config");
+  S.plat = S.cfg.platform || "windows";
+  if (S.cfg.service) S.svc = {...S.svc, ...S.cfg.service};
+}
+async function reloadProfiles(){
+  try{ S.prof = (await api("/api/profiles")).profiles || {}; }catch(e){ S.prof = {}; }
+}
+function resetDraft(){ S.base = draftFromCfg(); S.draft = clone(S.base); S.ex = {}; }
+function renderAll(){ renderSide(); renderTabs(); renderPane(); renderSavebar(); renderHeader(); scheduleCheck(); }
+
+function collectAll(){
   const vals = {};
-  for (const inp of $$(`[data-key]`)){
-    const k = inp.dataset.key;
-    if ((CFG.env_overridden||[]).includes(k)) continue;  // env 覆盖键不写
-    if (inp.dataset.affinity){
-      vals[k] = inp.value === "custom"
-        ? (($("#affinity-custom")?.value) || "").trim()
-        : inp.value;
-      continue;
-    }
-    if (OPTIONAL_FILE_KEYS.includes(k)){
-      const cb = $(`input[data-notuse="${k}"]`);
-      vals[k] = (cb && cb.checked) ? "" : inp.value.trim();
-      continue;
-    }
-    if (inp.dataset.check) vals[k] = inp.checked ? "1" : "0";
-    else vals[k] = inp.value.trim();
+  for (const f of FIELDS){
+    if (!fieldOn(f) || isEnv(f.k)) continue;
+    vals[f.k] = eff(S.draft, f.k);
   }
   return vals;
 }
+function markRestartIfActive(){ if (ACTIVE.includes(S.svc.state)) LS.set("restart", "1"); }
 
-async function save(thenStart, quiet){
-  if (!quiet) notice("");
-  const wv = $(`input[name=wv]:checked`).value;
+// 把草稿写进 service.conf；target 非空时再用规范化后的配置覆盖该方案
+async function commit(target){
+  await api("/api/config", "POST", {values:collectAll(), weights_ver:S.draft.wv});
+  await reloadCfg();
+  if (target){
+    await api("/api/profiles", "POST", {name:target, data:profileFromCfg()});
+    await reloadProfiles();
+  }
+  setSel(target || "");
+  markRestartIfActive();
+  resetDraft();
+}
+
+async function saveDraft(){
+  if (!isDirty()) return true;
+  if (Object.keys(validate(S.draft)).length){ toast(t("m_fixfirst"), true); return false; }
   try{
-    await api("/api/config", "POST", {values: collectValues(), weights_ver: wv});
-    if (thenStart){
-      await api("/api/start", "POST", {});
-      notice(t("starting"));
-      gotoTab("control");  // 跳到启动页看状态
-    } else if (!quiet){
-      notice(t("saved"));
+    const target = S.sel;
+    await commit(target);
+    toast((target ? t("m_saved_pf", {n:target}) : t("m_saved")) +
+          (ACTIVE.includes(S.svc.state) ? t("m_saved_run") : ""));
+    renderAll();
+    return true;
+  }catch(e){ toast(e.message, true); return false; }
+}
+
+function doRevert(){
+  if (!S.base) return;
+  S.draft = clone(S.base);
+  renderAll();
+}
+
+async function doNew(){
+  if (Object.keys(validate(S.draft)).length){ toast(t("m_fixfirst"), true); return; }
+  const base = S.sel || (LANG === "zh" ? "新方案" : "New profile");
+  let init = base, i = 2;
+  while (S.prof[init]) init = base + " " + (i++);
+  const name = await askName(t("d_new"), t("d_new_b"), init);
+  if (!name) return;
+  try{ await commit(name); toast(t("m_created", {n:name})); renderAll(); }
+  catch(e){ toast(e.message, true); }
+}
+async function doStoreUnsaved(){
+  const name = await askName(t("d_store"), t("d_store_b"), LANG === "zh" ? "默认" : "Default");
+  if (!name) return;
+  try{
+    if (isDirty() && !Object.keys(validate(S.draft)).length) await commit(name);
+    else {
+      await api("/api/profiles", "POST", {name, data:profileFromCfg()});
+      await reloadProfiles(); setSel(name);
     }
-    if (!quiet) await refreshConfig();  // 手动路径全量刷新；自动保存不动 DOM（防止打字被顶）
-    if (quiet){
-      // 静默同步服务端值（供方案匹配判断），不重排 DOM
-      const j = await api("/api/config");
-      CFG.values = j.values; CFG.weights_ver = j.weights_ver;
-      saveHintFlash();
-      updateProfileSel();
+    toast(t("m_created", {n:name})); renderAll();
+  }catch(e){ toast(e.message, true); }
+}
+
+async function doSwitch(name){
+  if (name === S.sel) return;
+  const dk = dirtyKeys();
+  if (dk.length){
+    const bad = Object.keys(validate(S.draft)).length > 0;
+    const v = await dialog({title:t("d_switch"),
+      body:t("d_switch_b", {a:S.sel || t("unsaved_name"), n:dk.length, b:name}),
+      buttons:[{label:t("b_cancel"), value:null}, {label:t("b_discard"), value:"discard", kind:"danger"},
+               ...(bad ? [] : [{label:t("b_save_go"), value:"save", kind:"", primary:true}])]});
+    if (!v) return;
+    if (v === "save" && !(await saveDraft())) return;
+  }
+  const data = S.prof[name];
+  if (!data) return;
+  const vals = {};
+  for (const [k, v] of Object.entries(data)) if (k !== "weights_ver") vals[k] = String(v);
+  try{
+    await api("/api/config", "POST", {values:vals, weights_ver:data.weights_ver || "v2"});
+    await reloadCfg();
+    // 后端会规范化部分值（如 KV 池按最大上下文取整）：回写方案，保证与 conf 一致
+    if (!profileMatches(data)){
+      await api("/api/profiles", "POST", {name, data:profileFromCfg()});
+      await reloadProfiles();
     }
-    pollStatus();
-  }catch(e){ notice(e.message, true); }
+    setSel(name); markRestartIfActive(); resetDraft();
+    toast(t("m_switched", {n:name}) + (ACTIVE.includes(S.svc.state) ? t("m_saved_run") : ""));
+    renderAll();
+  }catch(e){ toast(e.message, true); }
 }
 
-// ---- 自动保存：面板内任何输入 800ms 去抖后落盘 -----------------------------------
-function saveHintFlash(){
-  const el = $("#saveHint");
-  const d = new Date();
-  const p = n => String(n).padStart(2, "0");
-  el.textContent = (LANG === "zh" ? "✓ 已自动保存 " : "✓ saved ") +
-                   `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
-  el.style.opacity = "1";
-  clearTimeout(el._t);
-  el._t = setTimeout(() => el.style.opacity = ".55", 2500);
+async function doRename(old){
+  const name = await askName(t("d_rename"), "", old, old);
+  if (!name) return;
+  try{
+    await api("/api/profiles", "POST", {name, data:S.prof[old]});
+    await api("/api/profiles/delete", "POST", {name:old});
+    await reloadProfiles();
+    if (S.sel === old) setSel(name);
+    if (LS.get("runpf") === old) LS.set("runpf", name);
+    toast(t("m_renamed", {n:name})); renderAll();
+  }catch(e){ toast(e.message, true); }
 }
-let saveTimer = null;
-function autoSave(){
-  if (!CFG) return;
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => save(false, true), 800);
+async function doDup(src){
+  let init = src + t("dup_suffix"), i = 2;
+  while (S.prof[init]) init = src + t("dup_suffix") + " " + (i++);
+  const name = await askName(t("d_dup"), t("d_dup_b", {n:src}), init);
+  if (!name) return;
+  try{
+    await api("/api/profiles", "POST", {name, data:S.prof[src]});
+    await reloadProfiles(); toast(t("m_dup", {n:name})); renderAll();
+  }catch(e){ toast(e.message, true); }
 }
-document.querySelector(".panel").addEventListener("input", autoSave);
-document.querySelector(".panel").addEventListener("change", autoSave);
+async function doDelete(name){
+  if (!(await confirmDlg(t("d_del", {n:name}), t("d_del_b"), t("b_delete"), "danger"))) return;
+  try{
+    await api("/api/profiles/delete", "POST", {name});
+    await reloadProfiles();
+    if (S.sel === name) setSel(pickSel());
+    toast(t("m_deleted", {n:name})); renderAll();
+  }catch(e){ toast(e.message, true); }
+}
 
-// ---- 文件浏览器（支持项目外目录 / 绝对路径） --------------------------------------
-let FB = {key:null, mode:"file", path:"", root:"", exts:[]};
+async function doStart(){
+  if (isDirty() && !(await saveDraft())) return;
+  try{ await reloadCfg(); }catch(e){}
+  const bad = preflight().filter(x => x.st === "bad");
+  if (bad.length){
+    const list = bad.map(x => "· " + (t("ck")[x.k] || x.k) + (x.note ? "  " + x.note : "")).join("\n");
+    if (!(await confirmDlg(t("pre_title"), t("pre_fail", {list}), t("b_start_anyway"), "warnb"))) return;
+  }
+  try{
+    await api("/api/start", "POST", {});
+    LS.set("restart", null); LS.set("runpf", S.sel);
+    toast(t("m_starting"));
+    gotoTab("r");
+  }catch(e){ toast(e.message, true); }
+  pollStatus();
+}
+async function doStop(){
+  if (!(await confirmDlg(t("d_stop"), t("d_stop_b"), t("b_stop"), "danger"))) return;
+  try{ await api("/api/stop", "POST", {}); toast(t("m_stopping")); }
+  catch(e){ toast(e.message, true); }
+  pollStatus();
+}
+async function doRestart(){
+  if (isDirty() && !(await saveDraft())) return;
+  if (!(await confirmDlg(t("d_restart"), t("d_restart_b"), t("b_restart"), "warnb"))) return;
+  try{ await api("/api/stop", "POST", {}); toast(t("m_stopping")); }
+  catch(e){ toast(e.message, true); return; }
+  const t0 = Date.now();
+  while (Date.now() - t0 < 60000){
+    await new Promise(r => setTimeout(r, 700));
+    await pollStatus();
+    if (!ACTIVE.includes(S.svc.state)) break;
+  }
+  if (ACTIVE.includes(S.svc.state)){ toast(t("m_restart_to"), true); return; }
+  try{
+    await reloadCfg();
+    await api("/api/start", "POST", {});
+    LS.set("restart", null); LS.set("runpf", S.sel);
+    toast(t("m_starting")); gotoTab("r");
+  }catch(e){ toast(e.message, true); }
+  pollStatus();
+}
 
-// 字段 → 默认过滤扩展名
-const FB_EXTS = {MODEL_FILE:[".hgn"], NGRAM_FILE:[".hgn"], OVERLAY_FILE:[".hgn"],
-                 MTP_FILE:[".hgn"], VISION_FILE:[".hgn"],
-                 GGUF_FILE:[".gguf"], GGUF_MTP_FILE:[".gguf"], GGUF_VISION_FILE:[".gguf"]};
+async function doQuit(){
+  const active = ACTIVE.includes(S.svc.state);
+  if (active && !(await confirmDlg(t("d_quit"), t("d_quit_b"), t("b_quit"), "danger"))) return;
+  try{ await api("/api/shutdown" + (active ? "?force=1" : ""), "POST", {}); }catch(e){}
+  window.onbeforeunload = null;
+  document.body.innerHTML = `<p style="position:relative;padding:40px;text-align:center;color:#9aa6c0">${t("quit_done")}</p>`;
+}
 
+let lastState = null;
+async function pollStatus(){
+  try{ S.svc = await api("/api/status"); }catch(e){ return; }
+  const st = S.svc.state;
+  if (!ACTIVE.includes(st)) LS.set("restart", null);  // 没在运行就谈不上"需要重启"
+  renderHeader();
+  if (st !== lastState){
+    lastState = st;
+    renderTabs(); renderSide();
+    if (S.tab === "r"){ try{ await reloadCfg(); }catch(e){} }  // 状态变了：预检（端口等）重新取
+  }
+  if (S.tab === "r") fillRun();  // 原地刷新状态详情（加载进度等）
+}
+
+// ============================================================================
+// 文件浏览器
+// ============================================================================
+const FB = {key:null, mode:"file", path:"", root:"", exts:[], cur:""};
 function fmtSize(n){
   if (n === undefined) return "";
-  if (n >= 1e9) return (n/1e9).toFixed(1) + "G";
-  if (n >= 1e6) return (n/1e6).toFixed(1) + "M";
-  if (n >= 1e3) return (n/1e3).toFixed(1) + "K";
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + "G";
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
   return n + "B";
 }
 function fmtTime(ts){
   if (!ts) return "";
-  const d = new Date(ts * 1000);
-  const p = n => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  const d = new Date(ts * 1000), p = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
-
-// 选中路径的展示形式：项目根内 → ./相对路径；外部 → 绝对路径
-function fbDisplayPath(absPath){
-  const root = (FB.root || "").replace(/\\/g, "/");
-  const p = absPath.replace(/\\/g, "/");
-  if (root && (p === root)) return ".";
+// 项目根内 → ./相对路径；外部 → 绝对路径
+function fbDisplayPath(abs){
+  const root = (FB.root || "").replace(/\\/g, "/").replace(/\/+$/, ""), p = abs.replace(/\\/g, "/");
+  if (root && p === root) return ".";
   if (root && p.startsWith(root + "/")) return "./" + p.slice(root.length + 1);
   return p;
 }
-
-async function fbLoad(path){
-  const j = await api("/api/files?path=" + encodeURIComponent(path));
-  FB.path = j.path;         // 服务器回显的规范化绝对路径（或 @drives）
-  FB.root = j.root || FB.root;
-  $("#fbPath").value = j.path === "@drives" ? "" : j.path;
-  const list = $("#fbList");
-  list.innerHTML = "";
-  const filt = $("#fbFilter").value;  // "auto" = 按字段类型过滤；"" = 全部
-  const mk = (icon, name, onclick, size, mtime) => {
-    const d = document.createElement("div");
-    d.className = "fb-item";
-    d.innerHTML = `<span>${icon}</span><span class="nm"></span>` +
-                  `<span class="sz">${size !== undefined ? fmtSize(size) : ""}</span>` +
-                  `<span class="mt">${fmtTime(mtime)}</span>`;
-    d.children[1].textContent = name;
-    d.addEventListener("click", onclick);
-    list.appendChild(d);
-  };
-  const join = (base, name) =>
-    base === "@drives" ? name : base.endsWith("/") ? base + name : base + "/" + name;
-  for (const dir of j.dirs)
-    mk("📁", dir.name, () => fbLoad(join(j.path, dir.name)), undefined, dir.mtime);
-  for (const f of j.files){
-    if (FB.mode === "dir") continue;  // 选目录模式下文件只读
-    if (filt === "auto" && FB.exts.length &&
-        !FB.exts.some(e => f.name.toLowerCase().endsWith(e))) continue;
-    mk("📄", f.name, () => pickFile(join(j.path, f.name)), f.size, f.mtime);
-  }
-  if (!list.children.length)
-    list.innerHTML = `<div class="small" style="padding:12px">${
-      LANG === "zh" ? "（空目录或过滤后无匹配）" : "(empty or filtered out)"}</div>`;
-}
-
-function pickFile(absPath){
-  const inp = $(`input[data-key="${FB.key}"]`);
-  if (!inp) return;
-  inp.value = fbDisplayPath(absPath);
-  // 选中了文件 = 启用（去掉「不使用」）
-  const cb = $(`input[data-notuse="${FB.key}"]`);
-  if (cb){ cb.checked = false; inp.disabled = false; }
-  closeFb();
-}
-
-// 上一级：C:/x → C:/；C:/ → @drives；/a → /；@drives 时回到项目根
-function fbUp(){
-  if (FB.path === "@drives") return fbLoad("");
-  let p = FB.path.replace(/\/+$/, "");
-  if (!p) return;
-  const i = p.lastIndexOf("/");
-  let up = i <= 0 ? "/" : p.slice(0, i);
-  if (/^[A-Za-z]:$/.test(up)) up = "@drives";       // C:/ 再往上是计算机
-  if (up === p) up = "@drives";
-  fbLoad(up).catch(e => fbShowErr(e));
-}
-
-function fbShowErr(e){
-  $("#fbList").innerHTML =
-    `<div class="small" style="padding:12px;color:var(--bad)">${e.message}</div>`;
-}
-
-function openBrowser2(key, mode){
-  FB.key = key; FB.mode = mode || "file";
-  FB.exts = FB_EXTS[key] || [];
-  // 过滤下拉：有相关扩展名时才显示
-  const filt = $("#fbFilter");
-  filt.innerHTML = "";
-  if (FB.exts.length){
-    filt.innerHTML = `<option value="auto">*${FB.exts.join(" ")}</option>` +
-                     `<option value="">${t("fb_all")}</option>`;
-    filt.style.display = "";
-  } else {
-    filt.style.display = "none";
-  }
-  const cur = ($(`input[data-key="${key}"]`)?.value || "").trim();
-  // 初始目录：当前值的目录部分（相对/绝对均可，服务器解析）
-  let dir = cur.replace(/\\/g, "/");
-  if (mode !== "dir" && dir.includes("/")) dir = dir.slice(0, dir.lastIndexOf("/"));
-  if (mode !== "dir" && dir && !dir.includes("/")) dir = "";  // 裸文件名 → 项目根
-  $("#fbSelectDir").style.display = FB.mode === "dir" ? "" : "none";
-  $("#fbHint").textContent = FB.mode === "dir" ? t("fb_hint_dir") : t("fb_hint_file");
-  $("#fbModal").style.display = "";
-  $("#fbPath").focus();
-  // 目录不存在（如还没建 models/）时逐级退到项目根
-  const tryLoad = (p) => fbLoad(p).catch(() => {
-    if (!p || p === "@drives") { fbShowErr({message: "root"}); return; }
+function openBrowser(key, mode){
+  FB.key = key; FB.mode = mode; FB.exts = FMAP[key].ext || [];
+  const cur = String(S.draft.v[key] || "").trim().replace(/\\/g, "/");
+  FB.cur = baseName(cur);
+  let dir = cur;
+  if (mode !== "dir") dir = cur.includes("/") ? cur.slice(0, cur.lastIndexOf("/")) : "";
+  const host = $("#modalHost");
+  const filt = el("select", {style: FB.exts.length ? "min-width:0" : "display:none",
+    onchange:() => fbLoad(FB.path).catch(fbErr)},
+    FB.exts.length ? [el("option", {value:"auto", text:"*" + FB.exts.join(" ")}), el("option", {value:"", text:t("fb_all")})] : []);
+  const pathInp = el("input", {type:"text", id:"fbPath", spellcheck:"false",
+    onkeydown:ev => { if (ev.key === "Enter") fbLoad(ev.target.value.trim()).catch(fbErr); }});
+  const win = S.plat === "windows";
+  const card = el("div", {class:"fbcard"}, [
+    el("div", {class:"fb-toolbar"}, [el("button", {class:"btn ghost mini", text:"↑", onclick:fbUp}), pathInp, filt]),
+    el("div", {class:"fb-chips"}, [
+      el("button", {class:"btn ghost mini", text:t("fb_root"), onclick:() => fbLoad("").catch(fbErr)}),
+      el("button", {class:"btn ghost mini", text:"models", onclick:() => fbLoad("models").catch(fbErr)}),
+      el("button", {class:"btn ghost mini", text: win ? t("fb_drives") : "/", onclick:() => fbLoad(win ? "@drives" : "/").catch(fbErr)}),
+    ]),
+    el("div", {class:"fb-list", id:"fbList"}),
+    el("div", {class:"fb-foot"}, [
+      el("span", {class:"small", text: mode === "dir" ? t("fb_hint_dir") : t("fb_hint_file")}),
+      el("span", {class:"spacer"}),
+      mode === "dir" ? el("button", {class:"btn", text:t("fb_pick"), onclick:() => fbPick(FB.path)}) : null,
+      el("button", {class:"btn ghost", text:t("b_cancel"), onclick:fbClose}),
+    ]),
+  ]);
+  FB.filt = filt;
+  const modal = el("div", {class:"modal", onmousedown:ev => { if (ev.target === modal) fbClose(); }}, card);
+  host.innerHTML = ""; host.append(modal);
+  FB.onKey = ev => { if (ev.key === "Escape") fbClose(); };
+  document.addEventListener("keydown", FB.onKey);
+  const tryLoad = p => fbLoad(p).catch(() => {
+    if (!p || p === "@drives") return fbErr({message:"root"});
     tryLoad(p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "");
   });
   tryLoad(dir);
 }
-
-function closeFb(){ $("#fbModal").style.display = "none"; }
-$("#fbCancel").addEventListener("click", closeFb);
-$("#fbUp").addEventListener("click", fbUp);
-$("#fbFilter").addEventListener("change", () => fbLoad(FB.path).catch(fbShowErr));
-$("#fbPath").addEventListener("keydown", ev => {
-  if (ev.key === "Enter") fbLoad(ev.target.value.trim()).catch(fbShowErr);
-  if (ev.key === "Escape") closeFb();
-});
-document.addEventListener("keydown", ev => {
-  if (ev.key === "Escape" && $("#fbModal").style.display !== "none") closeFb();
-});
-$("#fbModal").addEventListener("click", ev => {
-  if (ev.target === $("#fbModal")) closeFb();
-});
-$("#fbSelectDir").addEventListener("click", () => {
-  const inp = $(`input[data-key="${FB.key}"]`);
-  if (inp) inp.value = fbDisplayPath(FB.path);
-  closeFb();
-});
-// 快捷跳转条
-$$("[data-fbgo]").forEach(b =>
-  b.addEventListener("click", () => fbLoad(b.dataset.fbgo).catch(fbShowErr)));
-// 静态 HTML 里的浏览按钮（动态区的已在 buildParams 里绑过）
-$$("[data-browse]").forEach(b => {
-  if (b.closest("#groups-infer") || b.closest("#groups-netlog")) return;
-  b.addEventListener("click", () => openBrowser2(b.dataset.browse, b.dataset.mode || "file"));
-});
-
-// ---- 方案（权重 + 推理设置绑定） --------------------------------------------------
-let PROFILES = {};
-// 权重键按版本过滤；推理设置键总是进方案
-const PROFILE_WKEYS = {  // 权重版本 → 该版本的键
-  v1: ["MODEL_FILE","OVERLAY_FILE","MTP_FILE","VISION_FILE","TOKENIZER_DIR"],
-  v2: ["MODEL_FILE","NGRAM_FILE","MTP_FILE","VISION_FILE","TOKENIZER_DIR"],
-  gguf: ["GGUF_FILE","GGUF_MTP_FILE","GGUF_VISION_FILE","TOKENIZER_DIR"],
-};
-const PROFILE_IKEYS = ["MAX_CONTEXT","PARALLEL","KV_PAGED","KV_POOL_TOKENS",
-  "PREFILL_CHUNK","CONC_PREFILL_CHUNK","QSA_INDEXER_BUDGET","KVSNAP_MAX_GB",
-  "KVSNAP_DIR","MOE_A4","MAX_IMAGES","VIZ","AFFINITY","PLE_URING",
-  "MEMORY_CAP_GB","MIN_AVAILABLE_GB","START_TIMEOUT","STALL_TIMEOUT"];
-const PROFILE_KEYS = ["MODEL_FILE","NGRAM_FILE","OVERLAY_FILE","MTP_FILE",
-  "VISION_FILE","GGUF_FILE","GGUF_MTP_FILE","GGUF_VISION_FILE","TOKENIZER_DIR",
-  ...PROFILE_IKEYS];
-
-async function loadProfiles(){
-  try{ const j = await api("/api/profiles"); PROFILES = j.profiles || {}; }
-  catch(e){ PROFILES = {}; }
-  const sel = $("#profileSel");
-  sel.innerHTML = "";
-  const o0 = document.createElement("option");
-  o0.value = ""; o0.textContent = t("pf_none"); sel.appendChild(o0);
-  for (const n of Object.keys(PROFILES)){
-    const o = document.createElement("option");
-    o.value = n; o.textContent = n; sel.appendChild(o);
-  }
-  updateProfileSel();
+function fbClose(){ $("#modalHost").innerHTML = ""; document.removeEventListener("keydown", FB.onKey); }
+function fbErr(e){
+  const l = $("#fbList");
+  if (l) l.replaceChildren(el("div", {class:"small", style:"padding:12px;color:var(--bad)", text:e.message}));
 }
-
-// 当前配置与哪个方案完全一致（权重版本 + 方案收的全部键逐项相等）；无匹配 = 当前配置
-function matchProfileName(){
-  if (!CFG || !CFG.values) return "";
-  const wv = $(`input[name=wv]:checked`)?.value || CFG.weights_ver;
-  for (const [name, data] of Object.entries(PROFILES)){
-    if ((data.weights_ver || "v2") !== wv) continue;
-    let ok = true;
-    for (const [k, v] of Object.entries(data)){
-      if (k === "weights_ver") continue;
-      if ((CFG.values[k] ?? "") !== v) { ok = false; break; }
+async function fbLoad(path){
+  const j = await api("/api/files?path=" + encodeURIComponent(path));
+  FB.path = j.path; FB.root = j.root || FB.root;
+  $("#fbPath").value = j.path === "@drives" ? "" : j.path;
+  const list = $("#fbList");
+  list.innerHTML = "";
+  const auto = FB.filt.value === "auto";
+  const join = (b, n) => b === "@drives" ? n : b.endsWith("/") ? b + n : b + "/" + n;
+  const mk = (icon, name, fn, size, mtime) => list.append(el("div",
+    {class:"fb-item" + (name === FB.cur ? " cur" : ""), onclick:fn},
+    [el("span", {text:icon}), el("span", {class:"nm", text:name}),
+     el("span", {class:"sz", text:size !== undefined ? fmtSize(size) : ""}), el("span", {class:"mt", text:fmtTime(mtime)})]));
+  for (const d of j.dirs) mk("📁", d.name, () => fbLoad(join(j.path, d.name)).catch(fbErr), undefined, d.mtime);
+  if (FB.mode !== "dir")
+    for (const f of j.files){
+      if (auto && FB.exts.length && !FB.exts.some(e => f.name.toLowerCase().endsWith(e))) continue;
+      mk("📄", f.name, () => fbPick(join(j.path, f.name)), f.size, f.mtime);
     }
-    if (ok) return name;
-  }
-  return "";
+  if (!list.children.length) list.append(el("div", {class:"small", style:"padding:12px", text:t("fb_empty")}));
 }
-function updateProfileSel(){
-  const sel = $("#profileSel");
-  if (sel) sel.value = matchProfileName();
+function fbUp(){
+  if (FB.path === "@drives") return fbLoad("").catch(fbErr);
+  const p = FB.path.replace(/\/+$/, "");
+  if (!p) return;
+  const i = p.lastIndexOf("/");
+  let up = i <= 0 ? "/" : p.slice(0, i);
+  if (/^[A-Za-z]:$/.test(up) || up === p) up = S.plat === "windows" ? "@drives" : "/";
+  fbLoad(up).catch(fbErr);
 }
-
-$("#profileSel").addEventListener("change", async ev => {
-  ev.stopPropagation();  // 方案切换自己保存，不触发面板的自动保存
-  const name = ev.target.value;
-  if (!name) return;  // 手动选回「当前配置」不做事（只是显示态）
-  const data = PROFILES[name];
-  if (!data) return;
-  const vals = {};
-  for (const k of PROFILE_KEYS) if (k in data) vals[k] = data[k];
-  try{
-    await api("/api/config", "POST",
-              {values: vals, weights_ver: data.weights_ver || "v2"});
-    notice(`${t("pf_switched")}「${name}」`);
-    await refreshConfig();  // 内含 updateProfileSel：下拉停在所切方案上
-  }catch(e){ notice(e.message, true); updateProfileSel(); }
-});
-
-$("#btnPfSave").addEventListener("click", async () => {
-  const name = prompt(t("pf_namewhat"));
-  if (!name || !name.trim()) return;
-  const wv = $(`input[name=wv]:checked`).value;
-  const vals = collectValues();
-  // 权重键按版本收，推理设置键全收
-  const data = {weights_ver: wv};
-  for (const k of [...PROFILE_WKEYS[wv], ...PROFILE_IKEYS])
-    if (k in vals) data[k] = vals[k];
-  try{
-    await api("/api/profiles", "POST", {name: name.trim(), data});
-    notice(`${t("pf_saved")}「${name.trim()}」`);
-    await loadProfiles();
-  }catch(e){ notice(e.message, true); }
-});
-
-$("#btnPfDel").addEventListener("click", async () => {
-  const sel = $("#profileSel");
-  const name = sel.value;
-  if (!name) return;
-  if (!confirm(`${t("pf_delq")}「${name}」?`)) return;
-  try{
-    await api("/api/profiles/delete", "POST", {name});
-    notice(`${t("pf_deleted")}「${name}」`);
-    await loadProfiles();
-  }catch(e){ notice(e.message, true); }
-});
-
-// ---- 状态轮询 ---------------------------------------------------------------------
-const ST_ORDER = ["spawning","waiting_engine","waiting_api","running","stopping"];
-
-async function pollStatus(){
-  try{ SVC = await api("/api/status"); }catch(e){ return; }
-  const badge = $("#stateBadge");
-  badge.textContent = t("st")[SVC.state] || SVC.state;
-  badge.className = "state s-" + SVC.state;
-  const active = ST_ORDER.includes(SVC.state);
-  // 失败/退出但 API 还在：允许「停止」清理残留
-  const leftover = (SVC.state === "failed" || SVC.state === "exited") &&
-                   SVC.api && SVC.api.up;
-  $("#btnStart").disabled = active || leftover;
-  $("#btnStop").disabled = !(active || leftover) || SVC.state === "stopping";
-  let d = SVC.detail || "";
-  if (SVC.engine){
-    if (SVC.engine.external) d += (d?"；":"") + (LANG==="zh"?"引擎由外部启动":"engine started externally");
-    if (SVC.engine.log) d += (d?"；":"") + SVC.engine.log;
-  }
-  if (SVC.api && SVC.api.external && SVC.api.up)
-    d += (d?"；":"") + (LANG==="zh"?"API 为外部进程":"API is external");
-  $("#statusDetail").textContent = d;
-  $("#consoleLink").innerHTML =
-    (SVC.api && SVC.api.up && SVC.console_url)
-      ? `<a href="${SVC.console_url}" target="_blank">${t("console")} →</a>` : "";
-  if ($('.tab[data-tab="control"]').classList.contains("on")) refreshLog();
+function fbPick(abs){
+  const k = FB.key;
+  S.draft.v[k] = fbDisplayPath(abs);
+  if (FMAP[k].opt) S.draft.on[k] = true;
+  fbClose(); renderPane(); changed();
 }
 
-async function refreshLog(){
-  const which = $("#logWhich").value;
-  try{
-    const j = await api("/api/logs?which=" + which);
-    $("#log").textContent = j.text || "";
-    $("#logPath").textContent = j.path || "";
-    $("#log").scrollTop = $("#log").scrollHeight;
-  }catch(e){ /* 忽略 */ }
-}
+// ---- 操作互斥：一次只跑一个动作（防止保存未完成时又点保存/切换/重启而重复提交） ----
+let BUSY = false;
+const act = fn => async (...a) => {
+  if (BUSY) return;
+  BUSY = true;
+  document.body.style.cursor = "progress";
+  try{ return await fn(...a); }
+  finally{ BUSY = false; document.body.style.cursor = ""; }
+};
+const doSave = act(saveDraft);
+doSwitch = act(doSwitch); doNew = act(doNew); doStoreUnsaved = act(doStoreUnsaved);
+doRename = act(doRename); doDup = act(doDup); doDelete = act(doDelete);
+doStart = act(doStart); doStop = act(doStop); doRestart = act(doRestart); doQuit = act(doQuit);
 
-async function refreshConfig(){
-  CFG = await api("/api/config");
-  LANG = CFG.lang || "zh";
-  PLATFORM = CFG.platform;
-  document.title = LANG === "zh" ? "Qwenox 启动器" : "Qwenox Launcher";
-  $("#langBtn").textContent = LANG === "zh" ? "EN" : "中文";
-  $$("[data-i18n]").forEach(el => { el.textContent = t(el.dataset.i18n); });
-  // 「计算机」按平台换：Linux 是根目录 /
-  const drv = $("#fbDrives");
-  drv.textContent = PLATFORM === "windows" ? "计算机" : "/";
-  drv.dataset.fbgo = PLATFORM === "windows" ? "@drives" : "/";
-  buildParams();
-  fillConfig();
-  loadProfiles();
-}
-
-// ---- 事件 ---------------------------------------------------------------------
-$$(`input[name=wv]`).forEach(r => r.addEventListener("change", () => applyWv(r.value)));
-document.addEventListener("change", ev => {
-  const cb = ev.target.closest("input[data-notuse]");
-  if (cb){
-    const inp = $(`input[data-key="${cb.dataset.notuse}"]`);
-    if (inp) inp.disabled = cb.checked;
-  }
-});
-$("#btnStart").addEventListener("click", () => save(true));
-$("#btnStop").addEventListener("click", async () => {
-  if (!confirm(t("confirmStop"))) return;
-  notice("");
-  try{ await api("/api/stop", "POST", {}); notice(t("stopping")); }
-  catch(e){ notice(e.message, true); }
-  pollStatus();
-});
-$("#btnQuit").addEventListener("click", async () => {
-  const active = ST_ORDER.includes(SVC.state);
-  if (active && !confirm(t("confirmQuit"))) return;
-  try{ await api("/api/shutdown" + (active ? "?force=1" : ""), "POST", {}); }catch(e){}
-  document.body.innerHTML =
-    `<p style="padding:40px;text-align:center;color:#9aa6c0">launcher_settings ${
-      LANG==="zh"?"已退出，本页可关闭（托盘图标可能仍在，可一并退出）。":"has exited; this page can be closed."}</p>`;
-});
+// ============================================================================
+// 全局事件 / 启动
+// ============================================================================
+$("#btnNew").addEventListener("click", doNew);
+$("#btnQuit").addEventListener("click", doQuit);
 $("#langBtn").addEventListener("click", async () => {
   LANG = LANG === "zh" ? "en" : "zh";
-  try{ await api("/api/config", "POST", {values:{}, lang: LANG}); }catch(e){}
-  await refreshConfig();
-  pollStatus();
+  try{ await api("/api/config", "POST", {values:{}, lang:LANG}); }catch(e){}
+  applyLang(); renderAll();
 });
-$("#logWhich").addEventListener("change", refreshLog);
+document.addEventListener("keydown", ev => {
+  if ((ev.ctrlKey || ev.metaKey) && (ev.key === "s" || ev.key === "S")){
+    ev.preventDefault();
+    if (!$("#modalHost").children.length) doSave();
+  }
+});
+window.onbeforeunload = ev => { if (isDirty()){ ev.preventDefault(); ev.returnValue = t("leave"); return t("leave"); } };
 
-// ---- 启动 ---------------------------------------------------------------------
+function applyLang(){
+  document.documentElement.lang = LANG === "zh" ? "zh-CN" : "en";
+  document.title = LANG === "zh" ? "Qwenox 启动器" : "Qwenox Launcher";
+  $("#langBtn").textContent = LANG === "zh" ? "EN" : "中文";
+  document.querySelectorAll("[data-i18n]").forEach(e => { e.textContent = t(e.dataset.i18n); });
+}
+
 (async () => {
   try{
-    await refreshConfig();
+    await reloadCfg();
+    LANG = S.cfg.lang || "zh";
+    applyLang();
+    await reloadProfiles();
+    setSel(pickSel());
+    resetDraft();
+    renderAll();
     await pollStatus();
-  }catch(e){
-    notice(e.message, true);
-  }
+  }catch(e){ toast(e.message, true); }
   setInterval(pollStatus, 2000);
-  setInterval(() => { if ($('.tab[data-tab="control"]').classList.contains("on")) refreshLog(); }, 3000);
+  setInterval(() => { if (S.tab === "r") refreshLog(false); }, 2500);
 })();
 </script>
 </body>

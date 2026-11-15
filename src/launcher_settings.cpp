@@ -1307,8 +1307,8 @@ void handle_files(const http::Request& q, http::Response* r, http::Stream*) {
     send_json(r, j);
 }
 
-// ---- /api/check：批量探测路径存在性（预检区随输入实时刷新用） --------------------
-// 与 /api/files 同样的根目录约束：绝对路径、".." 段直接按不存在处理。
+// ---- /api/check：批量探测路径存在性（配置页随输入实时显示"已找到/找不到"） --------
+// 相对路径相对项目根；绝对路径原样检查（文件浏览器可选项目外的文件，口径须一致）。
 void handle_check(const http::Request& q, http::Response* r, http::Stream*) {
     namespace fs = std::filesystem;
     const json body = json::parse(q.body, nullptr, false);
@@ -1322,7 +1322,6 @@ void handle_check(const http::Request& q, http::Response* r, http::Stream*) {
         if (!p.is_string() || out.size() >= 64) continue;
         std::string rel = p.get<std::string>();
         std::replace(rel.begin(), rel.end(), '\\', '/');
-        while (!rel.empty() && rel.front() == '/') rel.erase(rel.begin());
         json e;
         e["path"] = p.get<std::string>();
         fs::path sub = fs::u8path(rel);
