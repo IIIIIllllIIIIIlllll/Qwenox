@@ -11,6 +11,52 @@
 <link rel="stylesheet" href="/skin-constructivist.css">
 <link rel="stylesheet" href="/skin-aero.css">
 <link rel="stylesheet" href="/skin-faded.css">
+<style>
+/* 采样页共用排版（五套皮肤一致，只管位置/尺寸；颜色、字体、按钮外观全部继承皮肤）。
+   皮肤里同名规则带 [data-style]，优先级更高，需要时可单独覆盖。 */
+.ovr-card { container-type: inline-size; }
+.ovr-help { margin: 0 0 4px; }
+.ovr-help > summary { width: max-content; cursor: pointer; font-size: 12px; opacity: .75; }
+.ovr-help > summary:hover { opacity: 1; }
+.ovr-help[open] > summary { margin-bottom: 6px; }
+.ovr-help .ovr-hint { margin: 0 0 6px; }
+/* 方案区：第一行 = "方案" 标签名 + 另存/删除；第二行 = 方案标签条独占整宽（多了就折行，不和按钮抢位置） */
+.ovr-presets { display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "label tools" "chips chips";
+  align-items: center; gap: 8px 12px; padding: 10px 0 10px; }
+.ovr-presets-label { grid-area: label; font-size: 12px; letter-spacing: .06em; }
+.ovr-chips { grid-area: chips; min-width: 0; display: flex; flex-wrap: wrap; gap: 6px 8px; }
+.ovr-chip { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ovr-chip.on { outline: 2px solid currentColor; outline-offset: 2px; font-weight: 700; }
+.ovr-chip.manual { font-style: italic; }
+.ovr-chip .ovr-live-dot { display: inline-block; width: .5em; height: .5em; margin-right: .45em;
+  border-radius: 50%; background: currentColor; vertical-align: .12em; }
+.ovr-preset-tools { grid-area: tools; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.ovr-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; padding: 10px 0 12px;
+  border-top: 1px dashed color-mix(in srgb, currentColor 28%, transparent); margin-top: 0; }
+.ovr-actions .ovr-state { flex: none; font-size: 12px; font-weight: 700; padding: 2px 8px;
+  border: 1px solid currentColor; white-space: nowrap; }
+.ovr-actions .ovr-state.preview { border-style: dashed; opacity: .8; }
+.ovr-actions #ovr-status { margin-left: auto; }
+.ovr-card .form-err { margin-top: 0; margin-bottom: 10px; }
+#ovr-table td.ovr-note { white-space: normal; }
+/* 卡片窄于 760px：表格改为逐行卡片（参数 | 模式 | 值，说明另起一行）；faded 小票皮肤自带网格排版，不参与 */
+@container (max-width: 760px) {
+  html:not([data-style="faded"]) #ovr-table, html:not([data-style="faded"]) #ovr-table tbody { display: block; width: 100%; }
+  html:not([data-style="faded"]) #ovr-table thead { display: none; }
+  html:not([data-style="faded"]) #ovr-table tr { display: grid; grid-template-columns: minmax(0, 1fr) auto auto;
+    align-items: center; column-gap: 10px; padding: 8px 4px;
+    border-bottom: 1px dashed color-mix(in srgb, currentColor 22%, transparent); }
+  html:not([data-style="faded"]) #ovr-table td { padding: 0; border: 0; white-space: normal; min-width: 0; }
+  html:not([data-style="faded"]) #ovr-table td.ovr-note { grid-column: 1 / -1; min-width: 0; padding-top: 4px; }
+}
+/* 再窄（手机）：参数名独占一行，模式与值各占一半 */
+@container (max-width: 460px) {
+  html:not([data-style="faded"]) #ovr-table tr { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); row-gap: 4px; }
+  html:not([data-style="faded"]) #ovr-table td.ovr-param { grid-column: 1 / -1; }
+  html:not([data-style="faded"]) #ovr-table select, html:not([data-style="faded"]) #ovr-table input { width: 100%; }
+  .ovr-actions #ovr-status { margin-left: 0; flex-basis: 100%; }
+}
+</style>
 <script>
   // 首帧前定好风格与明暗，避免先按默认皮肤画一帧再跳；按钮状态由 app.js initStyle/initTheme 同步
   (function () {
@@ -189,17 +235,34 @@
       <h1 data-i18n="nav.sample">采样</h1>
       <span class="muted small" id="ovr-meta"></span>
     </header>
-    <div class="card" data-seq="SMPL0010">
+    <!-- 结构：方案标签条（选哪个方案）→ 操作栏（对选中方案做什么）→ 参数表（方案内容）。
+         表格随卡片宽度切换为逐行卡片（容器查询，见 head 里的共用排版）。
+         #ovr-preset 隐藏 select 仍是选中状态的唯一来源，标签条由 app.js 按它渲染。 -->
+    <div class="card ovr-card" data-seq="SMPL0010">
       <h2 data-i18n="ovr.title">采样 / 思考参数（服务端覆盖）</h2>
-      <p class="note muted ovr-hint" data-i18n="ovr.hint"></p>
-      <div class="head-tools ovr-preset-bar">
-        <label for="ovr-preset" data-i18n="ovr.preset_label">方案</label>
-        <select id="ovr-preset"></select>
-        <button class="btn" id="ovr-preset-apply" data-i18n="ovr.preset_apply">应用方案</button>
-        <button class="btn" id="ovr-preset-save" data-i18n="ovr.preset_save">另存为方案…</button>
-        <button class="btn" id="ovr-preset-del" data-i18n="ovr.preset_del">删除方案</button>
-        <span class="muted small" id="ovr-preset-meta"></span>
+      <details class="ovr-help">
+        <summary data-i18n="ovr.help_sum">模式说明</summary>
+        <p class="note muted ovr-hint" data-i18n="ovr.hint"></p>
+      </details>
+      <div class="ovr-presets">
+        <span class="ovr-presets-label muted" data-i18n="ovr.preset_label">方案</span>
+        <div class="ovr-chips" id="ovr-chips" role="tablist"></div>
+        <div class="ovr-preset-tools">
+          <button class="btn" id="ovr-preset-save" data-i18n="ovr.preset_save">另存为方案…</button>
+          <button class="btn" id="ovr-preset-del" data-i18n="ovr.preset_del">删除方案</button>
+        </div>
+        <select id="ovr-preset" class="hidden" aria-hidden="true" tabindex="-1"></select>
       </div>
+      <div class="ovr-actions">
+        <span class="ovr-state" id="ovr-preset-meta"></span>
+        <button class="btn primary" id="ovr-save" data-i18n="ovr.save">保存并生效</button>
+        <button class="btn" id="ovr-reload" data-i18n="ovr.reload">从服务端重新读取</button>
+        <button class="btn" id="ovr-clear" data-i18n="ovr.clear">全部改为跟随客户端</button>
+        <input id="ovr-key" type="password" class="hidden"
+               placeholder="管理密钥 (QWENOX_API_ADMIN_KEY)" data-i18n-placeholder="ovr.key_ph">
+        <span class="muted small" id="ovr-status"></span>
+      </div>
+      <p class="note form-err hidden" id="ovr-err"></p>
       <div class="table-wrap">
       <table class="table" id="ovr-table">
         <thead><tr>
@@ -209,15 +272,6 @@
         <tbody id="ovr-body"></tbody>
       </table>
       </div>
-      <div class="head-tools ovr-actions">
-        <input id="ovr-key" type="password" class="hidden"
-               placeholder="管理密钥 (QWENOX_API_ADMIN_KEY)" data-i18n-placeholder="ovr.key_ph">
-        <button class="btn primary" id="ovr-save" data-i18n="ovr.save">保存并生效</button>
-        <button class="btn" id="ovr-reload" data-i18n="ovr.reload">从服务端重新读取</button>
-        <button class="btn" id="ovr-clear" data-i18n="ovr.clear">全部改为跟随客户端</button>
-        <span class="muted small" id="ovr-status"></span>
-      </div>
-      <p class="note form-err hidden" id="ovr-err"></p>
     </div>
   </section>
   <!-- ======================= 引擎 / 设置 ======================= -->

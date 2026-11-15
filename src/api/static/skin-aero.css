@@ -306,7 +306,7 @@
 [data-style="aero"] #ovr-table tr.mode-force .ovr-param::before { content: "●"; margin-right: 7px; font-size: 9px; }
 [data-style="aero"] .card:not(.fill-card) .table tbody tr td { background-color: transparent; }
 [data-style="aero"] .card:not(.fill-card) .table th { position: static; background: transparent; backdrop-filter: none; }
-[data-style="aero"] .ovr-actions, [data-style="aero"] .eng-actions { margin-top: 16px; }
+[data-style="aero"] .eng-actions { margin-top: 16px; }
 [data-style="aero"] .form-err { margin: 14px 0 0; padding: 7px 12px; border: 1px solid rgba(217, 60, 54, .35); border-radius: 8px; background: rgba(223, 74, 74, .1); color: var(--red); }
 [data-style="aero"] .cfg-group-title { display: flex; align-items: center; gap: 12px; margin: 22px 0 10px; color: var(--blue-deep); font-size: 15px; font-weight: 600; }
 [data-style="aero"][data-theme="dark"] .cfg-group-title { color: var(--blue); }

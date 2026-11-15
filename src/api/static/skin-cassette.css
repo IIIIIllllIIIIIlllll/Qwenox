@@ -458,7 +458,6 @@
 [data-style="cassette"] #ovr-table tr.mode-default .ovr-param { color: var(--p); font-weight: 700; }
 [data-style="cassette"] #ovr-table tr.mode-force .ovr-param { color: var(--amber); font-weight: 700; text-shadow: 0 0 5px rgba(255, 193, 94, .5); }
 [data-style="cassette"] #ovr-table tr.mode-force .ovr-param::before { content: "! "; }
-[data-style="cassette"] .ovr-actions { margin-top: 18px; }
 [data-style="cassette"] .form-err {
   margin: 14px 0 0;
   padding: 6px 12px;

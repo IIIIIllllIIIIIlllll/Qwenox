@@ -469,7 +469,6 @@
 /* 采样表在卡片上，不用绿条 */
 [data-style="punch"] .card:not(.fill-card) .table tbody tr td { background-color: transparent; border-bottom: 1px dotted var(--ink-faint); }
 [data-style="punch"] .card:not(.fill-card) .table th { background: transparent; position: static; }
-[data-style="punch"] .ovr-actions { margin-top: 16px; }
 [data-style="punch"] .form-err {
   margin: 14px 0 0; padding: 6px 12px;
   border-left: 3px solid var(--ribbon); color: var(--ribbon);

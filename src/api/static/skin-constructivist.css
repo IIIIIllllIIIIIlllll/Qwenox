@@ -362,7 +362,6 @@
   position: static; background: transparent; color: var(--ink);
   border-bottom: 2px solid var(--ink);
 }
-[data-style="constructivist"] .ovr-actions { margin-top: 16px; }
 [data-style="constructivist"] .form-err {
   margin: 14px 0 0; padding: 6px 12px;
   border-left: 4px solid var(--red); background: var(--red-faint); color: var(--red);

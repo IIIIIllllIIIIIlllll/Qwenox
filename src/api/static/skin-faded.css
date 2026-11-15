@@ -672,7 +672,7 @@ html[lang="en"][data-style="faded"] #req-table td:nth-child(12)::before { conten
 [data-style="faded"] .btn.primary::before, [data-style="faded"] .btn.primary::after { content: none; }
 [data-style="faded"] .btn.primary:hover:not(:disabled) { background: none; color: var(--stamp); transform: rotate(-6deg) scale(1.04); }
 [data-style="faded"] .btn.primary:active:not(:disabled) { transform: rotate(-4deg) scale(.95); }
-[data-style="faded"] .ovr-actions, [data-style="faded"] .eng-actions, [data-style="faded"] .cfg-actions { display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap; margin-top: 14px; }
+[data-style="faded"] .eng-actions, [data-style="faded"] .cfg-actions { display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap; margin-top: 14px; }
 [data-style="faded"] .form-err { margin: 10px 0 0; padding: 2px 6px; background: var(--th); color: var(--th-paper); text-shadow: none; }
 
 /* 文件选择：小票上再压一张小一点的票 */

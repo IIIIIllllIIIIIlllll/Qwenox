@@ -106,16 +106,17 @@ const I18N = {
     "ovr.n_repeat_last_n": "默认 64；0 = 禁用整个 penalties，-1 = 本请求全历史；共享 prompt + accepted tokens 窗口",
     "ovr.n_repeat_penalty": "默认 1.0，必须 > 0；显式设置即进入 llama.cpp penalties 模式",
     "ovr.n_max_tokens": "默认值 = 客户端没给输出上限时用它；强制 = 输出上限，客户端给得更大时压到此值",
-    "ovr.preset_label": "方案", "ovr.preset_apply": "应用方案",
+    "ovr.preset_label": "方案",
     "ovr.preset_save": "另存为方案…", "ovr.preset_del": "删除方案",
-    "ovr.preset_active": "当前生效：{n}", "ovr.preset_none": "当前生效：无（手动设置）",
     "ovr.preset_name_ph": "方案名称（保存当前编辑框内容）：",
     "ovr.preset_confirm_overwrite": "方案“{n}”已存在，覆盖它？",
     "ovr.preset_confirm_del": "删除方案“{n}”？不影响当前生效的覆盖表。",
     "ovr.preset_applied": "已应用方案：{n}", "ovr.preset_saved": "已保存方案：{n}",
     "ovr.preset_deleted": "已删除方案：{n}",
     "ovr.preset_default_name": "默认",
-    "ovr.preset_preview": "预览方案：{n}（尚未生效，点「应用方案」生效）",
+    "ovr.preset_preview": "预览方案：{n}（尚未生效，点「应用」生效）",
+    "ovr.help_sum": "模式说明", "ovr.preset_manual": "手动设置",
+    "ovr.save_apply": "应用「{n}」", "ovr.st_live": "● 生效中", "ovr.st_preview": "预览中 · 未生效",
     "eng.status": "引擎状态", "eng.start": "启动引擎", "eng.stop": "停止引擎",
     "eng.state_stopped": "已停止", "eng.state_starting": "启动中（冷加载可能要几分钟）",
     "eng.state_running": "运行中", "eng.state_exited": "异常退出",
@@ -239,16 +240,17 @@ const I18N = {
     "ovr.n_repeat_penalty": "1.0 by default, must be > 0; explicitly setting it selects llama.cpp penalties",
     "ovr.n_max_tokens": "default = used when the client gives no output cap; " +
       "force = cap, larger client values clamp to it",
-    "ovr.preset_label": "Preset", "ovr.preset_apply": "Apply preset",
+    "ovr.preset_label": "Preset",
     "ovr.preset_save": "Save as preset…", "ovr.preset_del": "Delete preset",
-    "ovr.preset_active": "active: {n}", "ovr.preset_none": "active: none (manual)",
     "ovr.preset_name_ph": "Preset name (saves the current edits):",
     "ovr.preset_confirm_overwrite": "Preset \"{n}\" exists. Overwrite it?",
     "ovr.preset_confirm_del": "Delete preset \"{n}\"? The live override table is not affected.",
     "ovr.preset_applied": "preset applied: {n}", "ovr.preset_saved": "preset saved: {n}",
     "ovr.preset_deleted": "preset deleted: {n}",
     "ovr.preset_default_name": "Default",
-    "ovr.preset_preview": "previewing preset: {n} (not live — click \"Apply preset\")",
+    "ovr.preset_preview": "previewing preset: {n} (not live — click \"Apply\")",
+    "ovr.help_sum": "How modes work", "ovr.preset_manual": "Manual",
+    "ovr.save_apply": "Apply \u201c{n}\u201d", "ovr.st_live": "● live", "ovr.st_preview": "preview · not live",
     "eng.status": "Engine status", "eng.start": "Start engine", "eng.stop": "Stop engine",
     "eng.state_stopped": "stopped", "eng.state_starting": "starting (a cold load can take minutes)",
     "eng.state_running": "running", "eng.state_exited": "exited unexpectedly",
@@ -623,7 +625,11 @@ async function loadReqstat(force) {
 
 // ---------------- 路由 ----------------
 
-const PAGES = ["overview", "usage", "requests", "sample", "engine"];
+// 引擎页（启停 + service.conf 表单）：配置已统一到启动器（launcher_settings），控制台默认不显示。
+// 改 true 即恢复导航按钮与路由；页面代码保留不动。
+const SHOW_ENGINE_PAGE = false;
+const PAGES = ["overview", "usage", "requests", "sample"].concat(SHOW_ENGINE_PAGE ? ["engine"] : []);
+if (!SHOW_ENGINE_PAGE) document.querySelector('.nav-btn[data-route="engine"]')?.remove();
 let currentPage = "";
 const onEnter = { overview: enterOverview, usage: enterUsage, requests: enterRequests,
   sample: enterSample, engine: enterEngine };
@@ -631,9 +637,8 @@ const onEnter = { overview: enterOverview, usage: enterUsage, requests: enterReq
 function showPage(name) {
   if (!PAGES.includes(name)) name = "overview";
   currentPage = name;
-  for (const p of PAGES) {
-    document.getElementById("page-" + p).classList.toggle("hidden", p !== name);
-  }
+  for (const sec of document.querySelectorAll(".main > .page"))
+    sec.classList.toggle("hidden", sec.id !== "page-" + name);
   for (const b of document.querySelectorAll(".nav-btn"))
     b.classList.toggle("active", b.dataset.route === name);
   onEnter[name]();
@@ -983,9 +988,18 @@ function fillSample(state) {
   ovrDirty = false;
 }
 
+let ovrUserPick = 0;  // 用户点选方案标签的次数，判断加载期间用户是否换过选中项
 async function loadSample() {
+  const pick0 = ovrUserPick;
   try {
     fillSample(await getJSON("/admin/overrides"));
+    // 表单此刻是生效表。与方案列表并行加载，谁先回来都要和标签一致：
+    // 加载期间用户没点过 → 选中项同步回生效项；点过 → 保留其选择，表单恢复成该方案的预览
+    const sel = ovrEl("ovr-preset");
+    if (sel.options.length) {
+      if (ovrUserPick === pick0) renderPresetBar(ovrLiveSel());
+      else if (sel.value) fillSampleTable(ovrPresets.presets[sel.value] || {});
+    }
     ovrHideErr();
     ovrSetStatus(t("ovr.s_loaded"));
   } catch (e) {
@@ -1039,7 +1053,7 @@ async function postSample(table) {
   }
   fillSample(j);
   ovrHideErr();
-  loadPresets(true);  // 手动保存可能使后端清掉 active 标记，静默刷新方案条
+  loadPresets(true, true);  // 手动保存可能使后端清掉 active 标记；表单即生效表，选中项跟到生效项
   if (j.saved) {
     ovrSetStatus(t("ovr.s_saved"));
   } else {
@@ -1060,6 +1074,7 @@ ovrEl("ovr-save").addEventListener("click", () => {
 ovrEl("ovr-reload").addEventListener("click", () => {
   if (ovrDirty && !confirm(t("ovr.confirm_reload"))) return;
   loadSample();
+  loadPresets(true, true);
 });
 ovrEl("ovr-clear").addEventListener("click", () => {
   if (!confirm(t("ovr.confirm_clear"))) return;
@@ -1083,41 +1098,71 @@ function presetDisplayName(n) {
   return n === OVR_DEFAULT_PRESET ? t("ovr.preset_default_name") : n;
 }
 
+// 选中项（隐藏 select 的值）："" = 手动设置（生效表不属于任何方案时才出现），其余 = 方案名。
+// 生效中的那一项 = active 方案；没有 active 时是"手动设置"。
+const ovrLiveSel = () => ovrPresets.active || "";
+
+// 标签条 + 状态徽标 + 主按钮文案，全部按当前选中项重画。
 function syncPresetButtons() {
-  const v = ovrEl("ovr-preset").value;
-  ovrEl("ovr-preset-apply").disabled = !v;
+  const sel = ovrEl("ovr-preset");
+  const v = sel.value, live = v === ovrLiveSel();
   ovrEl("ovr-preset-del").disabled = !v || v === OVR_DEFAULT_PRESET;
+  // 选中项就是生效项 → 保存并生效（写回该方案）；预览别的方案 → 应用它
+  ovrEl("ovr-save").textContent = live ? t("ovr.save") : fmtMsg("ovr.save_apply", { n: presetDisplayName(v) });
+  const st = ovrEl("ovr-preset-meta");
+  st.textContent = live ? t("ovr.st_live") : t("ovr.st_preview");
+  st.className = "ovr-state " + (live ? "live" : "preview");
+  const host = ovrEl("ovr-chips");
+  host.textContent = "";
+  for (const o of sel.options) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "btn ovr-chip" + (o.value === v ? " on" : "") + (o.value === "" ? " manual" : "");
+    b.setAttribute("role", "tab");
+    b.setAttribute("aria-selected", String(o.value === v));
+    b.title = o.textContent;
+    if (o.value === ovrLiveSel()) {
+      const dot = document.createElement("span");
+      dot.className = "ovr-live-dot";
+      b.appendChild(dot);
+    }
+    b.appendChild(document.createTextNode(o.textContent));
+    b.addEventListener("click", () => {
+      if (sel.value === o.value) return;
+      ovrUserPick++;
+      sel.value = o.value;
+      sel.dispatchEvent(new Event("change"));
+    });
+    host.appendChild(b);
+  }
 }
 
-function renderPresetBar() {
+function renderPresetBar(forceSel) {
   const sel = ovrEl("ovr-preset");
-  const cur = sel.value;  // 刷新后尽量保持选中
+  const cur = forceSel !== undefined ? forceSel : sel.value;  // 刷新后尽量保持选中
   sel.textContent = "";
   const names = Object.keys(ovrPresets.presets).sort((a, b) => a.localeCompare(b));
   const di = names.indexOf(OVR_DEFAULT_PRESET);
   if (di > 0) { names.splice(di, 1); names.unshift(OVR_DEFAULT_PRESET); }  // 默认置顶
+  // 生效表不属于任何方案：放一个"手动设置"项在最前，代表当前生效的手动内容
+  if (!ovrPresets.active) names.unshift("");
   for (const n of names) {
     const o = document.createElement("option");
     o.value = n;
-    const dn = presetDisplayName(n);
-    o.textContent = n === ovrPresets.active ? "● " + dn : dn;
+    o.textContent = n ? presetDisplayName(n) : t("ovr.preset_manual");
     sel.appendChild(o);
   }
-  if (names.includes(cur)) sel.value = cur;
-  else if (ovrPresets.active && names.includes(ovrPresets.active))
-    sel.value = ovrPresets.active;
+  sel.value = names.includes(cur) ? cur : ovrLiveSel();
   ovrPresetPrevSel = sel.value;
   syncPresetButtons();
-  ovrEl("ovr-preset-meta").textContent = ovrPresets.active
-    ? fmtMsg("ovr.preset_active", { n: presetDisplayName(ovrPresets.active) })
-    : t("ovr.preset_none");
 }
 
-async function loadPresets(quiet) {
+// selLive：刷新后把选中项切到生效项（表单刚载入的是生效表时用，保证标签与表单内容一致）
+async function loadPresets(quiet, selLive) {
   try {
     const j = await getJSON("/admin/presets");
     ovrPresets = { presets: j.presets || {}, active: j.active || null };
-    renderPresetBar();
+    renderPresetBar(selLive ? ovrLiveSel() : undefined);
     if (!quiet) ovrHideErr();
   } catch (e) {
     if (!quiet) ovrShowErr(fmtMsg("ovr.e_read", { m: e.message }));
@@ -1147,10 +1192,13 @@ async function postPreset(url, body) {
 }
 
 // 写操作成功后的统一收尾：刷新方案条，报状态；持久化失败追加提示。
+// 另存为：选中新方案（表单即其内容）；删除：选中项没了，表单回到生效表。
 function presetDone(j, statusKey, name) {
   ovrPresets = { presets: j.presets || {}, active: j.active || null };
-  renderPresetBar();
-  if (ovrPresets.presets[name]) ovrEl("ovr-preset").value = name;
+  const keep = ovrPresets.presets[name] ? name : undefined;
+  renderPresetBar(keep !== undefined ? keep : ovrLiveSel());
+  if (keep === undefined) fillSampleTable((ovrLastState && ovrLastState.overrides) || {});
+  ovrDirty = false;
   ovrHideErr();
   ovrSetStatus(fmtMsg(statusKey, { n: name }));
   if (!j.saved) ovrShowErr(fmtMsg("ovr.e_persist", { m: j.save_error || "?" }));
@@ -1162,17 +1210,20 @@ function presetDone(j, statusKey, name) {
 ovrEl("ovr-preset").addEventListener("change", () => {
   const sel = ovrEl("ovr-preset");
   const name = sel.value;
-  if (!name || name === ovrPresetPrevSel) { syncPresetButtons(); return; }
+  if (name === ovrPresetPrevSel) { syncPresetButtons(); return; }
   if (ovrDirty && !confirm(t("ovr.confirm_reload"))) {
     sel.value = ovrPresetPrevSel;
     syncPresetButtons();
     return;
   }
-  fillSampleTable(ovrPresets.presets[name] || {});
+  // "手动设置" = 回到当前生效表；方案 = 预览其内容
+  fillSampleTable(name ? (ovrPresets.presets[name] || {}) : ((ovrLastState && ovrLastState.overrides) || {}));
+  ovrDirty = false;
   ovrPresetPrevSel = name;
   syncPresetButtons();
   ovrHideErr();
-  ovrSetStatus(fmtMsg("ovr.preset_preview", { n: presetDisplayName(name) }));
+  if (name && name !== ovrLiveSel()) ovrSetStatus(fmtMsg("ovr.preset_preview", { n: presetDisplayName(name) }));
+  else ovrSetStatus(t("ovr.s_loaded"));
 });
 
 // 应用/保存共用：把表单内容写入选中方案（save:true）并使其生效。
@@ -1182,21 +1233,12 @@ async function applyPreset(name, table) {
   const j = await postPreset("/admin/presets/apply", { name, table, save: true });
   if (!j) return;
   ovrPresets = { presets: j.presets || {}, active: j.active || null };
-  renderPresetBar();
-  if (ovrPresets.presets[name]) ovrEl("ovr-preset").value = name;
   if (j.applied) fillSample(j.applied);  // 表单回到刚生效的内容
+  renderPresetBar(ovrPresets.presets[name] ? name : ovrLiveSel());
   ovrHideErr();
   ovrSetStatus(fmtMsg("ovr.preset_applied", { n: presetDisplayName(name) }));
   if (!j.saved) ovrShowErr(fmtMsg("ovr.e_persist", { m: j.save_error || "?" }));
 }
-
-ovrEl("ovr-preset-apply").addEventListener("click", () => {
-  const name = ovrEl("ovr-preset").value;
-  if (!name) return;
-  let table;
-  try { table = getSample(); } catch (e) { ovrShowErr(e.message); return; }
-  applyPreset(name, table);
-});
 
 ovrEl("ovr-preset-save").addEventListener("click", async () => {
   let table;
