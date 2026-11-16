@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Qwenox 启动器</title>
+<link rel="icon" href="/favicon.ico" sizes="16x16 24x24 32x32 48x48 64x64 96x96">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <style>
 :root{
   --ink:#e8ecf6; --dim:#9aa6c0; --faint:#6c7893;
@@ -47,6 +49,7 @@ h1{font-size:17px;margin:0;white-space:nowrap;text-shadow:0 1px 6px rgba(0,0,0,.
   padding:6px 16px;font-size:13.5px;cursor:pointer;white-space:nowrap;line-height:1.4}
 .btn:hover{background:var(--btn-hi)}
 .btn:disabled{opacity:.4;cursor:not-allowed}
+a.btn{display:inline-flex;align-items:center;text-decoration:none}
 .btn.ghost{background:rgba(16,22,40,.72);color:var(--ink);border-color:var(--line2)}
 .btn.ghost:hover{background:rgba(40,56,100,.6)}
 .btn.danger{background:#7a3440;border-color:rgba(240,150,150,.3)}
@@ -267,7 +270,7 @@ pre#log{background:var(--card2);border:1px solid var(--line);border-radius:8px;
   <span class="restart-hint" id="restartHint" style="display:none"></span>
   <span id="hdrBtns" style="display:flex;gap:8px"></span>
   <span id="consoleLink"></span>
-  <button class="btn ghost mini" id="langBtn">EN</button>
+  <button class="btn ghost" id="langBtn">EN</button>
 </header>
 <main>
   <aside>
@@ -1020,7 +1023,7 @@ function renderHeader(){
       text: leftover ? t("cleanup") : t("stop"), onclick:doStop}));
   }
   $("#consoleLink").innerHTML = "";
-  if (consoleUrl) $("#consoleLink").append(el("a", {href:consoleUrl, target:"_blank", text:t("console")}));
+  if (consoleUrl) $("#consoleLink").append(el("a", {class:"btn ghost", href:consoleUrl, target:"_blank", text:t("console")}));
 }
 
 // ============================================================================
