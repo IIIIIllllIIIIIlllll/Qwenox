@@ -15,11 +15,23 @@
 #
 # 用法: tools/run_capped.sh [cap_gb] -- <command...>
 #   默认 cap 78G(68G arena + KV/工作区余量,32K 测试足够)。
+#   QWENOX_RUN_CAPPED=0 跳过 systemd scope（CI/容器没有用户级 systemd 时
+#   会自动走这条路），内存门限与看门狗都不启用，超时仍由调用方 timeout 负责。
 set -u
 CAP=78
 if [ $# -ge 2 ] && [ "$1" -eq "$1" ] 2>/dev/null; then CAP=$1; shift; fi
 [ "${1:-}" = "--" ] && shift
 [ $# -ge 1 ] || { echo "usage: run_capped.sh [cap_gb] -- <cmd...>" >&2; exit 2; }
+
+# CI/容器没有用户级 systemd（GitHub Actions 的 Ubuntu runner 即如此）。
+# 此时无法建 cgroup scope，也没有可停的 unit，直接执行并交给 timeout 兜底。
+# 显式 QWENOX_RUN_CAPPED=0 也可强制走这条路（不影响本地桌面保护）。
+if [ "${QWENOX_RUN_CAPPED:-1}" = 0 ] || \
+   ! command -v systemd-run >/dev/null 2>&1 || \
+   ! timeout 5 systemctl --user show-environment >/dev/null 2>&1; then
+  echo "run_capped: 无用户级 systemd 或已禁用，直接执行（未启用内存门限）" >&2
+  exec "$@"
+fi
 
 UNIT="capped-$$"
 systemd-run --user --scope --unit="$UNIT" \

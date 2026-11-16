@@ -5,6 +5,9 @@
 *.sh    text eol=lf
 *.conf  text eol=lf
 *.py    text eol=lf
+# GitHub Actions 的 run: 块也按 LF 存入/检出，避免 Windows runner 上 bash 读到 \r
+*.yml   text eol=lf
+*.yaml  text eol=lf
 # Windows 批处理保持 CRLF
 *.bat   text eol=crlf
 # 补丁按原样保存（git apply 要求与目标文件换行一致，仓库内是 LF）

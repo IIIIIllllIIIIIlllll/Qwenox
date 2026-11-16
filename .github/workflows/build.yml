@@ -1,0 +1,292 @@
+name: build-win-linux
+
+# Windows 与 Linux 同源码、同 GPU 目标（gfx1151）编译。
+# - push main / 手动触发：只产出可下载的构建产物
+# - push v* tag：额外把两个平台包发到同名 GitHub Release
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GPU_ARCH: gfx1151
+  # 固定 TheRock 发行版：10.0.0 的 gfx1151 包同时带展开式 kernel db，
+  # 与 build_win.sh / build.sh 的现有目录约定一致（10.1.0 起是 .kpack 布局）。
+  THEROCK_VERSION: 10.0.0
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    env:
+      THEROCK: /c/therock/install
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 环境检查
+        shell: bash
+        run: |
+          df -h || true
+          echo "nproc=$(nproc)"
+          bash --version | head -1
+          git rev-parse --short=7 HEAD
+
+      - name: 校验 tag 与 VERSION
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          ver="$(tr -d ' \r\n' < VERSION)"
+          if [ "$tag" != "v$ver" ]; then
+            echo "tag=$tag 与 VERSION=$ver 不一致（应打 v$ver）" >&2
+            exit 1
+          fi
+
+      # TheRock 10.0.0 自带的 clang 23 与 MSVC 14.51 的 constexpr <cmath>
+      # 不能共存（isgreater 等被隐式标成 host+device）。windows-2022 镜像
+      # 默认是 VS2022 14.4x，这里显式钉住，避免镜像以后升级到 14.5x。
+      - name: 固定 MSVC 14.4x 工具集
+        shell: bash
+        run: |
+          set -euo pipefail
+          tc="$(ls -d "/c/Program Files/Microsoft Visual Studio/"*/*/VC/Tools/MSVC/14.4* 2>/dev/null | sort -V | tail -1 || true)"
+          if [ -n "$tc" ]; then
+            win="$(cygpath -w "$tc")"
+            echo "VCToolsInstallDir=${win}\\" >> "$GITHUB_ENV"
+            echo "MSVC 工具集：${win}"
+          else
+            echo "::warning::未找到 14.4x 工具集；TheRock clang 23 可能与 14.5x 的 <cmath> 冲突"
+          fi
+
+      - name: 安装 TheRock 10.0.0（gfx1151）
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkg=/c/therock/therock-dist-windows-gfx1151-${THEROCK_VERSION}.tar.gz
+          mkdir -p /c/therock/install
+          curl -fL --retry 3 --retry-delay 2 --connect-timeout 30 \
+            -o "$pkg" \
+            "https://stable.repo.amd.com/rocm/core/tarball/therock-dist-windows-gfx1151-${THEROCK_VERSION}.tar.gz"
+          tar -xzf "$pkg" -C /c/therock/install
+          rm -f "$pkg"
+          test -x /c/therock/install/bin/hipcc.exe
+          test -d /c/therock/install/bin/rocblas/library/gfx1151
+          test -d /c/therock/install/bin/hipblaslt/library/gfx1151
+          du -sh /c/therock/install
+          df -h /c
+
+      # release_win.sh 要求 data/tokenizer/tokenizer.json（仓库里 gitignore）。
+      # 钉官方 Qwen3.8-Flash-Next 的 commit 和 sha256，保证 release 可复现。
+      - name: 获取发行包词表
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/tokenizer
+          curl -fL --retry 3 --connect-timeout 30 \
+            -o data/tokenizer/tokenizer.json \
+            "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/812d96e10a0dd82b69d749e68693698cf6c36daa/tokenizer.json"
+          echo "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3  data/tokenizer/tokenizer.json" | sha256sum -c -
+
+      # build_win.sh all 会并行跑 6 个目标；4 核 runner 上串行更稳。
+      - name: 编译（串行）
+        shell: bash
+        run: |
+          set -euo pipefail
+          for t in engine bench api launcher settings settings-tui; do
+            echo "::group::build_win.sh $t"
+            bash build_win.sh "$t"
+            echo "::endgroup::"
+          done
+
+      - name: 打包
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash release_win.sh --release --zip --skip-build
+          ls -lh dist/*.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qwenox-win64
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      # GitHub runner 没有用户级 systemd；build.sh 的 600 秒超时对 4 核
+      # 上的 Full LTO 不够，放宽 6 倍（引擎 3600 秒）。
+      QWENOX_RUN_CAPPED: '0'
+      QWENOX_TIMEOUT_SCALE: '6'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 环境检查
+        shell: bash
+        run: |
+          df -h / /mnt || true
+          echo "nproc=$(nproc)"
+          gcc --version | head -1
+          git rev-parse --short=7 HEAD
+
+      - name: 校验 tag 与 VERSION
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          ver="$(tr -d ' \r\n' < VERSION)"
+          if [ "$tag" != "v$ver" ]; then
+            echo "tag=$tag 与 VERSION=$ver 不一致（应打 v$ver）" >&2
+            exit 1
+          fi
+
+      - name: 安装主机依赖
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libpng-dev libjpeg-dev libwebp-dev
+
+      - name: 安装 TheRock 10.0.0（gfx1151）
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d /mnt ]; then
+            sudo mkdir -p /mnt/therock
+            sudo chown "$(id -u):$(id -g)" /mnt/therock
+            tr=/mnt/therock
+          else
+            tr="$HOME/therock"
+          fi
+          mkdir -p "$tr"
+          curl -fL --retry 3 --retry-delay 2 --connect-timeout 30 \
+            -o /tmp/therock.tar.gz \
+            "https://stable.repo.amd.com/rocm/core/tarball/therock-dist-linux-gfx1151-${THEROCK_VERSION}.tar.gz"
+          tar -xzf /tmp/therock.tar.gz -C "$tr"
+          rm -f /tmp/therock.tar.gz
+          test -x "$tr/bin/hipcc"
+          test -d "$tr/lib/rocblas/library/gfx1151"
+          test -d "$tr/lib/hipblaslt/library/gfx1151"
+          du -sh "$tr"
+          df -h / /mnt || true
+          echo "TR=$tr" >> "$GITHUB_ENV"
+          echo "HIPCC=$tr/bin/hipcc" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$tr/lib:$tr/lib/rocm_sysdeps/lib:$tr/lib/llvm/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+
+      # 与 Windows 相同：发行包要带 data/tokenizer/tokenizer.json。
+      - name: 获取发行包词表
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/tokenizer
+          curl -fL --retry 3 --connect-timeout 30 \
+            -o data/tokenizer/tokenizer.json \
+            "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/812d96e10a0dd82b69d749e68693698cf6c36daa/tokenizer.json"
+          echo "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3  data/tokenizer/tokenizer.json" | sha256sum -c -
+
+      # settings/launcher 不带 --bundle 时会清理 build/lib，所以先编它们；
+      # 后三个带 --bundle 的目标才会累积运行库和 kernel db。
+      - name: 编译（串行）
+        shell: bash
+        run: |
+          set -euo pipefail
+          for t in settings launcher; do
+            echo "::group::build.sh $t"
+            bash build.sh "$t"
+            echo "::endgroup::"
+          done
+          for t in engine bench api; do
+            echo "::group::build.sh --bundle $t"
+            bash build.sh --bundle "$t"
+            echo "::endgroup::"
+          done
+
+      - name: CPU 侧回归（不需要 GPU）
+        shell: bash
+        run: |
+          set -euo pipefail
+          build/engine_host_test
+          python3 tools/api_disconnect_test.py --api build/qwenox-api
+
+      - name: 组装 Linux 发行包
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="$(tr -d ' \r\n' < VERSION)"
+          out="dist/qwenox-${ver}-linux-x64"
+          rm -rf "$out" "dist/qwenox-${ver}-linux-x64.tar.gz"
+          mkdir -p "$out/models" "$out/data"
+          cp -a build "$out/build"
+          rm -rf "$out/build/.api-obj" "$out/build/deps" "$out/build/.build.lock"
+          rm -f "$out/build/.runtime-scan."* "$out/build/hgn-work.lock"
+          cp -a start_hgn.sh start_gguf.sh start.sh service.conf \
+                README.md README_EN.md CHANGELOG.md LICENSE VERSION \
+                qwenox-settings launcher_settings "$out/"
+          cp -a tools "$out/tools"
+          cp -a data/qsa-oracle "$out/data/"
+          cp -a data/tokenizer "$out/data/"
+          if [ -d docs ]; then cp -a docs "$out/docs"; fi
+          if [ -d media ]; then cp -a media "$out/media"; fi
+          cat > "$out/models/README.txt" <<'EOF'
+          模型权重目录（发行包不含权重）
+          ================================
+
+          按 README.md「支持的权重」把 hgn 或 GGUF 文件放进本目录，
+          再按 QUICKSTART.md 修改 service.conf 的路径。
+          纯文本服务可以不下载视觉塔；bench 的 token 输入已随包放在
+          data/qsa-oracle/。
+          EOF
+          cat > "$out/BUILD-INFO.txt" <<EOF
+          version: ${ver}
+          git: ${GITHUB_SHA}
+          built: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          therock: ${THEROCK_VERSION} gfx1151
+          EOF
+          tar -C dist -czf "dist/qwenox-${ver}-linux-x64.tar.gz" "qwenox-${ver}-linux-x64"
+          ls -lh dist/*.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qwenox-linux-x64
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, linux]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 发布到 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          ls -lh dist
+          (cd dist && sha256sum *.zip *.tar.gz > SHA256SUMS)
+          cat dist/SHA256SUMS
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* --title "$tag" --generate-notes \
+              || gh release upload "$tag" dist/* --clobber
+          fi

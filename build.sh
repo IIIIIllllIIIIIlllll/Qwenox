@@ -48,6 +48,10 @@ case "$TARGET" in
   all|engine|api|bench|settings|launcher|test) ;;
   *) usage >&2; exit 2 ;;
 esac
+# CI/容器：4 核 runner 上引擎/bench 的 Full LTO 远超本机 600 秒，按倍数放宽
+# 超时（默认 1 倍，行为不变）。QWENOX_TIMEOUT_SCALE=6 即引擎 3600 秒。
+TIMEOUT_SCALE="${QWENOX_TIMEOUT_SCALE:-1}"
+[[ "$TIMEOUT_SCALE" =~ ^[1-9][0-9]*$ ]] || { echo 'QWENOX_TIMEOUT_SCALE 必须是正整数' >&2; exit 2; }
 command -v flock >/dev/null || { echo '缺少 flock，请安装 util-linux' >&2; exit 1; }
 if processes="$(pgrep -af '(^|/)(qwenox[^/[:space:]]*|flash_serve|serve_api\.py)([[:space:]]|$)')"; then
   echo "已有引擎或 API 在运行，请先在原终端停止服务：$processes" >&2
@@ -56,7 +60,12 @@ fi
 mkdir -p build
 exec 9>build/.build.lock
 flock -n 9 || { echo '本目录已有编译任务在运行' >&2; exit 1; }
-exec 8>"${XDG_RUNTIME_DIR:-/run/user/$UID}/hgn-work.lock"
+# 会话锁默认放 /run/user/$UID；CI/容器里该目录可能不存在或不可写，退回 build/。
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$UID}"
+if [[ ! -d "$RUNTIME_DIR" || ! -w "$RUNTIME_DIR" ]]; then
+  RUNTIME_DIR="$ROOT/build"
+fi
+exec 8>"$RUNTIME_DIR/hgn-work.lock"
 flock -n 8 || { echo '另一个 Qwenox 编译或启动任务正在运行' >&2; exit 1; }
 
 GPU_ARCH="${GPU_ARCH:-gfx1151}"
@@ -86,6 +95,7 @@ trap cleanup_build EXIT
 # run <内存cap GB> <超时秒> <cmd...>:内存限额 + 超时保护下执行编译命令
 run() {
   local cap="$1" secs="$2"; shift 2
+  secs=$((secs * TIMEOUT_SCALE))
   # 8>&- 9>&-: 编译子进程(含 systemd scope 包装)不得继承锁 fd,否则它们
   # 比父进程晚退出时,紧跟的下一个 build.sh 调用会误判"已有编译任务"
   bash tools/run_capped.sh "$cap" -- timeout -k 3 "$secs" "$@" 8>&- 9>&-
