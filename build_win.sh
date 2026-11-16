@@ -214,16 +214,23 @@ build_engine() {
     (( PDB_ON )) && dbg=(-Xarch_host -g -Xarch_host -gcodeview)
     local pdbl=()
     mapfile -t pdbl < <(pdb_link "${out%.exe}.pdb")
+    mkres "$(basename "$out")" "Qwenox Inference Engine" Qwenox.Engine 0
+    local resx=()
+    [[ ${#RES[@]} -gt 0 ]] && resx=(-Xlinker "${RES[0]}")
     # 先编到临时文件再原子替换，编译失败保留上次成功的二进制（对齐 Linux build.sh）
     "$HIPCC" "${FLAGS[@]}" ${dbg[@]+"${dbg[@]}"} ${NPU_FLAGS[@]+"${NPU_FLAGS[@]}"} src/gpu/qwenox.cpp \
-      -o "$out.tmp" ${NPU_LINK[@]+"${NPU_LINK[@]}"} ${pdbl[@]+"${pdbl[@]}"} \
+      -o "$out.tmp" ${NPU_LINK[@]+"${NPU_LINK[@]}"} ${pdbl[@]+"${pdbl[@]}"} ${resx[@]+"${resx[@]}"} \
       && mv -f "$out.tmp" "$out"
 }
 
 build_bench() {
     echo "[编译] build/qwenox-bench.exe"
+    mkres qwenox-bench.exe "Qwenox Benchmark" Qwenox.Bench 0
+    local resx=()
+    [[ ${#RES[@]} -gt 0 ]] && resx=(-Xlinker "${RES[0]}")
     "$HIPCC" "${FLAGS[@]}" ${NPU_FLAGS[@]+"${NPU_FLAGS[@]}"} -std=c++17 -Ithird_party \
       src/gpu/bench_main.cpp -o build/qwenox-bench.exe.tmp ${NPU_LINK[@]+"${NPU_LINK[@]}"} \
+      ${resx[@]+"${resx[@]}"} \
       && mv -f build/qwenox-bench.exe.tmp build/qwenox-bench.exe
 }
 
@@ -340,7 +347,7 @@ build_api() {
     local api_out="${QWENOX_API_OUT:-build/qwenox-win.exe}"
     gen_static_inc
     gui_ldflags
-    mkiconres src/qwenox_win.rc build/qwenox_win.res qwenox-win.exe
+    mkres "$(basename "$api_out")" "Qwenox API Server" Qwenox.Tray 1
     echo "[编译] $api_out（16 个 TU 并行，静态 WebP）"
     local srcs=(http engine_client tokenizer chat_template json_py toolparse vision
                 reqstat reqstat_read power engine_sup tray_win snap_cuts reqlog diagpack main)
@@ -387,23 +394,99 @@ build_vision_test() {
     build/vision-test-win.exe --decode-only
 }
 
-# exe 资源（可选）：文件图标 + PerMonitorV2 manifest。优先 TheRock 的 llvm-rc，
-# 没有则退回 Windows SDK 的 rc.exe（取最新版本目录）；都没有时 RES 为空，
-# 调用方退化为无资源编译（程序内图标不受影响；DPI 由运行时 API 兜底）。
-# 结果写入 RES 数组。
-mkiconres() {  # $1=rc 源文件  $2=res 输出  $3=exe 名（提示用）
+# exe 资源：VERSIONINFO 版本信息 + 文件图标 + manifest，构建时按目标生成到 build/。
+# 版本信息取自 VERSION 文件与 git rev（与 VER_FLAGS 同源）——未签名二进制没有
+# 任何版本信息是杀软启发式与 SmartScreen 的强可疑特征，每个 exe 都带完整身份
+# （CompanyName/ProductName/FileDescription/版本/OriginalFilename）。manifest 声明
+# asInvoker（明确不提权）与 supportedOS(Win10/11)；GUI 目标另带 PerMonitorV2
+# （没有 rc 工具时 win_dpi.h / main() 里的运行时 DPI 兜底仍生效）。
+# 优先 TheRock 的 llvm-rc，退回 Windows SDK rc.exe；都没有时 RES 为空，调用方
+# 退化为无资源编译。结果写入 RES 数组。
+mkres() {  # $1=exe 文件名  $2=FileDescription  $3=manifest identity 名  $4=1 时含 DPI 段
     RES=()
-    "$CXX" -dumpmachine | grep -q msvc || return 0
+    local name="${1%.exe}"
+    local v1 v2 v3 _
+    IFS=. read -r v1 v2 v3 _ <<< "$QWENOX_VER"
+    v1="${v1//[^0-9]/}"; v2="${v2//[^0-9]/}"; v3="${v3//[^0-9]/}"
+    local mf="$name.manifest" rc="$name.rc"
+    [[ -f build/launch_win.ico ]] || cp src/launch_win.ico build/
+    {
+      cat <<EOF
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="$3" version="${v1:-0}.${v2:-0}.${v3:-0}.0" processorArchitecture="amd64"/>
+  <description>$2</description>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- {8e0f7a12-...} = Windows 10/11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+EOF
+      if [[ "$4" == 1 ]]; then
+        cat <<'EOF'
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
+    </windowsSettings>
+  </application>
+EOF
+      fi
+      echo '</assembly>'
+    } > "build/$mf"
+    {
+      cat <<EOF
+1 ICON "launch_win.ico"
+1 24 "$mf"
+1 VERSIONINFO
+FILEVERSION ${v1:-0},${v2:-0},${v3:-0},0
+PRODUCTVERSION ${v1:-0},${v2:-0},${v3:-0},0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS 0x40004L
+FILETYPE 0x1L
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "Qwenox Project"
+            VALUE "FileDescription", "$2"
+            VALUE "FileVersion", "${v1:-0}.${v2:-0}.${v3:-0}.0"
+            VALUE "InternalName", "$name"
+            VALUE "LegalCopyright", "Qwenox Project"
+            VALUE "OriginalFilename", "$1"
+            VALUE "ProductName", "Qwenox"
+            VALUE "ProductVersion", "$QWENOX_VER ($QWENOX_GITREV)"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
+EOF
+    } > "build/$rc"
     local RC="$TR/lib/llvm/bin/llvm-rc.exe"
     local RCFLAGS=(-no-preprocess)
     if [[ ! -x "$RC" ]]; then
       RC="$(ls "/c/Program Files (x86)/Windows Kits/10/bin"/*/x64/rc.exe 2>/dev/null | sort -V | tail -1)"
       RCFLAGS=()
     fi
-    if [[ -n "$RC" && -x "$RC" ]] && "$RC" "${RCFLAGS[@]}" -fo "$2" "$1"; then
-      RES=("$2")
+    # 在 build/ 内编译：rc 与图标/manifest 同目录，引用用裸文件名（沿袭旧 src/*.rc 的可用写法）
+    if [[ -n "$RC" && -x "$RC" ]] && ( cd build && "$RC" "${RCFLAGS[@]}" -fo "$name.res" "$rc" ); then
+      RES=("build/$name.res")
     else
-      echo "提示：llvm-rc 不可用，$3 不带文件图标/manifest（DPI 由运行时 API 兜底）" >&2
+      echo "提示：rc 工具不可用，$1 不带版本信息/图标/manifest" >&2
     fi
 }
 
@@ -414,7 +497,7 @@ build_launcher() {
     CXX="$TR/lib/llvm/bin/clang++.exe"
     [[ -x "$CXX" ]] || { echo "找不到 TheRock clang++: $CXX" >&2; exit 1; }
     gui_ldflags
-    mkiconres src/start_stub.rc build/start_stub.res start_win.exe
+    mkres start_win.exe "Qwenox Launcher" Qwenox.Launcher 1
     echo "[编译] start_win.exe"
     STUB_SRC=(-O2 -std=c++17 -D_CRT_SECURE_NO_WARNINGS src/start_stub_win.cpp
               -luser32 -lshell32 "${GUI_LDFLAGS[@]}" -o start_win.exe)
@@ -428,7 +511,7 @@ build_launcher() {
     # 127.0.0.1:8729）。静态页 src/launcher_static/ 用 gen_static_inc 同款
     # 机制嵌入；复用 src/api 的 http.cpp 与 third_party/nlohmann。
     gen_launcher_static_inc
-    mkiconres src/launcher_settings.rc build/launcher_settings.res launcher_settings.exe
+    mkres launcher_settings.exe "Qwenox Web Launcher" Qwenox.WebLauncher 1
     echo "[编译] launcher_settings.exe"
     LAUNCHER_SRC=(-O2 -std=c++17 -D_CRT_SECURE_NO_WARNINGS -I third_party
                   "${VER_FLAGS[@]}"
@@ -448,7 +531,7 @@ build_settings() {
     CXX="$TR/lib/llvm/bin/clang++.exe"
     [[ -x "$CXX" ]] || { echo "找不到 TheRock clang++: $CXX" >&2; exit 1; }
     gui_ldflags
-    mkiconres src/settings_win.rc build/settings_win.res settings_win.exe
+    mkres settings_win.exe "Qwenox Settings" Qwenox.Settings 1
     echo "[编译] settings_win.exe"
     SETTINGS_SRC=(-O2 -std=c++17 -D_CRT_SECURE_NO_WARNINGS src/settings_win.cpp
                   -lws2_32 -luser32 -lshell32 -lgdi32 -lgdiplus -ldwmapi -luxtheme -lcomdlg32 -lole32
@@ -469,8 +552,14 @@ build_settings_tui() {
     fi
     [[ -x "$CXX" ]] || { echo "找不到 C++ 编译器：设 CXX=/path/to/clang++（或配置 THEROCK）" >&2; exit 1; }
     echo "[编译] qwenox-settings.exe"
+    # MinGW ld 吃不了 .res，只有 MSVC 目标（lld-link）才嵌资源
+    local resx=()
+    if "$CXX" -dumpmachine 2>/dev/null | grep -q msvc; then
+      mkres qwenox-settings.exe "Qwenox Settings Console" Qwenox.SettingsConsole 0
+      resx=(${RES[@]+"${RES[@]}"})
+    fi
     "$CXX" -O2 -std=c++17 -D_CRT_SECURE_NO_WARNINGS -D_CRT_NONSTDC_NO_DEPRECATE \
-      src/settings_tui.cpp -o qwenox-settings.exe.tmp \
+      src/settings_tui.cpp ${resx[@]+"${resx[@]}"} -o qwenox-settings.exe.tmp \
       && mv -f qwenox-settings.exe.tmp qwenox-settings.exe
 }
 

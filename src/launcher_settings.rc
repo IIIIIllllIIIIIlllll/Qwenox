@@ -1,2 +1,0 @@
-// launcher_settings.exe file icon (shown in Explorer); compiled by build_win.sh when llvm-rc exists.
-1 ICON "launch_win.ico"

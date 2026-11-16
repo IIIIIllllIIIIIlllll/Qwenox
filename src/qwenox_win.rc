@@ -1,4 +1,0 @@
-// qwenox-win.exe manifest: PerMonitorV2 DPI awareness (type 24 = RT_MANIFEST).
-// Compiled by build_win.sh when llvm-rc/rc.exe exists; without it the runtime
-// SetProcessDpiAwarenessContext fallback in win_dpi.h still applies.
-1 24 "qwenox_win.manifest"
