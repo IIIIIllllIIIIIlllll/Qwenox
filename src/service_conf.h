@@ -25,7 +25,7 @@ using Conf = std::map<std::string, std::string>;
 // 由设置面板自己管理（settings_panel.inc 直接经 save_conf 的 vals 写盘）。
 inline const char* kManagedKeys[] = {
     "MODEL_FILE", "NGRAM_FILE", "OVERLAY_FILE", "MTP_FILE", "VISION_FILE",
-    "GGUF_FILE", "GGUF_MTP_FILE", "GGUF_VISION_FILE",
+    "GGUF_FILE", "GGUF_MTP_FILE", "GGUF_VISION_FILE", "GGUF_PLE_FILE",
     "TOKENIZER_DIR", "MAX_CONTEXT", "PARALLEL", "KV_POOL_TOKENS", "KV_PAGED",
     "PREFILL_CHUNK", "ROPE_FACTOR",
     "KVSNAP_MAX_GB", "KVSNAP_DIR", "MOE_A4", "QSA_INDEXER_BUDGET", "AFFINITY",
@@ -36,7 +36,8 @@ inline const size_t kManagedKeysCount = sizeof(kManagedKeys) / sizeof(kManagedKe
 // 可选文件键（目录键同理）：写回时用 ${KEY-值}（无冒号，允许显式置空禁用），
 // 与 service.conf 现状一致。KVSNAP_DIR 留空 = 引擎默认 data\kvsnap，也是这个风格。
 inline const char* kOptionalFileKeys[] = {"OVERLAY_FILE", "MTP_FILE", "VISION_FILE",
-                                          "GGUF_MTP_FILE", "GGUF_VISION_FILE", "KVSNAP_DIR"};
+                                          "GGUF_MTP_FILE", "GGUF_VISION_FILE", "GGUF_PLE_FILE",
+                                          "KVSNAP_DIR"};
 
 inline bool is_optional_file_key(const std::string& key) {
     for (const char* k : kOptionalFileKeys)

@@ -182,6 +182,7 @@ const std::pair<const char*, const char*> kDefaults[] = {
     {"GGUF_FILE", "./models/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"},
     {"GGUF_MTP_FILE", "./models/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"},
     {"GGUF_VISION_FILE", "./models/mmproj-BF16.gguf"},
+    {"GGUF_PLE_FILE", ""},
     {"ENGINE_HOST", "127.0.0.1"}, {"ENGINE_PORT", "8730"},
     {"API_HOST", "0.0.0.0"}, {"API_PORT", "8731"},
     {"MAX_CONTEXT", "262144"}, {"PARALLEL", "4"},
@@ -760,7 +761,7 @@ void do_start_windows(uint64_t gen) {
     bool files_ok = true;
     if (wv == "gguf") {
         files_ok = need_file("GGUF_FILE", false) && need_file("GGUF_MTP_FILE", false) &&
-                   need_file("GGUF_VISION_FILE", false);
+                   need_file("GGUF_VISION_FILE", false) && need_file("GGUF_PLE_FILE", false);
     } else {
         files_ok = need_file("MODEL_FILE", false) &&
                    (wv == "v1" || need_file("NGRAM_FILE", false)) &&
@@ -989,7 +990,7 @@ void do_start_linux(uint64_t gen) {
     bool files_ok = true;
     if (wv == "gguf") {
         files_ok = need_file("GGUF_FILE", false) && need_file("GGUF_MTP_FILE", false) &&
-                   need_file("GGUF_VISION_FILE", false);
+                   need_file("GGUF_VISION_FILE", false) && need_file("GGUF_PLE_FILE", false);
     } else {
         files_ok = need_file("MODEL_FILE", false) &&
                    (wv == "v1" || need_file("NGRAM_FILE", false)) &&
@@ -1129,7 +1130,7 @@ std::string query_param(const http::Request& q, const std::string& key);
 const char* kProfileKeys[] = {
     // 权重
     "MODEL_FILE", "NGRAM_FILE", "OVERLAY_FILE", "MTP_FILE", "VISION_FILE",
-    "GGUF_FILE", "GGUF_MTP_FILE", "GGUF_VISION_FILE", "TOKENIZER_DIR",
+    "GGUF_FILE", "GGUF_MTP_FILE", "GGUF_VISION_FILE", "GGUF_PLE_FILE", "TOKENIZER_DIR",
     // 推理设置
     "MAX_CONTEXT", "PARALLEL", "KV_PAGED", "KV_POOL_TOKENS", "PREFILL_CHUNK",
     "CONC_PREFILL_CHUNK", "QSA_INDEXER_BUDGET", "KVSNAP_MAX_GB", "KVSNAP_DIR",
@@ -1442,7 +1443,8 @@ void handle_config_get(const http::Request&, http::Response* r, http::Stream*) {
         std::lock_guard<std::mutex> lk(g_conf_mtx);
         const char* file_keys[] = {"MODEL_FILE",  "NGRAM_FILE",      "OVERLAY_FILE",
                                    "MTP_FILE",    "VISION_FILE",     "GGUF_FILE",
-                                   "GGUF_MTP_FILE", "GGUF_VISION_FILE", "KVSNAP_DIR"};
+                                   "GGUF_MTP_FILE", "GGUF_VISION_FILE", "GGUF_PLE_FILE",
+                                   "KVSNAP_DIR"};
         for (const char* key : file_keys) {
             const std::string p = resolved(g_conf, key);
             json f;
@@ -1560,11 +1562,12 @@ void handle_config_post(const http::Request& q, http::Response* r, http::Stream*
     if (!wv.empty()) {
         static const std::vector<std::string> kWeightKeys = {
             "MODEL_FILE", "NGRAM_FILE",     "OVERLAY_FILE",     "MTP_FILE",
-            "VISION_FILE", "GGUF_FILE",     "GGUF_MTP_FILE",    "GGUF_VISION_FILE"};
+            "VISION_FILE", "GGUF_FILE",     "GGUF_MTP_FILE",    "GGUF_VISION_FILE",
+            "GGUF_PLE_FILE"};
         static const std::vector<std::string> kVerKeys[] = {
             /* v1 */ {"MODEL_FILE", "OVERLAY_FILE", "MTP_FILE", "VISION_FILE"},
             /* v2 */ {"MODEL_FILE", "NGRAM_FILE", "MTP_FILE", "VISION_FILE"},
-            /* gguf */ {"GGUF_FILE", "GGUF_MTP_FILE", "GGUF_VISION_FILE"},
+            /* gguf */ {"GGUF_FILE", "GGUF_MTP_FILE", "GGUF_VISION_FILE", "GGUF_PLE_FILE"},
         };
         const auto& allow = kVerKeys[wv == "v2" ? 1 : wv == "gguf" ? 2 : 0];
         for (auto it = vals.begin(); it != vals.end();) {

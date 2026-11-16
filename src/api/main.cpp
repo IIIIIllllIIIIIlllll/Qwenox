@@ -1839,11 +1839,11 @@ void handle_config_post(const http::Request& q, http::Response* r, http::Stream*
     if (!weights_ver.empty()) {
         static const std::unordered_set<std::string> kWeightKeys = {
             "MODEL_FILE", "NGRAM_FILE", "OVERLAY_FILE", "MTP_FILE", "VISION_FILE",
-            "GGUF_FILE", "GGUF_MTP_FILE", "GGUF_VISION_FILE"};
+            "GGUF_FILE", "GGUF_MTP_FILE", "GGUF_VISION_FILE", "GGUF_PLE_FILE"};
         static const std::unordered_set<std::string> kVerKeys[] = {
             /* v1 */ {"MODEL_FILE", "OVERLAY_FILE", "MTP_FILE", "VISION_FILE"},
             /* v2 */ {"MODEL_FILE", "NGRAM_FILE", "MTP_FILE", "VISION_FILE"},
-            /* gguf */ {"GGUF_FILE", "GGUF_MTP_FILE", "GGUF_VISION_FILE"},
+            /* gguf */ {"GGUF_FILE", "GGUF_MTP_FILE", "GGUF_VISION_FILE", "GGUF_PLE_FILE"},
         };
         const auto& allow = kVerKeys[weights_ver == "v2"   ? 1
                                      : weights_ver == "gguf" ? 2

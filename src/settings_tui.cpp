@@ -573,6 +573,9 @@ const std::vector<Field>& field_specs() {
         {0, "GGUF_VISION_FILE", "GGUF 视觉塔", "留空表示纯文本服务",
          "GGUF vision tower", "Leave empty for text-only serving",
          FieldKind::kText, FieldGroup::kGguf, {}},
+        {0, "GGUF_PLE_FILE", "PLE 表", "独立 n-gram 表 GGUF（BF16/IQ4_NL）；留空用内置 IQ4_NL 表",
+         "PLE table", "Standalone n-gram table GGUF (BF16/IQ4_NL); empty = built-in IQ4_NL",
+         FieldKind::kText, FieldGroup::kGguf, {}},
         {0, "GGUF_I4R_PATCH", "i4r 补丁 [Linux]", "可选 .hgn 专家补丁；留空表示不使用",
          "i4r patch [Linux]", "Optional .hgn expert patch; leave empty to disable",
          FieldKind::kText, FieldGroup::kGguf, {}},
@@ -715,6 +718,7 @@ struct Model {
             conf, "GGUF_MTP_FILE", join_path(model_dir, "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"));
         values["GGUF_VISION_FILE"] = svcconf::cfg_optional(
             conf, "GGUF_VISION_FILE", join_path(model_dir, "mmproj-BF16.gguf"));
+        values["GGUF_PLE_FILE"] = svcconf::cfg_optional(conf, "GGUF_PLE_FILE", "");
         values["GGUF_I4R_PATCH"] = svcconf::cfg_optional(conf, "GGUF_I4R_PATCH", "");
         values["TOKENIZER_DIR"] = svcconf::cfg(conf, "TOKENIZER_DIR", join_path(model_dir, "tokenizer"));
 
@@ -761,7 +765,8 @@ struct Model {
         const std::string ver = get("#WEIGHTS", "v2");
         out["TOKENIZER_DIR"] = get("TOKENIZER_DIR");
         if (ver == "gguf") {
-            for (const char* key : {"GGUF_FILE", "GGUF_MTP_FILE", "GGUF_VISION_FILE", "GGUF_I4R_PATCH"})
+            for (const char* key : {"GGUF_FILE", "GGUF_MTP_FILE", "GGUF_VISION_FILE", "GGUF_PLE_FILE",
+                                    "GGUF_I4R_PATCH"})
                 out[key] = get(key);
         } else {
             out["MODEL_FILE"] = get("MODEL_FILE");
@@ -945,6 +950,11 @@ std::vector<Check> validate(const Model& model) {
         check_file(TR("GGUF 主分片", "GGUF main shard"), model.get("GGUF_FILE"), true, false, "GGUF");
         check_file(TR("GGUF MTP", "GGUF MTP"), model.get("GGUF_MTP_FILE"), false, false, "GGUF");
         check_file(TR("GGUF 视觉塔", "GGUF vision tower"), model.get("GGUF_VISION_FILE"), false, false, "GGUF");
+        if (model.get("GGUF_PLE_FILE").empty())
+            hint(TR("PLE 表：未配置，用主模型内置的 IQ4_NL 表",
+                    "PLE table: not set; the main model's built-in IQ4_NL table is used"));
+        else
+            check_file(TR("PLE 表", "PLE table"), model.get("GGUF_PLE_FILE"), false, false, "GGUF");
         check_file(TR("i4r 补丁", "i4r patch"), model.get("GGUF_I4R_PATCH"), false, false, "HGN1");
         if (model.get("GGUF_FILE").find("-00001-of-") != std::string::npos)
             hint(TR("GGUF 多分片：这里检查第 1 分片，其余分片须与它位于同一目录",

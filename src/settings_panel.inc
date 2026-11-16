@@ -383,8 +383,8 @@ struct PanelVals {
     int weights_ver = kVerV1;
     std::string model, ngram, overlay, mtp, vision, tok;
     bool no_overlay = false, no_mtp = false, no_vision = false;
-    std::string gguf, gguf_mtp, gguf_vision;
-    bool no_gguf_mtp = false, no_gguf_vision = false;
+    std::string gguf, gguf_mtp, gguf_vision, gguf_ple;
+    bool no_gguf_mtp = false, no_gguf_vision = false, no_gguf_ple = false;
     std::string max_context, parallel, kv_pool, prefill_chunk;
     bool kv_paged = true;
     std::string rope_factor, rope_original;  // rope_original 无 UI 行，从 conf/环境读
@@ -424,6 +424,8 @@ PanelVals panel_vals_from_conf() {
     v.no_gguf_mtp = v.gguf_mtp.empty();
     v.gguf_vision = cfg_optional("GGUF_VISION_FILE", model_dir + "\\mmproj-BF16.gguf");
     v.no_gguf_vision = v.gguf_vision.empty();
+    v.gguf_ple = cfg_optional("GGUF_PLE_FILE", "");
+    v.no_gguf_ple = v.gguf_ple.empty();
     v.tok = cfg("TOKENIZER_DIR", model_dir + "\\tokenizer");
     v.max_context = cfg("MAX_CONTEXT", "262144");
     v.parallel = cfg("PARALLEL", "1");
@@ -465,6 +467,7 @@ std::map<std::string, std::string> panel_vals_to_conf(const PanelVals& v) {
         m["GGUF_FILE"] = v.gguf;
         m["GGUF_MTP_FILE"] = v.no_gguf_mtp ? "" : v.gguf_mtp;
         m["GGUF_VISION_FILE"] = v.no_gguf_vision ? "" : v.gguf_vision;
+        m["GGUF_PLE_FILE"] = v.no_gguf_ple ? "" : v.gguf_ple;
     } else {
         m["MODEL_FILE"] = v.model;
         if (v.weights_ver == kVerV2) {
@@ -601,6 +604,10 @@ void check_weights_page(CheckLines& c, const PanelVals& v) {
             check_line(c, kLvPass, TR("GGUF 视觉塔：不使用", "GGUF vision tower: not used"));
         else
             check_weight(c, TR("GGUF 视觉塔", "GGUF vision tower"), v.gguf_vision, true, false);
+        if (v.no_gguf_ple)
+            check_line(c, kLvPass, TR("PLE 表：用内置 IQ4_NL", "PLE table: built-in IQ4_NL"));
+        else
+            check_weight(c, TR("PLE 表", "PLE table"), v.gguf_ple, true, false);
         check_line(c, kLvHint,
                    TR("GGUF 支持 Unsloth UD-Q4_K_XL / UD-IQ4_XS（Windows 已验证 UD-IQ4_XS）",
                       "GGUF: Unsloth UD-Q4_K_XL / UD-IQ4_XS (UD-IQ4_XS verified on Windows)"));
@@ -1191,10 +1198,10 @@ enum PanelId : int {
     kTab1, kTab2, kTab3, kTab4,
     kWVer1, kWVer2, kWVer3,
     kEdModel, kEdNgram, kEdOverlay, kEdMtp, kEdVision, kEdTok,
-    kEdGguf, kEdGgufMtp, kEdGgufVision,
+    kEdGguf, kEdGgufMtp, kEdGgufVision, kEdGgufPle,
     kBrModel, kBrNgram, kBrOverlay, kBrMtp, kBrVision,
-    kBrGguf, kBrGgufMtp, kBrGgufVision,
-    kOffOverlay, kOffMtp, kOffVision, kOffGgufMtp, kOffGgufVision,
+    kBrGguf, kBrGgufMtp, kBrGgufVision, kBrGgufPle,
+    kOffOverlay, kOffMtp, kOffVision, kOffGgufMtp, kOffGgufVision, kOffGgufPle,
     kEdMaxctx, kCbMaxctxPreset, kCbParallel, kEdKvPool, kCkKvPaged, kEdPrefill,
     kCkYarn, kEdKvsnap, kEdKvsnapDir, kBrKvsnapDir, kCbAffinity,
     kEdEHost, kEdEPort, kEdAHost, kEdAPort,
@@ -1211,7 +1218,7 @@ struct PanelCtl {
     HWND tabs[4] = {};
     HWND wver[3] = {};
     FileRow row_model, row_ngram, row_overlay, row_mtp, row_vision;
-    FileRow row_gguf, row_gguf_mtp, row_gguf_vision, row_tok;
+    FileRow row_gguf, row_gguf_mtp, row_gguf_vision, row_gguf_ple, row_tok;
     HWND tok_hint = nullptr, ver_note = nullptr;
     HWND moe_a4 = nullptr;  // V2 专属勾选框：prefill 4-bit 加速（MOE_A4）
     HWND maxctx = nullptr, maxctx_preset = nullptr, parallel = nullptr, kv_pool = nullptr,
@@ -1419,6 +1426,8 @@ PanelVals panel_collect() {
     v.gguf_mtp = get_edit(g_pc.row_gguf_mtp.edit);
     v.no_gguf_vision = get_check(g_pc.row_gguf_vision.off);
     v.gguf_vision = get_edit(g_pc.row_gguf_vision.edit);
+    v.no_gguf_ple = get_check(g_pc.row_gguf_ple.off);
+    v.gguf_ple = get_edit(g_pc.row_gguf_ple.edit);
     v.tok = get_edit(g_pc.row_tok.edit);
     v.max_context = get_edit(g_pc.maxctx);
     const int sel = static_cast<int>(SendMessageW(g_pc.parallel, CB_GETCURSEL, 0, 0));
@@ -1611,12 +1620,13 @@ void place_row(const FileRow& r, int y, bool visible) {
 // 第 1 页布局：按版本只显示相关文件行，顺序重排，隐藏其余
 void layout_page1(int ver) {
     g_weights_ver = ver;
-    const FileRow* order[9];
+    const FileRow* order[10];
     int n = 0;
     if (ver == kVerGguf) {
         order[n++] = &g_pc.row_gguf;
         order[n++] = &g_pc.row_gguf_mtp;
         order[n++] = &g_pc.row_gguf_vision;
+        order[n++] = &g_pc.row_gguf_ple;
         order[n++] = &g_pc.row_tok;
     } else if (ver == kVerV2) {
         order[n++] = &g_pc.row_model;
@@ -1631,9 +1641,10 @@ void layout_page1(int ver) {
         order[n++] = &g_pc.row_vision;
         order[n++] = &g_pc.row_tok;
     }
-    const FileRow* all[9] = {&g_pc.row_model,  &g_pc.row_ngram,  &g_pc.row_overlay,
-                             &g_pc.row_mtp,    &g_pc.row_vision, &g_pc.row_gguf,
-                             &g_pc.row_gguf_mtp, &g_pc.row_gguf_vision, &g_pc.row_tok};
+    const FileRow* all[10] = {&g_pc.row_model,  &g_pc.row_ngram,  &g_pc.row_overlay,
+                              &g_pc.row_mtp,    &g_pc.row_vision, &g_pc.row_gguf,
+                              &g_pc.row_gguf_mtp, &g_pc.row_gguf_vision, &g_pc.row_gguf_ple,
+                              &g_pc.row_tok};
     int y = 76;
     for (int i = 0; i < n; ++i) {
         place_row(*order[i], y, true);
@@ -2024,6 +2035,9 @@ LRESULT CALLBACK panel_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             case kBrGgufVision:
                 if (panel_browse(g_pc.row_gguf_vision.edit)) panel_recheck();
                 return 0;
+            case kBrGgufPle:
+                if (panel_browse(g_pc.row_gguf_ple.edit)) panel_recheck();
+                return 0;
             case kBrKvsnapDir:
                 if (panel_browse_dir(g_pc.kvsnap_dir,
                                      TR(L"选择 KV 快照目录", L"Select KV snapshot folder")))
@@ -2056,6 +2070,11 @@ LRESULT CALLBACK panel_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             case kOffGgufVision:
                 set_optional_row_state(g_pc.row_gguf_vision.off, g_pc.row_gguf_vision.edit,
                                        g_pc.row_gguf_vision.browse);
+                panel_recheck();
+                return 0;
+            case kOffGgufPle:
+                set_optional_row_state(g_pc.row_gguf_ple.off, g_pc.row_gguf_ple.edit,
+                                       g_pc.row_gguf_ple.browse);
                 panel_recheck();
                 return 0;
             case kCkKvPaged: panel_recheck(); return 0;
@@ -2228,6 +2247,10 @@ PanelResult panel_run() {
     g_pc.row_gguf_vision = page1_file_row(h, ry, TR(L"GGUF 视觉塔", L"GGUF vision tower"),
                                           kEdGgufVision, kBrGgufVision, kOffGgufVision,
                                           init.gguf_vision, init.no_gguf_vision);
+    ry += 26;
+    g_pc.row_gguf_ple = page1_file_row(h, ry, TR(L"PLE 表", L"PLE table"),
+                                       kEdGgufPle, kBrGgufPle, kOffGgufPle,
+                                       init.gguf_ple, init.no_gguf_ple);
     ry += 26;
     g_pc.row_tok = page1_file_row(h, ry, L"tokenizer", kEdTok, 0, 0, init.tok, false);
     g_pc.tok_hint = pctl(0, h, L"Static", SS_LEFTNOWORDWRAP, kEdX, 210, 434, 18,

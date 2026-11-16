@@ -326,7 +326,7 @@ zh:{
   pre_title:"启动前检查", pre_note:"按已保存的配置检查", pre_busy:"服务运行中，端口检查略过",
   pre_fail:"以下检查没通过：\n{list}\n\n仍要启动吗？",
   ck:{MODEL_FILE:"主模型",NGRAM_FILE:"n-gram 表",OVERLAY_FILE:"overlay",MTP_FILE:"MTP 草稿",
-      VISION_FILE:"视觉塔",GGUF_FILE:"GGUF 主模型",GGUF_MTP_FILE:"MTP 草稿",GGUF_VISION_FILE:"视觉塔",
+      VISION_FILE:"视觉塔",GGUF_FILE:"GGUF 主模型",GGUF_MTP_FILE:"MTP 草稿",GGUF_VISION_FILE:"视觉塔",GGUF_PLE_FILE:"PLE 表",
       TOKENIZER_JSON:"tokenizer.json",api:"API 程序",engine:"引擎程序",kernel_db:"kernel 库",
       scripts:"启动脚本",eport:"引擎端口",aport:"API 端口"},
   ck_off:"未启用", ck_empty:"未填写", ck_free:"空闲", ck_busy:"被占用", ck_missing:"缺少",
@@ -398,7 +398,7 @@ en:{
   pre_title:"Pre-flight", pre_note:"checks the saved config", pre_busy:"service running; port check skipped",
   pre_fail:"These checks failed:\n{list}\n\nStart anyway?",
   ck:{MODEL_FILE:"main model",NGRAM_FILE:"n-gram table",OVERLAY_FILE:"overlay",MTP_FILE:"MTP draft",
-      VISION_FILE:"vision tower",GGUF_FILE:"GGUF model",GGUF_MTP_FILE:"MTP draft",GGUF_VISION_FILE:"vision tower",
+      VISION_FILE:"vision tower",GGUF_FILE:"GGUF model",GGUF_MTP_FILE:"MTP draft",GGUF_VISION_FILE:"vision tower",GGUF_PLE_FILE:"PLE table",
       TOKENIZER_JSON:"tokenizer.json",api:"API binary",engine:"engine binary",kernel_db:"kernel db",
       scripts:"launch scripts",eport:"engine port",aport:"API port"},
   ck_off:"disabled", ck_empty:"empty", ck_free:"free", ck_busy:"in use", ck_missing:"missing",
@@ -459,6 +459,8 @@ const FIELDS = [
    helpZh:"推测解码草稿头；关闭后不做 MTP", helpEn:"Speculative-decoding draft head; off = no MTP"},
   {k:"GGUF_VISION_FILE", tab:"w", wv:["gguf"], type:"file", opt:1, ext:[".gguf"], nameZh:"视觉塔（mmproj）", nameEn:"Vision (mmproj)",
    helpZh:"关闭后不支持图片输入", helpEn:"Off = no image input"},
+  {k:"GGUF_PLE_FILE", tab:"w", wv:["gguf"], type:"file", opt:1, ext:[".gguf",".gguf_file"], nameZh:"PLE 表", nameEn:"PLE table",
+   helpZh:"独立 n-gram 表（BF16/IQ4_NL GGUF）；关闭后用主模型内置的 IQ4_NL 表", helpEn:"Standalone n-gram table (BF16/IQ4_NL GGUF); off = the built-in IQ4_NL table"},
   {k:"TOKENIZER_DIR", tab:"w", wv:["v1","v2"], type:"dir", req:1, tok:1, nameZh:"词表目录", nameEn:"Tokenizer dir",
    helpZh:"目录内需包含 tokenizer.json", helpEn:"Must contain tokenizer.json"},
   // ---- 推理：上下文与并发 ----
@@ -521,7 +523,7 @@ const RANGES = {ENGINE_PORT:[1,65535], API_PORT:[1,65535], MAX_CONTEXT:[1024,104
 const PF_WKEYS = {
   v1:["MODEL_FILE","OVERLAY_FILE","MTP_FILE","VISION_FILE","TOKENIZER_DIR"],
   v2:["MODEL_FILE","NGRAM_FILE","MTP_FILE","VISION_FILE","TOKENIZER_DIR"],
-  gguf:["GGUF_FILE","GGUF_MTP_FILE","GGUF_VISION_FILE","TOKENIZER_DIR"],
+  gguf:["GGUF_FILE","GGUF_MTP_FILE","GGUF_VISION_FILE","GGUF_PLE_FILE","TOKENIZER_DIR"],
 };
 const PF_IKEYS = FIELDS.filter(f => f.tab === "i").map(f => f.k);
 const ACTIVE = ["spawning","waiting_engine","waiting_api","running","stopping"];
