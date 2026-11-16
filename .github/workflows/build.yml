@@ -227,7 +227,7 @@ jobs:
           rm -rf "$out" "dist/qwenox-${ver}-linux-x64.tar.gz"
           mkdir -p "$out/models" "$out/data"
           cp -a build "$out/build"
-          rm -rf "$out/build/.api-obj" "$out/build/deps" "$out/build/.build.lock"
+          rm -rf "$out/build/.api-obj" "$out/build/.bench-obj" "$out/build/deps" "$out/build/.build.lock"
           rm -f "$out/build/.runtime-scan."* "$out/build/hgn-work.lock"
           cp -a start_hgn.sh start_gguf.sh start.sh service.conf \
                 README.md README_EN.md CHANGELOG.md LICENSE VERSION \

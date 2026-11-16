@@ -2,7 +2,10 @@
 #include "qwenox.cpp"
 
 #include "../api/tokenizer.h"
-#include "../api/tokenizer.cpp"
+// tokenizer.cpp 是纯 host 代码，单独用 CXX 编译成对象后链接（build.sh /
+// build_win.sh）。不要把它 include 进 hipcc 的 TU：clang 23 + libstdc++
+// 在 host/device 两个 pass 解析 nlohmann 3.12 的 get<int>() 时都会在
+// operator value_t() 上报 "cannot convert basic_json to value_t"。
 
 #include <cctype>
 #include <cerrno>

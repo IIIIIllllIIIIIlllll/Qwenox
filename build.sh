@@ -292,9 +292,17 @@ build_engine() {
 }
 
 build_bench() {
+  # tokenizer.cpp 是纯 host 代码，单独用 $CXX 编译成对象再链接，避免
+  # hipcc 的 host/device 双 pass 解析 nlohmann（clang 23 + libstdc++ 在
+  # get<int>() 的 value_t 转换上报错）；API 目标本来就是这样编的。
+  local objdir=build/.bench-obj
+  mkdir -p "$objdir"
+  "$CXX" -O2 -std=c++17 -D_CRT_SECURE_NO_WARNINGS -D_CRT_NONSTDC_NO_DEPRECATE \
+    -Isrc/api -Ithird_party -Ithird_party/miniz \
+    -c src/api/tokenizer.cpp -o "$objdir/tokenizer.o" || return 1
   compile build/qwenox-bench 8 600 "$HIPCC" -O3 -Werror -std=c++17 "${VER_FLAGS[@]}" \
     --offload-arch="$GPU_ARCH" "${NPU_FLAGS[@]}" -Ithird_party src/gpu/bench_main.cpp \
-    -lrocblas -lhipblaslt "${NPU_LINK[@]}" "${BUNDLE_RPATH[@]}"
+    -Xlinker "$objdir/tokenizer.o" -lrocblas -lhipblaslt "${NPU_LINK[@]}" "${BUNDLE_RPATH[@]}"
 }
 
 API_FLAGS=(-O2 -std=c++17 "${VER_FLAGS[@]}" -Isrc/api -Ithird_party -Ithird_party/miniz

@@ -228,9 +228,18 @@ build_bench() {
     mkres qwenox-bench.exe "Qwenox Benchmark" Qwenox.Bench 0
     local resx=()
     [[ ${#RES[@]} -gt 0 ]] && resx=(-Xlinker "${RES[0]}")
+    # tokenizer.cpp 是纯 host 代码，单独用 clang++ 编译成对象；不要放进
+    # hipcc 的 TU（Linux 上 clang 23 + libstdc++ 会在 nlohmann get<int>() 报错）。
+    local bench_cxx="$TR/lib/llvm/bin/clang++.exe"
+    [[ -x "$bench_cxx" ]] || { echo "找不到 TheRock clang++: $bench_cxx" >&2; return 1; }
+    mkdir -p build/.bench-obj
+    "$bench_cxx" -O2 -std=c++17 -D_CRT_SECURE_NO_WARNINGS -D_CRT_NONSTDC_NO_DEPRECATE \
+      -Isrc/api -Ithird_party -Ithird_party/miniz \
+      -c src/api/tokenizer.cpp -o build/.bench-obj/tokenizer.o || return 1
     "$HIPCC" "${FLAGS[@]}" ${NPU_FLAGS[@]+"${NPU_FLAGS[@]}"} -std=c++17 -Ithird_party \
-      src/gpu/bench_main.cpp -o build/qwenox-bench.exe.tmp ${NPU_LINK[@]+"${NPU_LINK[@]}"} \
-      ${resx[@]+"${resx[@]}"} \
+      src/gpu/bench_main.cpp -Xlinker build/.bench-obj/tokenizer.o \
+      -o build/qwenox-bench.exe.tmp \
+      ${NPU_LINK[@]+"${NPU_LINK[@]}"} ${resx[@]+"${resx[@]}"} \
       && mv -f build/qwenox-bench.exe.tmp build/qwenox-bench.exe
 }
 
