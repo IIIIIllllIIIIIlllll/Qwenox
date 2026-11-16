@@ -83,8 +83,11 @@ void repr_string(const std::string& s, std::string& out) {
         } else if (cp == '\t') {
             out += "\\t";
         } else if (cp < 0x20 || (cp >= 0x7f && cp <= 0xa0)) {
-            char tmp[8];
-            std::snprintf(tmp, sizeof(tmp), "\\x%02x", cp);
+            // 本分支 cp <= 0xa0，实际只输出 \xNN；16 字节是为 GCC 11 的
+            // -Wformat-truncation 留出 %02x 对 uint32_t 的最坏情况上界。
+            char tmp[16];
+            std::snprintf(tmp, sizeof(tmp), "\\x%02x",
+                          static_cast<unsigned>(cp & 0xffu));
             out += tmp;
         } else {
             out.append(s, i, n);
