@@ -302,6 +302,11 @@ def handle(conn):
                           29, 198, 27, 15704, 79114, 29, 198, 55101, 10459, 198,
                           510, 15704, 29, 198, 510, 1628, 29, 198, 248059]
                 tokens = [(token, -0.1) for token in tokens]
+            elif "9101" in fields:
+                # "Let me check the weather.</think>\n\nHi": a real reasoning
+                # prefix, for the Responses reasoning-item wiring.
+                tokens = [(token, -0.1)
+                          for token in GUARD_THINK + [248069, 271, 12675]]
             elif n_ids <= 2:
                 tokens = [(4130, -0.5), (284, -0.25)]  # " Par" + "is"
             elif 248069 in ids:

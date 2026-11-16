@@ -17,6 +17,10 @@ import time
 
 from api_regression_test import check, get, request
 
+# The Windows api build is a tray app that serves only with --console; the
+# Linux console build has no such flag.
+CONSOLE_FLAG = ["--console"] if os.name == "nt" else []
+
 
 def wait_for(predicate, name, timeout=3.5):
     deadline = time.monotonic() + timeout
@@ -194,7 +198,7 @@ def main():
 
                 wait_for(engine_ready, "fake-engine-ready")
                 children.append(subprocess.Popen(
-                    [api_binary, "--tokenizer", str(root / "tokenizer"),
+                    [api_binary, *CONSOLE_FLAG, "--tokenizer", str(root / "tokenizer"),
                      "--engine", f"127.0.0.1:{engine_port}", "--host", "127.0.0.1",
                      "--port", str(api_port), "--overrides", ""],
                     cwd=root, env=env, stdout=log, stderr=log, creationflags=creationflags))

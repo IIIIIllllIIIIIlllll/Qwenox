@@ -20,6 +20,10 @@ from pathlib import Path
 from api_regression_test import check, get, parse_sse, request
 from api_disconnect_test import free_port, wait_for
 
+# The Windows api build is a tray app that serves only with --console; the
+# Linux console build has no such flag.
+CONSOLE_FLAG = ["--console"] if os.name == "nt" else []
+
 SENTENCE = ("Considering the limited time by the user, I have to give the solution "
             "based on the thinking directly now.")
 THINK = "Let me check the weather."
@@ -382,7 +386,7 @@ def main():
                     if guard_env is not None:
                         child_env["QWENOX_THINK_GUARD"] = guard_env
                     children.append(subprocess.Popen(
-                        [api_binary, "--tokenizer", args.tokenizer,
+                        [api_binary, *CONSOLE_FLAG, "--tokenizer", args.tokenizer,
                          "--engine", f"127.0.0.1:{engine_port}", "--host", "127.0.0.1",
                          "--port", str(api_port), "--overrides", ""],
                         cwd=root, env=child_env, stdout=log, stderr=log,

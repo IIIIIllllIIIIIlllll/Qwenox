@@ -2170,17 +2170,31 @@ json normalize_responses_input(const json& body) {
             has_pending_reasoning = true;
             return;
         }
-        if (type == "function_call") {
+        if (type == "function_call" || type == "custom_tool_call") {
+            // custom_tool_call is the freeform twin (Codex replays it for
+            // gpt-5-style "custom" tools): same routing, but the payload is a
+            // raw string under "input". Wrap it as {"input": ...} because the
+            // tool_calls normalization accepts only object arguments.
+            const bool custom = type == "custom_tool_call";
             const json* call_id = nullptr;
             if (item.contains("call_id")) call_id = &item["call_id"];
             else if (item.contains("id")) call_id = &item["id"];
             if (call_id == nullptr || !call_id->is_string() ||
                 call_id->get_ref<const std::string&>().empty())
-                http::fail(400, "function_call items require a string call_id");
+                http::fail(400, type + " items require a string call_id");
             if (!item.contains("name") || !item["name"].is_string() ||
                 item["name"].get_ref<const std::string&>().empty())
-                http::fail(400, "function_call items require a string name");
-            json arguments = item.contains("arguments") ? item["arguments"] : json("{}");
+                http::fail(400, type + " items require a string name");
+            json arguments = json("{}");
+            if (custom) {
+                if (item.contains("input") && !item["input"].is_null()) {
+                    if (!item["input"].is_string())
+                        http::fail(400, "custom_tool_call items require a string input");
+                    arguments = json{{"input", item["input"]}};
+                }
+            } else if (item.contains("arguments")) {
+                arguments = item["arguments"];
+            }
             json call = {{"id", *call_id},
                          {"type", "function"},
                          {"function", {{"name", item["name"]}, {"arguments", arguments}}}};
@@ -2202,12 +2216,12 @@ json normalize_responses_input(const json& body) {
             }
             return;
         }
-        if (type == "function_call_output") {
+        if (type == "function_call_output" || type == "custom_tool_call_output") {
             if (!item.contains("call_id") || !item["call_id"].is_string() ||
                 item["call_id"].get_ref<const std::string&>().empty())
-                http::fail(400, "function_call_output items require a string call_id");
+                http::fail(400, type + " items require a string call_id");
             if (!item.contains("output"))
-                http::fail(400, "function_call_output items require output");
+                http::fail(400, type + " items require output");
             ordinary.push_back(
                 json{{"role", "tool"},
                      {"tool_call_id", item["call_id"]},
@@ -2253,6 +2267,8 @@ json normalize_responses_input(const json& body) {
                                   input[0].contains("type") && input[0]["type"].is_string() &&
                                   input[0]["type"] != "function_call" &&
                                   input[0]["type"] != "function_call_output" &&
+                                  input[0]["type"] != "custom_tool_call" &&
+                                  input[0]["type"] != "custom_tool_call_output" &&
                                   input[0]["type"] != "reasoning";
         if (flat_content)
             append_user_content(responses_message_content(input, "input", true));
@@ -4105,6 +4121,9 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
 
     const std::string id = make_id("resp_");
     const long long created = now_unix();
+    // Tokenized once the reasoning text is final; reported under
+    // usage.output_tokens_details.reasoning_tokens.
+    long long reasoning_tokens = 0;
     auto output_part = [](const std::string& text) {
         return json{{"type", "output_text"},
                     {"text", text},
@@ -4129,6 +4148,16 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
                     {"name", name},
                     {"arguments", arguments}};
     };
+    auto reasoning_item = [](const std::string& item_id, const std::string& text) {
+        // "content" rides along so a store:false client that replays output
+        // items as the next input (Codex) hands the reasoning back; the chat
+        // template then decides inclusion per preserve_thinking.
+        return json{
+            {"id", item_id},
+            {"type", "reasoning"},
+            {"summary", json::array({json{{"type", "summary_text"}, {"text", text}}})},
+            {"content", json::array({json{{"type", "reasoning_text"}, {"text", text}}})}};
+    };
     auto response_object = [&](const std::string& status, const json& output,
                                const GenOutcome* outcome) {
         json response;
@@ -4150,6 +4179,11 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
             response["usage"] = {{"input_tokens", pt},
                                  {"output_tokens", outcome->n_gen},
                                  {"total_tokens", pt + outcome->n_gen}};
+            if (outcome->n_cached > 0)
+                response["usage"]["input_tokens_details"] = {{"cached_tokens", outcome->n_cached}};
+            if (reasoning_tokens > 0)
+                response["usage"]["output_tokens_details"] =
+                    {{"reasoning_tokens", reasoning_tokens}};
             if (!outcome->guard.empty()) response["usage"]["think_guard"] = outcome->guard;
             if (status == "incomplete")
                 response["incomplete_details"] = {{"reason", "max_output_tokens"}};
@@ -4182,6 +4216,10 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
         // (dev-docs/BUG-FINISH-LENGTH.md).
         const bool incomplete = o.reason == "length";
         json output = json::array();
+        if (!reasoning.empty()) {
+            reasoning_tokens = static_cast<long long>(g_tok.encode(reasoning).size());
+            output.push_back(reasoning_item(make_id("rs_"), reasoning));
+        }
         if (!parser.content().empty() || (!incomplete && parser.calls().empty())) {
             output.push_back(message_item(make_id("msg_"),
                                           incomplete ? "incomplete" : "completed",
@@ -4278,6 +4316,66 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
                           {"logprobs", json::array()}});
     };
 
+    // Reasoning is a prefix item: the splitter yields reasoning deltas only
+    // until the first content byte, so the item opens on the first reasoning
+    // delta and closes when content starts; it never reopens.
+    struct ReasoningState {
+        bool open = false;
+        int output_index = -1;
+        std::string id;
+        std::string text;
+    } reasoning;
+    auto emit_reasoning = [&](const std::string& delta) {
+        if (delta.empty()) return true;
+        if (!reasoning.open) {
+            if (!ensure_created()) return false;
+            reasoning.open = true;
+            reasoning.output_index = next_output_index++;
+            reasoning.id = make_id("rs_");
+            reasoning.text.clear();
+            json item = json{{"id", reasoning.id},
+                             {"type", "reasoning"},
+                             {"summary", json::array()}};
+            if (!event("response.output_item.added",
+                       json{{"output_index", reasoning.output_index}, {"item", item}}))
+                return false;
+            if (!event("response.reasoning_summary_part.added",
+                       json{{"item_id", reasoning.id},
+                            {"output_index", reasoning.output_index},
+                            {"summary_index", 0},
+                            {"part", json{{"type", "summary_text"}, {"text", ""}}}}))
+                return false;
+        }
+        reasoning.text += delta;
+        return event("response.reasoning_summary_text.delta",
+                     json{{"item_id", reasoning.id},
+                          {"output_index", reasoning.output_index},
+                          {"summary_index", 0},
+                          {"delta", delta}});
+    };
+    auto finish_reasoning = [&]() {
+        if (!reasoning.open) return true;
+        if (!event("response.reasoning_summary_text.done",
+                   json{{"item_id", reasoning.id},
+                        {"output_index", reasoning.output_index},
+                        {"summary_index", 0},
+                        {"text", reasoning.text}}))
+            return false;
+        if (!event("response.reasoning_summary_part.done",
+                   json{{"item_id", reasoning.id},
+                        {"output_index", reasoning.output_index},
+                        {"summary_index", 0},
+                        {"part", json{{"type", "summary_text"}, {"text", reasoning.text}}}}))
+            return false;
+        json item = reasoning_item(reasoning.id, reasoning.text);
+        if (!event("response.output_item.done",
+                   json{{"output_index", reasoning.output_index}, {"item", item}}))
+            return false;
+        put_output(reasoning.output_index, std::move(item));
+        reasoning.open = false;
+        return true;
+    };
+
     struct CallState {
         bool open = false;
         int output_index = -1;
@@ -4345,48 +4443,75 @@ void handle_responses(const http::Request& q, http::Response* r, http::Stream* s
         // SSE comment as a protocol-neutral keep-alive during queue/prefill.
         return st->send_raw(": keep-alive\n\n");
     };
-    GenOutcome o = run_generation_guarded(
-        spec, guard,
-        [&](const std::string& delta) {
-            if (st->disconnected()) return false;
-            if (tool_setup.choice.forced()) return dispatch_tool_events(parser.feed(delta));
+    try {
+        GenOutcome o = run_generation_guarded(
+            spec, guard,
+            [&](const std::string& delta) {
+                if (st->disconnected()) return false;
+                if (tool_setup.choice.forced()) return dispatch_tool_events(parser.feed(delta));
+                std::string reasoning_delta, content_delta;
+                splitter.feed(delta, &reasoning_delta, &content_delta);
+                if (!emit_reasoning(reasoning_delta)) return false;
+                // Reasoning precedes content, so the first content byte closes
+                // the reasoning item before any message/call event.
+                if (!content_delta.empty() && !finish_reasoning()) return false;
+                return dispatch_tool_events(parser.feed(content_delta));
+            },
+            id, on_wait);
+        if (o.client_gone) return;
+        if (!tool_setup.choice.forced()) {
             std::string reasoning_delta, content_delta;
-            splitter.feed(delta, &reasoning_delta, &content_delta);
-            return dispatch_tool_events(parser.feed(content_delta));
-        },
-        id, on_wait);
-    if (o.client_gone) return;
-    if (!tool_setup.choice.forced()) {
-        std::string reasoning_delta, content_delta;
-        splitter.finish(&reasoning_delta, &content_delta);
-        if (!dispatch_tool_events(parser.feed(content_delta))) return;
-        if (!dispatch_tool_events(parser.feed(o.reasoning_calls))) return;
-    }
-    if (!dispatch_tool_events(parser.finish())) return;
-    if (!finish_message() || !ensure_created()) return;
+            splitter.finish(&reasoning_delta, &content_delta);
+            if (!emit_reasoning(reasoning_delta)) return;
+            if (!finish_reasoning()) return;
+            if (!dispatch_tool_events(parser.feed(content_delta))) return;
+            if (!dispatch_tool_events(parser.feed(o.reasoning_calls))) return;
+        }
+        if (!dispatch_tool_events(parser.finish())) return;
+        if (!finish_message() || !ensure_created()) return;
 
-    // Flush calls still open at end of stream as per-item "incomplete".
-    for (CallState& call : call_states) {
-        if (!call.open) continue;
-        json item = function_item(call.item_id, call.call_id, "incomplete",
-                                  call.name, call.arguments);
-        if (!event("response.output_item.done",
-                   json{{"output_index", call.output_index}, {"item", item}}))
-            return;
-        put_output(call.output_index, std::move(item));
-        call.open = false;
-    }
+        // Flush calls still open at end of stream as per-item "incomplete".
+        for (CallState& call : call_states) {
+            if (!call.open) continue;
+            json item = function_item(call.item_id, call.call_id, "incomplete",
+                                      call.name, call.arguments);
+            if (!event("response.output_item.done",
+                       json{{"output_index", call.output_index}, {"item", item}}))
+                return;
+            put_output(call.output_index, std::move(item));
+            call.open = false;
+        }
 
-    // Per-item "incomplete" markers above stay, but only a real budget hit
-    // marks the whole response incomplete.
-    const bool incomplete = o.reason == "length";
-    if (output_slots.empty() && !incomplete) {
-        if (!start_message() || !finish_message()) return;
+        // Per-item "incomplete" markers above stay, but only a real budget hit
+        // marks the whole response incomplete.
+        const bool incomplete = o.reason == "length";
+        bool has_payload = false;
+        for (const auto& slot : output_slots)
+            if (slot.is_object() && slot.value("type", "") != "reasoning")
+                has_payload = true;
+        if (!has_payload && !incomplete) {
+            if (!start_message() || !finish_message()) return;
+        }
+        if (!reasoning.text.empty())
+            reasoning_tokens = static_cast<long long>(g_tok.encode(reasoning.text).size());
+        json final_response =
+            response_object(incomplete ? "incomplete" : "completed", output_slots, &o);
+        event(incomplete ? "response.incomplete" : "response.completed",
+              json{{"response", std::move(final_response)}});
+    } catch (const http::Error& e) {
+        // Mid-stream engine failures (the status line is spent by then) become
+        // a terminal response.failed with the error on the response object, in
+        // place of the chat-style error frame the server would otherwise
+        // append. Before the stream starts, the ordinary JSON error with a
+        // real status code is the better answer, so rethrow.
+        if (st->disconnected()) return;
+        if (!st->started()) throw;
+        if (!ensure_created()) return;
+        json response = response_object("failed", json::array(), nullptr);
+        response["error"] = {{"code", e.code == "null" ? json(nullptr) : json(e.code)},
+                             {"message", e.message}};
+        event("response.failed", json{{"response", std::move(response)}});
     }
-    json final_response =
-        response_object(incomplete ? "incomplete" : "completed", output_slots, &o);
-    event(incomplete ? "response.incomplete" : "response.completed",
-          json{{"response", std::move(final_response)}});
 }
 
 // ------------------------------------------------- Anthropic Messages API --

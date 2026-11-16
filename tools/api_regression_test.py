@@ -376,6 +376,75 @@ def main():
           deltas == "Hi" and [event["sequence_number"] for event in events] == list(range(8)),
           "responses-sse", raw[:1200])
 
+    # A real reasoning prefix becomes a reasoning output item: output[0]
+    # non-stream, and reasoning_summary events ahead of the message when
+    # streamed. (Seed needs a SAMPLE section, so temperature must be nonzero.)
+    reasoning_body = dict(response_body, temperature=1, seed=9101,
+                          max_output_tokens=16)
+    status, _, raw = request(args.base, "/v1/responses", reasoning_body)
+    response = json.loads(raw)
+    reasoning_items = [item for item in response["output"] if item["type"] == "reasoning"]
+    check(status == 200 and len(reasoning_items) == 1 and
+          reasoning_items[0]["summary"] == [
+              {"type": "summary_text", "text": "Let me check the weather."}] and
+          reasoning_items[0]["content"] == [
+              {"type": "reasoning_text", "text": "Let me check the weather."}] and
+          response["output"][-1]["content"][0]["text"] == "Hi" and
+          response["usage"]["output_tokens_details"]["reasoning_tokens"] > 0,
+          "responses-reasoning-nonstream", raw[:800])
+
+    status, content_type, raw = request(args.base, "/v1/responses",
+                                        dict(reasoning_body, stream=True))
+    events = parse_sse(raw)
+    types = [event["type"] for event in events]
+    reasoning_deltas = "".join(event.get("delta", "") for event in events
+                               if event["type"] == "response.reasoning_summary_text.delta")
+    final = events[-1]
+    check(status == 200 and "text/event-stream" in content_type and
+          types[0] == "response.created" and
+          types[1] == "response.output_item.added" and
+          events[1]["item"]["type"] == "reasoning" and
+          "response.reasoning_summary_part.added" in types and
+          "response.reasoning_summary_text.done" in types and
+          "response.reasoning_summary_part.done" in types and
+          reasoning_deltas == "Let me check the weather." and
+          types.index("response.output_item.done") <
+          types.index("response.content_part.added") and
+          final["type"] == "response.completed" and
+          [item["type"] for item in final["response"]["output"]] ==
+          ["reasoning", "message"] and
+          final["response"]["usage"]["output_tokens_details"]["reasoning_tokens"] > 0 and
+          [event["sequence_number"] for event in events] == list(range(len(events))),
+          "responses-reasoning-sse", raw[:1500])
+
+    # Engine abort mid-decode: a 503 JSON error non-stream; streamed, the
+    # terminal event is response.failed with the error on the response object.
+    status, _, raw = request(args.base, "/v1/responses",
+                             dict(response_body, temperature=1, seed=5150))
+    check(status == 503 and b"aborted" in raw, "responses-failed-503", raw[:300])
+    status, _, raw = request(args.base, "/v1/responses",
+                             dict(response_body, temperature=1, seed=5150, stream=True))
+    events = parse_sse(raw)
+    final = events[-1]
+    check(status == 200 and final["type"] == "response.failed" and
+          final["response"]["status"] == "failed" and
+          "aborted" in final["response"]["error"]["message"],
+          "responses-failed-stream", raw[:800])
+
+    # A reasoning item replayed from a previous turn attaches to the next
+    # assistant message instead of failing the request.
+    reasoning_roundtrip = {
+        "input": [
+            {"type": "reasoning",
+             "content": [{"type": "reasoning_text", "text": "thought"}]},
+            {"role": "assistant", "content": [{"type": "output_text", "text": "Hi"}]},
+            {"role": "user", "content": "again"},
+        ],
+        "temperature": 0, "max_output_tokens": 4,
+    }
+    status, _, raw = request(args.base, "/v1/responses", reasoning_roundtrip)
+    check(status == 200, "responses-reasoning-roundtrip", raw[:1000])
+
     tools = [
         {"type": "function", "function": {
             "name": "get_weather",
@@ -496,6 +565,22 @@ def main():
     }
     status, _, raw = request(args.base, "/v1/responses", roundtrip)
     check(status == 200, "responses-tool-roundtrip", raw[:1000])
+
+    # Codex replays freeform (custom) tool history as custom_tool_call items:
+    # they normalize into the same assistant/tool message pair instead of 400,
+    # and {"type": "custom"} tool definitions are ignored like other built-ins.
+    custom_roundtrip = {
+        "input": [
+            {"type": "custom_tool_call", "call_id": "call_prev", "name": "apply_patch",
+             "input": "*** Begin Patch\n*** End Patch\n"},
+            {"type": "custom_tool_call_output", "call_id": "call_prev", "output": "patched"},
+            {"role": "user", "content": "summarize"},
+        ],
+        "tools": [{"type": "custom", "name": "apply_patch", "description": "edit files"}],
+        "temperature": 0, "max_output_tokens": 4,
+    }
+    status, _, raw = request(args.base, "/v1/responses", custom_roundtrip)
+    check(status == 200, "responses-custom-tool-roundtrip", raw[:1000])
 
     invalid_history = dict(tool_body)
     invalid_history["messages"] = [{"role": "assistant", "tool_calls": [{

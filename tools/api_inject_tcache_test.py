@@ -26,6 +26,10 @@ from pathlib import Path
 from api_regression_test import check, get, request
 from api_disconnect_test import free_port, wait_for
 
+# The Windows api build is a tray app that serves only with --console; the
+# Linux console build has no such flag.
+CONSOLE_FLAG = ["--console"] if os.name == "nt" else []
+
 # Fake engine reply to a thinking prompt: "</think>Hi" (248069, 12675).
 FIRST = [{"role": "user", "content": "hi"}]
 # The first turn's prompt + reply, typed into the next user message.
@@ -113,7 +117,7 @@ def main():
                     if cache == "0":
                         child_env["QWENOX_API_TOKCACHE"] = "0"
                     children.append(subprocess.Popen(
-                        [api_binary, "--tokenizer", args.tokenizer,
+                        [api_binary, *CONSOLE_FLAG, "--tokenizer", args.tokenizer,
                          "--engine", f"127.0.0.1:{engine_port}", "--host", "127.0.0.1",
                          "--port", str(api_port), "--overrides", ""],
                         cwd=root, env=child_env, stdout=log, stderr=log,
