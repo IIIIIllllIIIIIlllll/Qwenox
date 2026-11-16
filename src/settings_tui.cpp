@@ -573,8 +573,8 @@ const std::vector<Field>& field_specs() {
         {0, "GGUF_VISION_FILE", "GGUF 视觉塔", "留空表示纯文本服务",
          "GGUF vision tower", "Leave empty for text-only serving",
          FieldKind::kText, FieldGroup::kGguf, {}},
-        {0, "GGUF_PLE_FILE", "PLE 表", "独立 n-gram 表 GGUF（BF16/IQ4_NL）；留空用内置 IQ4_NL 表",
-         "PLE table", "Standalone n-gram table GGUF (BF16/IQ4_NL); empty = built-in IQ4_NL",
+        {0, "GGUF_PLE_FILE", "PLE 表", "独立 n-gram 表 GGUF（BF16/IQ4_NL）；留空用内置表",
+         "PLE table", "Standalone n-gram table GGUF (BF16/IQ4_NL); empty = built-in",
          FieldKind::kText, FieldGroup::kGguf, {}},
         {0, "GGUF_I4R_PATCH", "i4r 补丁 [Linux]", "可选 .hgn 专家补丁；留空表示不使用",
          "i4r patch [Linux]", "Optional .hgn expert patch; leave empty to disable",
@@ -951,8 +951,8 @@ std::vector<Check> validate(const Model& model) {
         check_file(TR("GGUF MTP", "GGUF MTP"), model.get("GGUF_MTP_FILE"), false, false, "GGUF");
         check_file(TR("GGUF 视觉塔", "GGUF vision tower"), model.get("GGUF_VISION_FILE"), false, false, "GGUF");
         if (model.get("GGUF_PLE_FILE").empty())
-            hint(TR("PLE 表：未配置，用主模型内置的 IQ4_NL 表",
-                    "PLE table: not set; the main model's built-in IQ4_NL table is used"));
+            hint(TR("PLE 表：未配置，用主模型内置的表",
+                    "PLE table: not set; the main model's built-in table is used"));
         else
             check_file(TR("PLE 表", "PLE table"), model.get("GGUF_PLE_FILE"), false, false, "GGUF");
         check_file(TR("i4r 补丁", "i4r patch"), model.get("GGUF_I4R_PATCH"), false, false, "HGN1");

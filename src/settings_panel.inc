@@ -605,7 +605,7 @@ void check_weights_page(CheckLines& c, const PanelVals& v) {
         else
             check_weight(c, TR("GGUF 视觉塔", "GGUF vision tower"), v.gguf_vision, true, false);
         if (v.no_gguf_ple)
-            check_line(c, kLvPass, TR("PLE 表：用内置 IQ4_NL", "PLE table: built-in IQ4_NL"));
+            check_line(c, kLvPass, TR("PLE 表：用内置表", "PLE table: built-in"));
         else
             check_weight(c, TR("PLE 表", "PLE table"), v.gguf_ple, true, false);
         check_line(c, kLvHint,

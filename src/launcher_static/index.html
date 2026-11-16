@@ -460,7 +460,7 @@ const FIELDS = [
   {k:"GGUF_VISION_FILE", tab:"w", wv:["gguf"], type:"file", opt:1, ext:[".gguf"], nameZh:"视觉塔（mmproj）", nameEn:"Vision (mmproj)",
    helpZh:"关闭后不支持图片输入", helpEn:"Off = no image input"},
   {k:"GGUF_PLE_FILE", tab:"w", wv:["gguf"], type:"file", opt:1, ext:[".gguf",".gguf_file"], nameZh:"PLE 表", nameEn:"PLE table",
-   helpZh:"独立 n-gram 表（BF16/IQ4_NL GGUF）；关闭后用主模型内置的 IQ4_NL 表", helpEn:"Standalone n-gram table (BF16/IQ4_NL GGUF); off = the built-in IQ4_NL table"},
+   helpZh:"独立 n-gram 表（BF16/IQ4_NL GGUF）；关闭后用主模型内置的表", helpEn:"Standalone n-gram table (BF16/IQ4_NL GGUF); off = the built-in table"},
   {k:"TOKENIZER_DIR", tab:"w", wv:["v1","v2"], type:"dir", req:1, tok:1, nameZh:"词表目录", nameEn:"Tokenizer dir",
    helpZh:"目录内需包含 tokenizer.json", helpEn:"Must contain tokenizer.json"},
   // ---- 推理：上下文与并发 ----
