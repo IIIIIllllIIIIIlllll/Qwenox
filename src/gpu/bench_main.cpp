@@ -2,13 +2,7 @@
 #include "qwenox.cpp"
 
 #include "../api/tokenizer.h"
-// clang 的 HIP 设备 pass 会实例化 host-only 函数里的具体模板调用；nlohmann
-// 3.12 的 operator value_t() 在 libstdc++ 的设备 pass 下不可见，导致
-// "cannot convert basic_json to value_t"。tokenizer 只在 host 侧使用，设备
-// pass 不需要它的定义，跳过实现文件即可（声明保留给宿主代码解析）。
-#if !defined(__HIP_DEVICE_COMPILE__)
 #include "../api/tokenizer.cpp"
-#endif
 
 #include <cctype>
 #include <cerrno>
