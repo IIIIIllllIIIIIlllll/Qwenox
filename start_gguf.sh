@@ -14,6 +14,9 @@ serve_init "$@"
 for f in "$GGUF_FILE" "$GGUF_MTP_FILE" "$GGUF_VISION_FILE"; do
   [[ -z "$f" || "$f" == *.gguf ]] || fail "$LAUNCHER 只接受 .gguf 权重：$f（hgn 请用 bash start_hgn.sh）"
 done
+# 可选的独立 PLE n-gram 表 GGUF（BF16 engram 拆出文件）；空 = 内置 IQ4_NL 表。
+GGUF_PLE_FILE="${GGUF_PLE_FILE:-}"
+[[ -z "$GGUF_PLE_FILE" ]] || need 'PLE n-gram 表' "$GGUF_PLE_FILE" '用内置表可设 GGUF_PLE_FILE=""'
 # 可选的 i4r 专家补丁是 .hgn overlay，不是主权重。
 [[ -z "$GGUF_I4R_PATCH" || "$GGUF_I4R_PATCH" == *.hgn ]] || \
   fail "GGUF_I4R_PATCH 必须是 .hgn：$GGUF_I4R_PATCH"
@@ -36,6 +39,7 @@ MISSING_HINT='GGUF 权重下载 Unsloth 的 Qwen3.8-Flash-Next UD-Q4_K_XL（全�
 # 引擎看到 *.gguf 基座即为纯 GGUF 启动（自动 QWENOX_GGUF + QWENOX_GGUF_DENSE=1）；
 # MTP sidecar 总是显式传入（空串 = 不用），不让引擎去分片目录里猜。
 export QWENOX_GGUF_MTP="$GGUF_MTP_FILE"
+[[ -z "$GGUF_PLE_FILE" ]] || { export QWENOX_GGUF_PLE="$GGUF_PLE_FILE"; echo "PLE n-gram 表：$GGUF_PLE_FILE（外部 GGUF）"; }
 FORMAT=GGUF
 MAIN_MODEL=$GGUF_FILE
 if [[ -n "$GGUF_I4R_PATCH" ]]; then

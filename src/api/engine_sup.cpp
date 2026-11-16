@@ -373,6 +373,11 @@ bool start(const std::string& root, const svcconf::Conf& conf, std::string* err)
         gguf ? svcconf::cfg(conf, "GGUF_FILE", "")
              : svcconf::cfg(conf, "MODEL_FILE", model_dir + "\\heretic.hgn");
     const std::string ngram_file = gguf ? model_file : svcconf::cfg(conf, "NGRAM_FILE", model_file);
+    // GGUF 外部 PLE 表（GGUF_PLE_FILE，手改 service.conf，不进设置面板）：
+    // 空 = GGUF 内置 IQ4_NL 表；非空 = 独立的 PLE GGUF（如 engram BF16 拆出文件），
+    // 经 QWENOX_GGUF_PLE=<path> 传给引擎。
+    const std::string gguf_ple_file =
+        gguf ? svcconf::cfg_optional(conf, "GGUF_PLE_FILE", "") : "";
     const std::string mtp_file =
         gguf ? svcconf::cfg_optional(conf, "GGUF_MTP_FILE", "")
              : svcconf::cfg_optional(conf, "MTP_FILE", model_dir + "\\heretic-mtp.hgn");
@@ -438,6 +443,10 @@ bool start(const std::string& root, const svcconf::Conf& conf, std::string* err)
     }
     if (!file_exists(ngram_file)) {
         *err = "n-gram table not found: " + ngram_file;
+        return false;
+    }
+    if (!gguf_ple_file.empty() && !file_exists(gguf_ple_file)) {
+        *err = "external PLE table not found: " + gguf_ple_file;
         return false;
     }
     if (!mtp_file.empty() && !file_exists(mtp_file)) {
@@ -519,8 +528,11 @@ bool start(const std::string& root, const svcconf::Conf& conf, std::string* err)
                             !gguf || !mtp_key ? nullptr
                             : mtp_file.empty() ? "none"
                                                : mtp_file.c_str());
-    for (const char* k : {"QWENOX_GGUF", "QWENOX_GGUF_DENSE", "QWENOX_GGUF_PLE", "QWENOX_GGUF_EXPERTS"})
+    for (const char* k : {"QWENOX_GGUF", "QWENOX_GGUF_DENSE", "QWENOX_GGUF_EXPERTS"})
         SetEnvironmentVariableA(k, nullptr);
+    // 外部 PLE 表：空 = 清除残留（引擎用内置 IQ4_NL 表），非空 = 外部 GGUF 路径
+    SetEnvironmentVariableA("QWENOX_GGUF_PLE",
+                            gguf_ple_file.empty() ? nullptr : gguf_ple_file.c_str());
 
     std::vector<std::string> args = {model_file};
     if (!overlay_file.empty()) args.push_back(overlay_file);

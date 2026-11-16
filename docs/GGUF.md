@@ -62,6 +62,7 @@ export QWENOX_GGUF_MTP=$D/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf          # G3.
 | `QWENOX_GGUF_MTP_EXPERTS=0` | 调试用：MTP 路由专家仍取 hgn |
 | `--vision-tower <mmproj.gguf>` | 路径以 `.gguf` 结尾时按 llama.cpp mmproj（clip / qwen3vl_merger）加载，转成与 hgn 视觉文件相同的 bf16 张量（`gguf_map::build_vision`） |
 | `QWENOX_GGUF_PLE=1` | 混合模式下 PLE n-gram 表也用 GGUF 的 IQ4_NL（默认保留 hgn 的 fp8 表，KLD 更好，见下） |
+| `QWENOX_GGUF_PLE=<路径>` | 用独立 GGUF 里的 `per_layer_token_embd.weight`（BF16 或 IQ4_NL，如 engram 拆出文件）取代内置 PLE 表；行数与行序必须与模型配置一致。service.conf 里对应 `GGUF_PLE_FILE` |
 | `QWENOX_GGUF_DENSE_FILTER=a,b,...` | 调试用：只有名字包含其中某个子串的张量来自 GGUF（`!` 前缀表示取反），用于二分定位 |
 
 ## 转换规则（gguf_map.h）

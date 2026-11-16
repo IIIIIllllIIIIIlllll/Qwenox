@@ -474,6 +474,7 @@ struct GgExperts {
 };
 static gguf::File* g_gguf = nullptr;
 static gguf::File* g_gguf_mtp = nullptr;  // QWENOX_GGUF_MTP sidecar
+static gguf::File* g_gguf_ple = nullptr;  // QWENOX_GGUF_PLE=<path> external PLE table
 static std::vector<GgExperts> g_ggx;  // per trunk layer; empty = hgn experts
 static GgExperts g_ggx_mtp;           // gate == nullptr: MTP experts from hgn
 static bool gg_on() { return !g_ggx.empty(); }
@@ -668,7 +669,15 @@ static void gguf_dense_apply(Checkpoint& ck) {
   size_t n = gguf_map::build(ck, *g_gguf, g_gguf_mtp);
   // PLE n-gram table: a hgn base keeps its fp8 table by default (KLD 0.0453
   // vs 0.0511 with the GGUF's IQ4_NL one); pure GGUF / QWENOX_GGUF_PLE=1 use IQ4_NL.
+  // QWENOX_GGUF_PLE=<path> (any value other than 0/1): a standalone GGUF
+  // holding per_layer_token_embd.weight (e.g. the BF16 engram split) replaces
+  // the built-in table with a view into that file; 40_model.inc re-points the
+  // batch reader at g_gguf_ple's mapping.
   const char* pe = getenv("QWENOX_GGUF_PLE");
+  if (pe && *pe && strcmp(pe, "0") && strcmp(pe, "1")) {
+    if (!g_gguf_ple) g_gguf_ple = new gguf::File(pe);
+    gguf_map::add_ple_table_file(ck, *g_gguf_ple);
+  }
   const bool ple = (pe && !strcmp(pe, "1")) || !ck.find("layers.1.ple.ngram_embedding.weight");
   if (ple) gguf_map::add_ple_table(ck, *g_gguf);
   size_t bytes = 0, nbytes = 0;
@@ -691,7 +700,8 @@ static void gguf_dense_apply(Checkpoint& ck) {
           "gguf dense: %zu tensors from GGUF%s (%d q8g32, %d native %.2f GiB, %.2f GiB synthetic, "
           "%.1f s)%s\n",
           n, g_gguf_mtp ? " + MTP sidecar" : "", n8, nn, nbytes / 1073741824.0,
-          bytes / 1073741824.0, s, ple ? "; PLE table IQ4_NL" : "");
+          bytes / 1073741824.0, s,
+          ple ? "; PLE table IQ4_NL" : g_gguf_ple ? "; PLE table external" : "");
 }
 // After GpuModel construction: free host copies of large synthetic tensors
 // (the device arena has them). Small ones stay: ensure_hcnorm/ensure_norm256

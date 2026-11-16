@@ -420,6 +420,31 @@ inline void add_ple_table(hgn::Checkpoint& ck, const gguf::File& g) {
   ck.add_view(d);
 }
 
+// External standalone PLE table (QWENOX_GGUF_PLE=<path>): a GGUF holding
+// per_layer_token_embd.weight on its own, either BF16 [rows][160] (the engram
+// split — same bytes as the hgn bf16 n-gram file from tools/ple_ngram_bf16.py,
+// registered with its (128, R, 160) dims) or IQ4_NL like the built-in table.
+inline void add_ple_table_file(hgn::Checkpoint& ck, const gguf::File& g) {
+  const std::string name = "layers.1.ple.ngram_embedding.weight";
+  if (g_keep && !g_keep(name)) return;
+  const gguf::Tensor& t = g.at("per_layer_token_embd.weight");
+  if (t.type == gguf::IQ4_NL) {
+    need(t.ne[0] == 160 && t.row_bytes() == 90,
+         "external PLE: expected IQ4_NL [rows][160]");
+    hgn::Tensor d = desc(name, 11, {t.rows(), 160});
+    d.data = t.data;
+    d.data_size = t.nbytes;
+    ck.add_view(d);
+    return;
+  }
+  need(t.type == gguf::BF16 && t.ne[0] == 160 && t.rows() % 128 == 0,
+       "external PLE: expected BF16 [128*R][160] or IQ4_NL [rows][160]");
+  hgn::Tensor d = desc(name, 0, {128, t.rows() / 128, 160});
+  d.data = t.data;
+  d.data_size = t.nbytes;
+  ck.add_view(d);
+}
+
 // mmproj GGUF (general.architecture clip, projector qwen3vl_merger, e.g.
 // mmproj-BF16.gguf) -> the vision tower's hgn names (visual.*), all bf16
 // (dtype 0) like the hgn vision file; 31_vision.inc then loads it unchanged.

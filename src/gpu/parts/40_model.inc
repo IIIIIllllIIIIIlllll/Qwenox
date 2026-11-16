@@ -1509,22 +1509,25 @@ struct GpuModel {
       ple_iq4 = ple_table->dtype == 11;
       ple_bf16 = ple_table->dtype == 0;
       if (ple_iq4) {
-        // GGUF IQ4_NL table: 90 B rows, no global scale. The batch-read fd is
-        // re-pointed at the shard that holds it (mmapped from offset 0).
+        // GGUF IQ4_NL table: 90 B rows, no global scale.
         g_ple_rb = 90;
-        if (g_gguf)
-          for (const auto& mp : g_gguf->mappings())
-            if (ple_table->data >= mp.base && ple_table->data < mp.base + mp.len) {
-              ple_uring_open(mp.path.c_str());
-              g_ple_foff = (uint64_t)(ple_table->data - mp.base);
+        // The batch reader is re-pointed at the file holding the table: a
+        // g_gguf shard for the built-in one, g_gguf_ple for an external
+        // QWENOX_GGUF_PLE=<path> file.
+        for (const gguf::File* pf : {g_gguf, g_gguf_ple})
+          if (pf)
+            for (const auto& mp : pf->mappings())
+              if (ple_table->data >= mp.base && ple_table->data < mp.base + mp.len) {
+                ple_uring_open(mp.path.c_str());
+                g_ple_foff = (uint64_t)(ple_table->data - mp.base);
 #ifdef _WIN32
-              g_ple_off_ok = g_ple_win.fh != INVALID_HANDLE_VALUE;
+                g_ple_off_ok = g_ple_win.fh != INVALID_HANDLE_VALUE;
 #else
-              g_ple_off_ok = g_ple_fd >= 0;
+                g_ple_off_ok = g_ple_fd >= 0;
 #endif
-              fprintf(stderr, "ple: IQ4_NL n-gram table from %s%s\n", mp.path.c_str(),
-                      g_ple_off_ok ? "" : " (batch reader unavailable: mapped reads)");
-            }
+                fprintf(stderr, "ple: IQ4_NL n-gram table from %s%s\n", mp.path.c_str(),
+                        g_ple_off_ok ? "" : " (batch reader unavailable: mapped reads)");
+              }
       } else {
       if (ple_bf16) {
         // Raw bf16 table (dtype 0): 320 B rows, values used as-is (no trailing
@@ -1544,9 +1547,34 @@ struct GpuModel {
       // holds it. open_base opened the base .hgn; a separate n-gram file
       // (NGRAM_FILE, passed as an overlay — hgn v2 ships the table on its
       // own) re-points the reader at that file. Every mapping maps its file
-      // from offset 0.
+      // from offset 0. QWENOX_GGUF_PLE=<path>: the table views the external
+      // GGUF's mapping, which ckpt.mapping_of cannot see — same re-point.
+      bool ple_ext = false;
+      if (g_gguf_ple)
+        for (const auto& mp : g_gguf_ple->mappings())
+          if (ple_table->data >= mp.base && ple_table->data < mp.base + mp.len) {
+            ple_uring_open(mp.path.c_str());
+            g_ple_foff = (uint64_t)(ple_table->data - mp.base);
+#ifdef _WIN32
+            g_ple_off_ok = g_ple_win.fh != INVALID_HANDLE_VALUE;
+#else
+            g_ple_off_ok = g_ple_fd >= 0;
+#endif
+            fprintf(stderr, "ple: n-gram table from %s%s\n", mp.path.c_str(),
+                    g_ple_off_ok ? "" : " (batch reader unavailable: mapped reads)");
+            ple_ext = true;
+          }
+      if (!ple_ext)
       if (const auto* mp = ckpt.mapping_of(ple_table->data)) {
-        if (!ckpt.mappings().empty() && mp != &ckpt.mappings()[0]) {
+#ifdef _WIN32
+        const bool reader_was_ok = g_ple_win.fh != INVALID_HANDLE_VALUE;
+#else
+        const bool reader_was_ok = g_ple_fd >= 0;
+#endif
+        // mp == mappings()[0] means the table lives in the base file the
+        // reader already points at — unless the base is a GGUF (open_base
+        // opened nothing), e.g. pure GGUF + an .hgn n-gram overlay.
+        if (!ckpt.mappings().empty() && (mp != &ckpt.mappings()[0] || !reader_was_ok)) {
           ple_uring_open(mp->path.c_str());
           fprintf(stderr, "ple: n-gram table from %s\n", mp->path.c_str());
         }
