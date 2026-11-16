@@ -249,14 +249,16 @@ ensure_gen_static_inc() {
 gen_static_inc() {
     ensure_gen_static_inc
     echo "[生成] src/api/static_gen.inc"
-    ./build/gen_static_inc.exe src/api/static src/api/static_gen.inc || exit 1
+    ./build/gen_static_inc.exe src/api/static src/api/static_gen.inc \
+      --map=favicon.ico=src/launch_win.ico --map=apple-touch-icon.png=src/apple-touch-icon.png || exit 1
 }
 
 # launcher_settings 的静态页嵌入：同一生成器，来源 src/launcher_static/。
 gen_launcher_static_inc() {
     ensure_gen_static_inc
     echo "[生成] src/launcher_static_gen.inc"
-    ./build/gen_static_inc.exe src/launcher_static src/launcher_static_gen.inc || exit 1
+    ./build/gen_static_inc.exe src/launcher_static src/launcher_static_gen.inc \
+      --map=favicon.ico=src/launch_win.ico --map=apple-touch-icon.png=src/apple-touch-icon.png || exit 1
 }
 
 # GUI 子系统链接选项（托盘/入口程序，双击不出控制台）；入口仍是 main()。
@@ -409,7 +411,6 @@ mkres() {  # $1=exe 文件名  $2=FileDescription  $3=manifest identity 名  $4=
     IFS=. read -r v1 v2 v3 _ <<< "$QWENOX_VER"
     v1="${v1//[^0-9]/}"; v2="${v2//[^0-9]/}"; v3="${v3//[^0-9]/}"
     local mf="$name.manifest" rc="$name.rc"
-    [[ -f build/launch_win.ico ]] || cp src/launch_win.ico build/
     {
       cat <<EOF
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -444,7 +445,7 @@ EOF
     } > "build/$mf"
     {
       cat <<EOF
-1 ICON "launch_win.ico"
+1 ICON "../src/launch_win.ico"
 1 24 "$mf"
 1 VERSIONINFO
 FILEVERSION ${v1:-0},${v2:-0},${v3:-0},0
@@ -482,7 +483,8 @@ EOF
       RC="$(ls "/c/Program Files (x86)/Windows Kits/10/bin"/*/x64/rc.exe 2>/dev/null | sort -V | tail -1)"
       RCFLAGS=()
     fi
-    # 在 build/ 内编译：rc 与图标/manifest 同目录，引用用裸文件名（沿袭旧 src/*.rc 的可用写法）
+    # 在 build/ 内编译：manifest 是同目录生成的（裸文件名引用），图标直接用
+    # 仓库唯一源文件 ../src/launch_win.ico，不复制副本。
     if [[ -n "$RC" && -x "$RC" ]] && ( cd build && "$RC" "${RCFLAGS[@]}" -fo "$name.res" "$rc" ); then
       RES=("build/$name.res")
     else

@@ -299,15 +299,19 @@ ensure_gen_static_inc() {
       && mv -f "build/gen_static_inc.tmp.$$" build/gen_static_inc || return 1
   fi
 }
+# 图标源文件全仓唯一(src/launch_win.ico / src/apple-touch-icon.png)，
+# 各静态目录经 --map 嵌入同一份，不在源目录里放复制品。
 gen_static_inc() {
   ensure_gen_static_inc || return 1
   echo "[生成] src/api/static_gen.inc"
-  ./build/gen_static_inc src/api/static src/api/static_gen.inc
+  ./build/gen_static_inc src/api/static src/api/static_gen.inc \
+    --map=favicon.ico=src/launch_win.ico --map=apple-touch-icon.png=src/apple-touch-icon.png
 }
 gen_launcher_static_inc() {
   ensure_gen_static_inc || return 1
   echo "[生成] src/launcher_static_gen.inc"
-  ./build/gen_static_inc src/launcher_static src/launcher_static_gen.inc
+  ./build/gen_static_inc src/launcher_static src/launcher_static_gen.inc \
+    --map=favicon.ico=src/launch_win.ico --map=apple-touch-icon.png=src/apple-touch-icon.png
 }
 # tokenizer/chat_template 由 CLI 与服务器共用,每个目标须显式列出源文件
 # (否则 main.cpp 会与 CLI 的 main 冲突)。
