@@ -14,7 +14,7 @@
 
 const I18N = {
   zh: {
-    "app.title": "Qwen-Flash-Server 控制台",
+    "app.title": "Qwenox 控制台",
     "hint.theme": "切换明暗主题",
     "hint.style": "切换界面风格（卡带 / 打孔机 / 构成主义 / Frutiger Aero）",
     "nav.overview": "总览", "nav.usage": "用量", "nav.requests": "请求",
@@ -144,7 +144,7 @@ const I18N = {
     "cfg.dir_tag": "目录", "cfg.e_files": "文件列表加载失败：{m}",
   },
   en: {
-    "app.title": "Qwen-Flash-Server console",
+    "app.title": "Qwenox console",
     "hint.theme": "toggle light/dark theme",
     "hint.style": "switch UI style (cassette / punch card / constructivist / Frutiger Aero)",
     "nav.overview": "Overview", "nav.usage": "Usage", "nav.requests": "Requests",
