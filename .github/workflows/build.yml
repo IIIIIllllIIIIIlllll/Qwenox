@@ -277,16 +277,29 @@ jobs:
       - name: 发布到 GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          # publish job 没有 checkout，gh 需要显式仓库上下文，否则报
+          # "fatal: not a git repository"。
+          GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
+          # vX.Y.Z-preview 这类 tag 在 GitHub 上标成 pre-release，
+          # 避免抢占 stable 版本的 Latest 标记。
+          prerelease=()
+          case "$tag" in
+            *-preview*) prerelease=(--prerelease) ;;
+          esac
           ls -lh dist
           (cd dist && sha256sum *.zip *.tar.gz > SHA256SUMS)
           cat dist/SHA256SUMS
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/* --clobber
+          if gh release view "$tag" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber --repo "$GH_REPO"
+            if (( ${#prerelease[@]} )); then
+              gh release edit "$tag" --prerelease --repo "$GH_REPO"
+            fi
           else
             gh release create "$tag" dist/* --title "$tag" --generate-notes \
-              || gh release upload "$tag" dist/* --clobber
+              --repo "$GH_REPO" "${prerelease[@]}" \
+              || gh release upload "$tag" dist/* --clobber --repo "$GH_REPO"
           fi
