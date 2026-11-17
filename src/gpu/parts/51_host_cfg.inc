@@ -2721,27 +2721,41 @@ static int slot_admit(GpuModel& m, const std::vector<int>& ids, int max_tokens,
       }
       const int s = pick_slot(ids);
       if (s >= 0) {
+        // 视觉内存分两侧记账：ViT 工作区在 Windows 下由设备 arena 一次性预留
+        //（vision_arena_need），其余（嵌入行增长 + 安全余量）仍走 hipMalloc
+        //（vision_need，对 hip_free）。两侧都够才放行。
+        size_t vision_arena_need = 0;
         const size_t vision_need =
-            vision.max_p > 0 ? m.vision_memory_need(s, vision) : 0;
+            vision.max_p > 0 ? m.vision_memory_need(s, vision, &vision_arena_need) : 0;
         EngineMemStats vision_ms;
-        if (vision_need || vision_waiting) vision_ms = memstats_snapshot();
+        if (vision_need || vision_arena_need || vision_waiting) vision_ms = memstats_snapshot();
         static std::atomic<bool> test_low_fired{false};
         const char* test_low = getenv("QWENOX_VISION_TEST_LOW_ONCE");
-        if (vision_need && test_low && atoi(test_low) != 0 &&
+        if ((vision_need || vision_arena_need) && test_low && atoi(test_low) != 0 &&
             !test_low_fired.exchange(true)) {
-          vision_ms.hip_free = 0;
-          fprintf(stderr, "%s req %lld: injected low vision memory once\n", log_ts(), req);
+          // MiB 数值：把 hip_free 压到该值模拟紧张机器（1 ≈ 0，旧布尔行为）。
+          // arena 侧不压——正是要验证工作区从 arena 出。
+          const size_t floor_b = (size_t)atoi(test_low) << 20;
+          if (vision_ms.hip_free > floor_b) vision_ms.hip_free = floor_b;
+          fprintf(stderr, "%s req %lld: injected low vision memory once (hip_free=%.2f GiB)\n",
+                  log_ts(), req, vision_ms.hip_free / 1073741824.0);
         }
-        if (vision_need && vision_ms.hip_total && vision_ms.hip_free < vision_need) {
+        const size_t vision_arena_free = devarena_free_bytes();
+        if ((vision_need || vision_arena_need) && vision_ms.hip_total &&
+            (vision_ms.hip_free < vision_need ||
+             vision_arena_free < vision_arena_need)) {
           bool peers = false;
           for (size_t i = 0; i < g_slots.size(); i++)
             if ((int)i != s && g_slots[i].busy) peers = true;
           if (!peers) {
             fprintf(stderr,
-                    "%s req %lld rejected at admission: vision memory needs %.2f GiB "
-                    "(P=%d rows=%zu), only %.2f GiB free with no active peer to wait for\n",
-                    log_ts(), req, vision_need / 1073741824.0, vision.max_p,
-                    vision.rows, vision_ms.hip_free / 1073741824.0);
+                    "%s req %lld rejected at admission: vision memory needs %.2f GiB hip "
+                    "+ %.2f GiB arena (P=%d rows=%zu), only %.2f GiB hip + %.2f GiB "
+                    "arena free with no active peer to wait for\n",
+                    log_ts(), req, vision_need / 1073741824.0,
+                    vision_arena_need / 1073741824.0, vision.max_p,
+                    vision.rows, vision_ms.hip_free / 1073741824.0,
+                    vision_arena_free / 1073741824.0);
             g_wait.pop_front();
             g_scv.notify_all();
             lk.unlock();
@@ -2752,10 +2766,13 @@ static int slot_admit(GpuModel& m, const std::vector<int>& ids, int max_tokens,
             vision_waiting = true;
             vision_wait_start = std::chrono::steady_clock::now();
             fprintf(stderr,
-                    "%s req %lld waiting for vision memory: need %.2f GiB, free %.2f GiB "
+                    "%s req %lld waiting for vision memory: need %.2f GiB hip "
+                    "+ %.2f GiB arena, free %.2f GiB hip + %.2f GiB arena "
                     "(P=%d rows=%zu)\n",
                     log_ts(), req, vision_need / 1073741824.0,
-                    vision_ms.hip_free / 1073741824.0, vision.max_p, vision.rows);
+                    vision_arena_need / 1073741824.0,
+                    vision_ms.hip_free / 1073741824.0,
+                    vision_arena_free / 1073741824.0, vision.max_p, vision.rows);
           }
           // Keep the FIFO ticket, but never hold the GPU while sleeping: the
           // active peer must be able to finish and release its temporary memory.
@@ -2770,10 +2787,12 @@ static int slot_admit(GpuModel& m, const std::vector<int>& ids, int max_tokens,
                                     std::chrono::steady_clock::now() - vision_wait_start)
                                     .count();
           fprintf(stderr,
-                  "%s req %lld vision memory ready after %.1f s: need %.2f GiB, "
-                  "free %.2f GiB\n",
+                  "%s req %lld vision memory ready after %.1f s: need %.2f GiB hip "
+                  "+ %.2f GiB arena, free %.2f GiB hip + %.2f GiB arena\n",
                   log_ts(), req, waited, vision_need / 1073741824.0,
-                  vision_ms.hip_free / 1073741824.0);
+                  vision_arena_need / 1073741824.0,
+                  vision_ms.hip_free / 1073741824.0,
+                  vision_arena_free / 1073741824.0);
           vision_waiting = false;
         }
         if (m.nslots > 1 && m.kv_paged) {

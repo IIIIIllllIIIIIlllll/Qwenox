@@ -2049,10 +2049,14 @@ struct GpuModel {
 
   // Estimate the additional allocation peak for this request on candidate slot s.
   // The shared ViT workspace and per-slot embedding high-water marks are already
-  // committed and must not be charged a second time.
-  size_t vision_memory_need(int s, const VisionMemDemand& demand) const {
+  // committed and must not be charged a second time. When the device arena can
+  // hold the workspace's one-shot reservation (ensure() uses the same test),
+  // that part is charged to *arena_need instead of the returned hipMalloc peak.
+  size_t vision_memory_need(int s, const VisionMemDemand& demand,
+                            size_t* arena_need) const {
     const size_t cap_rows = s == bound_ ? img_emb_cap : slots_[(size_t)s].img_emb_cap;
-    return vision_memory_budget(vt.capP, cap_rows, demand);
+    return vision_memory_budget(vt.capP, cap_rows, demand,
+                                devarena_free_bytes(), arena_need);
   }
 
   // Run the ViT over each image's patches and build the injection map.

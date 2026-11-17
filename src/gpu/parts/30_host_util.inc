@@ -10,7 +10,9 @@
 #ifdef _WIN32
 static void* g_devarena = nullptr;
 static size_t g_devarena_sz = 0, g_devarena_off = 0;
+static std::mutex g_devarena_mu;  // ViT workspace reserves at request time
 static hipError_t dalloc_arena(void** p, size_t bytes, const char* name) {
+  std::lock_guard<std::mutex> arena_lk(g_devarena_mu);
   static const bool dbg = getenv("QWENOX_ARENA_DEBUG") != nullptr;
   size_t off = (g_devarena_off + 255) & ~(size_t)255;
   if (!g_devarena || off + bytes > g_devarena_sz) {
@@ -37,8 +39,15 @@ static hipError_t dalloc_arena(void** p, size_t bytes, const char* name) {
   return hipSuccess;
 }
 #define DALLOC(p, s) CK(dalloc_arena((void**)(p), (size_t)(s), #p))
+// 设备 arena 的剩余空间（视觉准入把 ViT 工作区记在它头上；无 arena 时恒 0，
+// 视觉预算退回纯 hipMalloc 口径）。读取不加锁：请求期只有 ViT 一次性预留
+// 会动 bump（turn 串行），此处至多读到一次预留前后的相邻值。
+static size_t devarena_free_bytes() {
+  return g_devarena ? g_devarena_sz - g_devarena_off : 0;
+}
 #else
 #define DALLOC(p, s) CK(hipMalloc(p, s))
+static size_t devarena_free_bytes() { return 0; }
 #endif
 
 // 与 devarena_estimate 共享的 maxbatch 决策。32K 是 Linux 上实测能与 68 GiB
@@ -409,10 +418,13 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
 static void devarena_init(const Checkpoint& ck, int maxctx) {
 #ifdef _WIN32
   size_t need = devarena_estimate(ck, maxctx);
-  // slack：estimate 的兜底余量。估高部分 + slack 都闲置在 arena 里；视觉塔工作区
-  // 走 arena 外 hipMalloc，吃不到这份闲置——slack 过大反而把全局 hip free 压穿
-  // （64 GiB 显存机器上 slack=4 时 free<1 GiB，视觉准入必拒）。estimate 实测偏高
-  // ~0.7 GiB，默认 2 GiB 足够；service.conf ARENA_SLACK_GB 可调。
+  // slack：estimate 的兜底余量，同时兼任 ViT 工作区预留——首张图片到来时
+  // VisionTower::ensure 从 arena 一次性预留 kVisionMaxPatches 规模的工作区
+  // （约 1.02 GiB，31_vision.inc），不再走 arena 外 hipMalloc，64 GiB 显存
+  // 机器上视觉准入不再被全局 hip free 卡死。估高部分 + slack 闲置在 arena 里，
+  // estimate 实测偏高 ~0.7 GiB，默认 2 GiB 足够覆盖估算误差 + ViT 预留；
+  // service.conf ARENA_SLACK_GB 可调（调小到 1 以下时视觉可能回退 hipMalloc
+  // 并恢复旧的 free 卡准入行为）。
   double slack_gb = 2.0, cap_gb = 95.0;  // bigalloc 实测 95 GiB 成功 / 96 失败
   if (const char* e = getenv("QWENOX_ARENA_SLACK_GB")) slack_gb = atof(e);
   if (const char* e = getenv("QWENOX_ARENA_CAP_GB")) cap_gb = atof(e);

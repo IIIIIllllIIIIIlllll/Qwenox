@@ -665,8 +665,10 @@ struct VisionTower {
   using LtKey = std::tuple<int, int, int, int, int, int, int, int, int>;
   std::map<LtKey, LtEntry> lt_cache;
 
-  // grow-only activation buffers (sized by the largest image seen)
+  // grow-only activation buffers (sized by the largest image seen; on Windows
+  // reserved one-shot at kVisionMaxPatches from the device arena, ws_arena)
   int capP = 0;
+  bool ws_arena = false;  // buffers point into g_devarena: never hipFree
   float *d_h = nullptr, *d_n = nullptr, *d_qkv = nullptr, *d_attn = nullptr,
         *d_mlp = nullptr, *d_out = nullptr;
   uint16_t *d_xbf = nullptr, *d_xlo = nullptr, *d_qb = nullptr, *d_kb = nullptr,
@@ -853,9 +855,13 @@ struct VisionTower {
   }
 
   void clear_workspace() {
+    // Arena bump allocations cannot be freed individually: with ws_arena just
+    // drop the pointers (the chunk stays reserved). Only reachable via the
+    // defensive P > kVisionMaxPatches regrow, which the API pixel cap makes
+    // unreachable today.
 #define QWENOX_VIT_FREE(p) \
     do {                   \
-      if (p) (void)hipFree(p); \
+      if (p && !ws_arena) (void)hipFree(p); \
       p = nullptr;         \
     } while (0)
     QWENOX_VIT_FREE(d_h); QWENOX_VIT_FREE(d_n); QWENOX_VIT_FREE(d_qkv);
@@ -866,47 +872,90 @@ struct VisionTower {
     QWENOX_VIT_FREE(d_idx); QWENOX_VIT_FREE(d_wts);
 #undef QWENOX_VIT_FREE
     capP = 0;
+    ws_arena = false;
   }
 
   void ensure(int P) {
     if (P <= capP) return;
-    clear_workspace();
     static std::atomic<bool> test_fired{false};
     const char* test = getenv("QWENOX_VISION_OOM_AT");
     const int fail_at = test ? atoi(test) : 0;
     int allocation_index = 0;
-    auto alloc = [&](auto* p, size_t bytes, const char* name) {
+    auto alloc = [&](auto* p, size_t bytes, const char* name, bool arena) {
       allocation_index++;
       hipError_t error = hipSuccess;
       if (fail_at == allocation_index && !test_fired.exchange(true)) {
         fprintf(stderr, "vision: injected allocation failure at %s (P=%d)\n", name, P);
         error = hipErrorMemoryAllocation;
+      } else if (arena) {
+#ifdef _WIN32
+        error = dalloc_arena((void**)p, bytes, name);
+#else
+        error = hipMalloc(p, bytes);  // 不可达：arena 一次性预留仅 Windows
+#endif
       } else {
         error = hipMalloc(p, bytes);
       }
       if (error != hipSuccess) {
         const EngineMemStats ms = memstats_snapshot();
+        // arena 失败路径：bump 分配无法退回，清空指针（块留在 arena 里），
+        // 下次 ensure 从头再来。ws_arena 已在循环前置位，clear 只清指针。
         clear_workspace();
         vision_alloc_fail(name, bytes, P, error, ms);
       }
     };
+#ifdef _WIN32
+    // Windows 设备 arena：一次性按 kVisionMaxPatches（API kMaxPixels 硬上限
+    // 2560x1440 / patch 16）预留工作区。bump 分配器无法逐个释放旧 buffer，
+    // 旧 grow-only 路径每次放大都会泄漏；一次性到位后 ensure 恒不再分配，
+    // 视觉准入的工作区部分也改记到 arena 余量头上（vision_memory.h）。
+    // arena 装不下（slack 调得太小/估算偏低）时回退旧的 grow-only hipMalloc。
+    if (!ws_arena && !d_h && P <= kVisionMaxPatches && g_devarena != nullptr &&
+        vision_workspace_bytes(kVisionMaxPatches) + kVisionWorkspaceArenaPad <=
+            g_devarena_sz - g_devarena_off) {
+      const int Pm = kVisionMaxPatches, Mm = Pm / 4;
+      ws_arena = true;  // 失败时 clear_workspace 只弃指针，不 hipFree
+      alloc(&d_h, (size_t)Pm * 1152 * 4, "d_h", true);
+      alloc(&d_n, (size_t)Pm * 1152 * 4, "d_n", true);
+      alloc(&d_qkv, (size_t)Pm * 3456 * 4, "d_qkv", true);
+      alloc(&d_attn, (size_t)Pm * 1152 * 4, "d_attn", true);
+      alloc(&d_mlp, (size_t)Pm * 4608 * 4, "d_mlp", true);
+      alloc(&d_out, (size_t)Mm * 2560 * 4, "d_out", true);
+      alloc(&d_xbf, (size_t)Pm * 4608 * 2, "d_xbf", true);
+      alloc(&d_xlo, (size_t)Pm * 4608 * 2, "d_xlo", true);
+      alloc(&d_qb, (size_t)Pm * 1152 * 2, "d_qb", true);
+      alloc(&d_kb, (size_t)Pm * 1152 * 2, "d_kb", true);
+      alloc(&d_vb, (size_t)Pm * 1152 * 2, "d_vb", true);
+      alloc(&d_emb_bf16, (size_t)Mm * 2560 * 2, "d_emb_bf16", true);
+      alloc(&d_cos, (size_t)Pm * 72 * 4, "d_cos", true);
+      alloc(&d_sin, (size_t)Pm * 72 * 4, "d_sin", true);
+      alloc(&d_idx, (size_t)Pm * 4 * 4, "d_idx", true);
+      alloc(&d_wts, (size_t)Pm * 4 * 4, "d_wts", true);
+      capP = Pm;
+      fprintf(stderr,
+              "vision: workspace %.2f GiB reserved in device arena (P<=%d)\n",
+              vision_workspace_bytes(Pm) / 1073741824.0, Pm);
+      return;
+    }
+#endif
+    clear_workspace();
     int M = P / 4;
-    alloc(&d_h, (size_t)P * 1152 * 4, "d_h");
-    alloc(&d_n, (size_t)P * 1152 * 4, "d_n");
-    alloc(&d_qkv, (size_t)P * 3456 * 4, "d_qkv");
-    alloc(&d_attn, (size_t)P * 1152 * 4, "d_attn");
-    alloc(&d_mlp, (size_t)P * 4608 * 4, "d_mlp");  // merger fc1 also needs 4608
-    alloc(&d_out, (size_t)M * 2560 * 4, "d_out");
-    alloc(&d_xbf, (size_t)P * 4608 * 2, "d_xbf");
-    alloc(&d_xlo, (size_t)P * 4608 * 2, "d_xlo");
-    alloc(&d_qb, (size_t)P * 1152 * 2, "d_qb");
-    alloc(&d_kb, (size_t)P * 1152 * 2, "d_kb");
-    alloc(&d_vb, (size_t)P * 1152 * 2, "d_vb");
-    alloc(&d_emb_bf16, (size_t)M * 2560 * 2, "d_emb_bf16");
-    alloc(&d_cos, (size_t)P * 72 * 4, "d_cos");
-    alloc(&d_sin, (size_t)P * 72 * 4, "d_sin");
-    alloc(&d_idx, (size_t)P * 4 * 4, "d_idx");
-    alloc(&d_wts, (size_t)P * 4 * 4, "d_wts");
+    alloc(&d_h, (size_t)P * 1152 * 4, "d_h", false);
+    alloc(&d_n, (size_t)P * 1152 * 4, "d_n", false);
+    alloc(&d_qkv, (size_t)P * 3456 * 4, "d_qkv", false);
+    alloc(&d_attn, (size_t)P * 1152 * 4, "d_attn", false);
+    alloc(&d_mlp, (size_t)P * 4608 * 4, "d_mlp", false);  // merger fc1 also needs 4608
+    alloc(&d_out, (size_t)M * 2560 * 4, "d_out", false);
+    alloc(&d_xbf, (size_t)P * 4608 * 2, "d_xbf", false);
+    alloc(&d_xlo, (size_t)P * 4608 * 2, "d_xlo", false);
+    alloc(&d_qb, (size_t)P * 1152 * 2, "d_qb", false);
+    alloc(&d_kb, (size_t)P * 1152 * 2, "d_kb", false);
+    alloc(&d_vb, (size_t)P * 1152 * 2, "d_vb", false);
+    alloc(&d_emb_bf16, (size_t)M * 2560 * 2, "d_emb_bf16", false);
+    alloc(&d_cos, (size_t)P * 72 * 4, "d_cos", false);
+    alloc(&d_sin, (size_t)P * 72 * 4, "d_sin", false);
+    alloc(&d_idx, (size_t)P * 4 * 4, "d_idx", false);
+    alloc(&d_wts, (size_t)P * 4 * 4, "d_wts", false);
     capP = P;
   }
 

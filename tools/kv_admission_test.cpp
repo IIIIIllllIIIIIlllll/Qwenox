@@ -39,9 +39,12 @@ struct GpuModel {
     return pages[(size_t)slot];
   }
   size_t test_vision_need = 0;
+  size_t test_vision_arena_need = 0;
   mutable std::atomic<int> vision_checks{0};
-  size_t vision_memory_need(int, const VisionMemDemand&) const {
+  size_t vision_memory_need(int, const VisionMemDemand&,
+                            size_t* arena_need) const {
     vision_checks++;
+    *arena_need = test_vision_arena_need;
     return test_vision_need;
   }
 };
@@ -50,9 +53,11 @@ struct EngineMemStats {
   uint64_t hip_free = 0, hip_total = 0;
 };
 static std::atomic<uint64_t> g_test_hip_free{0}, g_test_hip_total{0};
+static std::atomic<uint64_t> g_test_arena_free{0};
 static EngineMemStats memstats_snapshot() {
   return {g_test_hip_free.load(), g_test_hip_total.load()};
 }
+static size_t devarena_free_bytes() { return g_test_arena_free.load(); }
 
 namespace rckpt {
 static bool enabled() { return false; }
@@ -94,6 +99,7 @@ static void reset_slots(int count) {
   g_conn_id = 0;
   tl_slot = -1;
   g_test_hip_free = g_test_hip_total = (uint64_t)1 << 40;
+  g_test_arena_free = 0;
 }
 
 static void require_turn_free() {
@@ -168,6 +174,36 @@ static void test_arithmetic() {
   const VisionMemDemand huge{1, std::numeric_limits<size_t>::max()};
   require(vision_memory_budget(0, 0, huge) == std::numeric_limits<size_t>::max(),
           "vision budget overflow not saturated");
+  // Arena split (Windows): the ViT workspace's one-shot kVisionMaxPatches
+  // reservation is charged to the arena; hipMalloc keeps embeddings + safety.
+  size_t arena_need = 0;
+  const size_t ws_max = vision_workspace_bytes(kVisionMaxPatches);
+  const size_t ws_arena_fit = ws_max + kVisionWorkspaceArenaPad;
+  require(vision_memory_budget(0, 0, image, ws_arena_fit, &arena_need) ==
+              fresh_embedding + kVisionMemorySafetyBytes,
+          "arena path charges hip side with embeddings + safety only");
+  require(arena_need == ws_max,
+          "arena path charges the workspace one-shot to the arena");
+  arena_need = 0;
+  require(vision_memory_budget(0, 0, image, ws_arena_fit - 1, &arena_need) ==
+              fresh_embedding + ws_max + kVisionMemorySafetyBytes,
+          "arena too small falls back to charging hip with the workspace");
+  require(arena_need == 0, "fallback leaves arena_need at zero");
+  arena_need = 0;
+  require(vision_memory_budget(14400, 4096, image, ws_arena_fit, &arena_need) == 0,
+          "arena path also respects the committed high-water marks");
+  require(arena_need == 0, "no fresh charge once the workspace is committed");
+  arena_need = 0;
+  require(vision_memory_budget(0, 0, image, 0, &arena_need) ==
+              vision_memory_budget(0, 0, image),
+          "no arena reproduces the legacy hipMalloc-only budget");
+  require(arena_need == 0, "no arena leaves arena_need at zero");
+  const VisionMemDemand over_cap{kVisionMaxPatches + 4, 3600};
+  arena_need = 0;
+  require(vision_memory_budget(0, 0, over_cap, ws_arena_fit, &arena_need) ==
+              vision_memory_budget(0, 0, over_cap),
+          "beyond the API pixel cap never charges the arena");
+  require(arena_need == 0, "over-cap leaves arena_need at zero");
   std::puts("PASS admission arithmetic / decode cap / context edge / vision budget");
 }
 
@@ -339,6 +375,34 @@ static void test_vision_memory_queue() {
   std::puts("PASS vision memory queue / resume / cancellation / permanent failure");
 }
 
+// The ViT workspace charged to the device arena must not be held against hip
+// free (the 64 GiB APU rejection), and an arena shortfall must reject even
+// when hip free suffices.
+static void test_vision_arena_split() {
+  const VisionMemDemand image{1024, 256};
+  std::atomic<bool> cancel{false};
+  reset_slots(2);
+  GpuModel model;
+  model.test_vision_need = 100;
+  model.test_vision_arena_need = 200;
+  g_test_hip_total = 1000;
+  g_test_hip_free = 150;  // < 100+200 combined, >= hip side alone
+  g_test_arena_free = 250;
+  int r = slot_admit(model, {30}, 16, cancel, 40, image);
+  if (r >= 0) release_slot(r);
+  require(r >= 0, "arena-covered vision workspace rejected on hip free alone");
+  require_turn_free();
+
+  reset_slots(2);
+  g_test_arena_free = 150;  // < test_vision_arena_need
+  require(slot_admit(model, {20}, 16, cancel, 41, image) == -3,
+          "arena shortfall did not reject");
+  require_turn_free();
+  require(!admission_waiting(), "arena rejection left a FIFO ticket");
+  reset_slots(2);
+  std::puts("PASS vision arena/hip split admission");
+}
+
 static void test_continuation_and_single_slot() {
   reset_slots(2);
   GpuModel model;
@@ -421,6 +485,7 @@ int main() {
     test_rejection_and_context_edge();
     test_cancellation();
     test_vision_memory_queue();
+    test_vision_arena_split();
     test_continuation_and_single_slot();
     test_churn();
     std::puts("ALL PASS (KV admission host regression)");
