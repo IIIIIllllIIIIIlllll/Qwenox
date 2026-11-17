@@ -876,6 +876,9 @@ struct GpuModel {
   int64_t prog_last_est = 0;  // est tokens at the last report (interval rate)
   int64_t prog_req = -1;      // request id stamped on progress lines
   std::chrono::steady_clock::time_point prog_t0, prog_last;
+  // perfsnap（tooltip/悬浮窗）200ms 节奏，与 1s stderr 日志行解耦
+  std::chrono::steady_clock::time_point prog_snap_last;
+  int64_t prog_snap_last_est = 0;
   hipEvent_t prog_ev[64] = {};  // per-layer completion probes (DisableTiming)
   int live_spec_rounds = 0;
   int live_spec_commits = 0;
@@ -973,7 +976,7 @@ struct GpuModel {
   X(mtp_tap_capture) X(spec_snap) X(vsnap_row0_) X(ngram_verify_active)       \
   X(cut_abs) X(cut_r_) X(cut_hit) X(cut_mtp_hit) X(d_mR)                      \
   X(prog_total) X(prog_base) X(prog_last_est) X(prog_req) X(prog_t0) X(pf_end) \
-  X(prog_last) X(last_spec_rounds) X(last_spec_commit) X(last_spec_rollbacks) \
+  X(prog_last) X(prog_snap_last) X(prog_snap_last_est) X(last_spec_rounds) X(last_spec_commit) X(last_spec_rollbacks) \
   X(last_spec_proposed) X(last_ng_rounds) X(last_ng_proposed)                \
   X(last_ng_accepted) X(live_spec_rounds) X(live_spec_commits)                \
   X(live_spec_proposed) X(g1_exec) X(g2_exec)                                 \
@@ -7401,15 +7404,18 @@ struct GpuModel {
   // Chunked prefill: prompts longer than maxbatch are processed in
   // maxbatch-token continuations (the same path KV reuse uses), so batch
   // workspace stays chunk-sized regardless of maxctx.
-  // 1s-cadence prefill progress: record a completion probe after layer l's
-  // enqueue, and once a second report the highest COMPLETED layer as an
-  // estimated token count. hipEventQuery is non-blocking (hipErrorNotReady
-  // is the expected answer for in-flight layers), so this never serializes
-  // the pipeline the way the QWENOX_PHASE sync profiling does.
+  // Prefill progress: record a completion probe after layer l's enqueue, and
+  // report the highest COMPLETED layer as an estimated token count — stderr
+  // log keeps the 1s cadence while perfsnap (tray tooltip / overlay) writes
+  // at 200ms, so sub-second prefills still leave a snapshot. hipEventQuery
+  // is non-blocking (hipErrorNotReady is the expected answer for in-flight
+  // layers), so this never serializes the pipeline the way the
+  // QWENOX_PHASE sync profiling does.
   void prog_print(int P) {
     auto now = std::chrono::steady_clock::now();
-    double iv = std::chrono::duration<double>(now - prog_last).count();
-    if (iv < 1.0) return;
+    const double siv = std::chrono::duration<double>(now - prog_snap_last).count();
+    const double iv = std::chrono::duration<double>(now - prog_last).count();
+    if (siv < 0.2 && iv < 1.0) return;
     int done = -1;
     for (int k = g_cfg.layers - 1; k >= 0; --k)
       if (prog_ev[k] && hipEventQuery(prog_ev[k]) == hipSuccess) {
@@ -7420,17 +7426,23 @@ struct GpuModel {
     double frac = double(done + 1) / g_cfg.layers;
     int64_t est = prog_base + (int64_t)(P * frac);
     double el = std::chrono::duration<double>(now - prog_t0).count();
-    fprintf(stderr,
-            "%s req %lld | prompt processing | n_tokens = %lld/%d (%.0f%%) "
-            "| t = %.1f s | %.0f tok/s (avg %.0f)\n",
-            log_ts(), (long long)prog_req, (long long)est, prog_total,
-            100.0 * est / prog_total, el, (est - prog_last_est) / iv,
-            el > 0 ? est / el : 0.0);
-    perfsnap::write_prefill((uint64_t)prog_req, (est - prog_last_est) / iv,
-                            (uint64_t)est, (uint64_t)prog_total);
-    crashdiag::note("req %lld prefill %lld/%d", (long long)prog_req, (long long)est, prog_total);
-    prog_last = now;
-    prog_last_est = est;
+    if (siv >= 0.2) {
+      perfsnap::write_prefill((uint64_t)prog_req, (est - prog_snap_last_est) / siv,
+                              (uint64_t)est, (uint64_t)prog_total);
+      prog_snap_last = now;
+      prog_snap_last_est = est;
+    }
+    if (iv >= 1.0) {
+      fprintf(stderr,
+              "%s req %lld | prompt processing | n_tokens = %lld/%d (%.0f%%) "
+              "| t = %.1f s | %.0f tok/s (avg %.0f)\n",
+              log_ts(), (long long)prog_req, (long long)est, prog_total,
+              100.0 * est / prog_total, el, (est - prog_last_est) / iv,
+              el > 0 ? est / el : 0.0);
+      crashdiag::note("req %lld prefill %lld/%d", (long long)prog_req, (long long)est, prog_total);
+      prog_last = now;
+      prog_last_est = est;
+    }
   }
   void prog_probe(int l, int P) {
     if (l < 0 || l >= 64) return;

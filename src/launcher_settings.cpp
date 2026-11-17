@@ -718,7 +718,8 @@ void monitor_windows(uint64_t gen, int64_t spawn_deadline) {
     bool start_posted = false;
     int api_fail = 0;
     for (;;) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        // 200ms 轮询周期：状态机迁移之外还喂悬浮窗/tooltip 的 SNAP 采集
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
         {
             std::lock_guard<std::mutex> lk(g_mtx);
             if (gen != g_gen || g_svc.state == "idle") return;
@@ -2668,7 +2669,7 @@ bool tray_init() {
     g_nid.uVersion = NOTIFYICON_VERSION_4;
     Shell_NotifyIconW(NIM_SETVERSION, &g_nid);
     g_tray_state = "idle";
-    SetTimer(g_tray_hwnd, kTimerStatus, 2000, nullptr);
+    SetTimer(g_tray_hwnd, kTimerStatus, 200, nullptr);  // 悬浮窗/tooltip 200ms 刷新
     return true;
 }
 #endif  // _WIN32

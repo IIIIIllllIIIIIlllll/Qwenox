@@ -3842,6 +3842,8 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     m.prog_last_est = 0;
     m.prog_req = g.req;
     m.prog_t0 = m.prog_last = std::chrono::steady_clock::now();
+    m.prog_snap_last = m.prog_t0;
+    m.prog_snap_last_est = 0;
     crashdiag::note("req %lld prefill %zu..%zu (cached %d, %s, spec %d chain %d df2 %d, cuts %zu)",
                     (long long)g.req, done_upto, g.ids.size(), n_cached, cont ? "cont" : "fresh",
                     (int)use_spec, (int)chain_mtp, (int)use_df2, cuts.size());
@@ -3946,14 +3948,29 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     // with the live MTP acceptance the spec loops bump every round.
     // committed drafts = commits - rounds (each round also emits the
     // verify/bonus token), acceptance = committed / proposed.
+    // perfsnap（托盘 tooltip / 悬浮窗）走独立的 200ms 节奏：不满 1s 的短
+    // 请求在首个日志点之前结束，快照照样有数据；stderr 日志维持 1s。
     auto dl_t0 = std::chrono::steady_clock::now();
     auto dl_last = dl_t0;
     int dl_last_ngen = 0;
+    auto dl_snap_last = dl_t0;
+    int dl_snap_last_ngen = 0;
     auto dl_tick = [&]() {
       auto now = std::chrono::steady_clock::now();
+      const double el = std::chrono::duration<double>(now - dl_t0).count();
+      const double siv = std::chrono::duration<double>(now - dl_snap_last).count();
+      if (siv >= 0.2) {
+        perfsnap::write_decode((uint64_t)g.req, (ngen - dl_snap_last_ngen) / siv,
+                               el > 0 ? ngen / el : 0.0,
+                               m.live_spec_rounds > 0 && m.live_spec_proposed
+                                   ? 100.0 * (m.live_spec_commits - m.live_spec_rounds) /
+                                         (double)m.live_spec_proposed
+                                   : -1.0);
+        dl_snap_last = now;
+        dl_snap_last_ngen = ngen;
+      }
       double iv = std::chrono::duration<double>(now - dl_last).count();
       if (iv < 1.0) return;
-      double el = std::chrono::duration<double>(now - dl_t0).count();
       if (m.live_spec_rounds > 0) {
         int acc_n = m.live_spec_commits - m.live_spec_rounds;
         fprintf(stderr,
@@ -3972,12 +3989,6 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
                 log_ts(), (long long)g.req, ngen, el,
                 (ngen - dl_last_ngen) / iv, el > 0 ? ngen / el : 0.0);
       }
-      perfsnap::write_decode((uint64_t)g.req, (ngen - dl_last_ngen) / iv,
-                             el > 0 ? ngen / el : 0.0,
-                             m.live_spec_rounds > 0 && m.live_spec_proposed
-                                 ? 100.0 * (m.live_spec_commits - m.live_spec_rounds) /
-                                       (double)m.live_spec_proposed
-                                 : -1.0);
       dl_last = now;
       dl_last_ngen = ngen;
       crashdiag::note("req %lld decode n=%d pos=%d rounds=%d", (long long)g.req, ngen, m.pos,

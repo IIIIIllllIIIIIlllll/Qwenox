@@ -1,5 +1,6 @@
 // perfsnap.h — 引擎内实时性能快照（dev-docs/HANDOFF-PERFSNAP.md）。
-// dl_tick / prog_print 每秒写一次最近一次/进行中请求的 pp、tg、接受率；
+// dl_tick / prog_print 每 200ms 写一次最近一次/进行中请求的 pp、tg、接受率
+// （与 1s 的 stderr 统计行解耦）；
 // 行协议的 SNAP 动词把它吐给托盘轮询（127.0.0.1，无磁盘 IO、无日志解析）。
 // 多 conn 线程并发写由互斥串行化，last-writer-wins（tooltip 不需要精确
 // 多请求归属）；TTL 由读端判：ts_ms 超过 6s 未更新视为过期。
