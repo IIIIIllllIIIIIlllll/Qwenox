@@ -1,13 +1,10 @@
 name: build-win-linux
 
 # Windows 与 Linux 同源码、同 GPU 目标（gfx1151）编译。
-# - push main / 手动触发：只产出可下载的构建产物
-# - push v* tag：额外把两个平台包发到同名 GitHub Release
+# 只在 push v* tag（发版）时触发；main 提交和普通 push 不构建。
 on:
   push:
-    branches: [main]
     tags: ['v*']
-  workflow_dispatch:
 
 permissions:
   contents: read
