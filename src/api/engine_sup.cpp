@@ -597,12 +597,22 @@ bool start(const std::string& root, const svcconf::Conf& conf, std::string* err)
             li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
             if (!SetInformationJobObject(g_job, JobObjectExtendedLimitInformation, &li,
                                          sizeof(li))) {
+                fprintf(stderr,
+                        "qwenox-api: WARNING: SetInformationJobObject failed, error %lu;"
+                        " engine will NOT follow API exit\n", GetLastError());
                 CloseHandle(g_job);
                 g_job = nullptr;
             }
+        } else {
+            fprintf(stderr,
+                    "qwenox-api: WARNING: CreateJobObject failed, error %lu;"
+                    " engine will NOT follow API exit\n", GetLastError());
         }
     }
-    if (g_job) AssignProcessToJobObject(g_job, pi.hProcess);  // 失败也不影响运行
+    if (g_job && !AssignProcessToJobObject(g_job, pi.hProcess))
+        fprintf(stderr,
+                "qwenox-api: WARNING: AssignProcessToJobObject(engine) failed, error %lu;"
+                " engine will NOT follow API exit\n", GetLastError());
     if (affinity && !SetProcessAffinityMask(pi.hProcess, affinity))
         fprintf(stderr, "qwenox-api: WARNING: SetProcessAffinityMask(engine)"
                         " failed, error %lu\n", GetLastError());
@@ -646,7 +656,14 @@ bool stop(std::string* err) {
         return false;
     }
     g_stopping = true;
-    TerminateProcess(g_proc, 1);  // 锁内终止：避免与监管线程的 CloseHandle 竞态
+    if (!TerminateProcess(g_proc, 1)) {  // 锁内终止：避免与监管线程的 CloseHandle 竞态
+        const DWORD e = GetLastError();
+        g_stopping = false;
+        fprintf(stderr, "qwenox-api: TerminateProcess(engine pid %d) failed, error %lu\n",
+                g_st.pid, e);
+        *err = "TerminateProcess(engine) failed, error " + std::to_string(e);
+        return false;
+    }
     return true;                  // 状态由监管线程翻转为 stopped（前端轮询可见）
 #else
     *err = "engine start/stop is only supported on Windows";

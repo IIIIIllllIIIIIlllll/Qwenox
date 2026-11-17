@@ -9,9 +9,14 @@
 //
 // 拉起语义（与平台现有架构一致，不复制启动逻辑）：
 //   Windows：spawn build\qwenox-win.exe（托盘 API），等 API 端口就绪后经
-//             POST /admin/engine/start 让它自己拉引擎；停止 = POST stop +
-//             结束本进程拉起的 API（其 Job 对象会带走引擎）。已在外部运行的
-//             API/引擎会被识别为 external：引擎可停（若非外部启动），API 不动。
+//             POST /admin/engine/start 让它自己拉引擎。API 进程一律纳入
+//             KILL_ON_JOB_CLOSE Job：launcher 以任何形式退出（含被杀/崩溃），
+//             内核都会带走 API，API 自己的 Job 再带走引擎——服务生命期
+//             恒等于 launcher 生命期，优雅停止失效时也不会残留。
+//             已在运行的 API 会被接管并按其自报的 api_pid 同样绑定 Job
+//             （旧版 API 无此字段时降级为只停引擎）；停止 = POST stop（重试
+//             3 轮）+ 结束 API + 按 pid/映像名兜底清扫。引擎外部启动
+//             （external）时不碰。
 //   Linux  ：fork+setsid 跑 bash start_hgn.sh / start_gguf.sh（按
 //             "# start_win: weights=" 标记选择），脚本的 EXIT trap 负责清理；
 //             停止 = 给脚本进程组发 SIGTERM。launcher 重启后凭
@@ -539,6 +544,7 @@ struct Svc {
     bool api_up = false;
     bool api_external = false;  // 不是本进程拉起的（launcher 重启后接管也算）
     int api_pid = 0;
+    int api_pid_seen = 0;  // API 自报的 pid（status 的 api_pid 字段；0 = 旧版无此字段）
 #ifdef _WIN32
     HANDLE api_proc = nullptr;
 #else
@@ -549,6 +555,10 @@ struct Svc {
 std::mutex g_mtx;
 Svc g_svc;
 uint64_t g_gen = 0;  // 每次状态机复位自增：让旧监视线程退出
+#ifdef _WIN32
+HANDLE g_api_job = nullptr;   // KILL_ON_JOB_CLOSE：launcher 退出（含被杀）内核带走 API
+std::mutex g_api_job_mtx;     // job_bind_api 惰性创建的并发保护
+#endif
 
 std::string api_connect_host() {
     std::lock_guard<std::mutex> lk(g_conf_mtx);
@@ -602,7 +612,101 @@ bool poll_engine_from_api() {
     g_svc.eng_log = j.value("log", "");
     g_svc.eng_detail = j.value("detail", "");
     g_svc.eng_diag = j.value("diag", "");
+    g_svc.api_pid_seen = j.value("api_pid", 0);
     return true;
+}
+#endif  // _WIN32
+
+#ifdef _WIN32
+// 把 API 进程句柄纳入 KILL_ON_JOB_CLOSE Job：launcher 以任何形式退出
+// （含任务管理器强杀、崩溃），内核都会终止 API；API 自己的 Job 再带走引擎。
+// 这是"退出不残留"的内核级兜底，正常退出仍走 do_stop_windows 的优雅流程。
+void job_bind_api(HANDLE proc, int pid) {
+    {
+        std::lock_guard<std::mutex> lk(g_api_job_mtx);
+        if (!g_api_job) {
+            g_api_job = CreateJobObjectA(nullptr, nullptr);
+            if (g_api_job) {
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+                li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                if (!SetInformationJobObject(g_api_job, JobObjectExtendedLimitInformation,
+                                             &li, sizeof(li))) {
+                    const DWORD e = GetLastError();
+                    CloseHandle(g_api_job);
+                    g_api_job = nullptr;
+                    log_event("警告：Job 设置 KILL_ON_JOB_CLOSE 失败（error " +
+                              std::to_string(e) + "），API 将不随 launcher 退出");
+                }
+            } else {
+                log_event("警告：CreateJobObject 失败（error " +
+                          std::to_string(GetLastError()) + "），API 将不随 launcher 退出");
+            }
+        }
+    }
+    if (!g_api_job) return;
+    if (!AssignProcessToJobObject(g_api_job, proc))
+        log_event("警告：API（pid " + std::to_string(pid) + "）绑定 Job 失败（error " +
+                  std::to_string(GetLastError()) + "），它将不随 launcher 退出");
+}
+
+// 接管已在运行的 API：按其自报 pid 拿句柄 + 绑 Job，使其与 owned 一样
+// "随 launcher 退出"。失败仅降级为旧行为（退出时不杀），日志可见。
+void adopt_api_bind(int pid) {
+    if (pid <= 0) {
+        log_event("警告：API 未报告自身 pid（旧版本？），接管的 API 无法绑定退出联动");
+        return;
+    }
+    HANDLE h = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE | SYNCHRONIZE |
+                               PROCESS_QUERY_LIMITED_INFORMATION,
+                           FALSE, static_cast<DWORD>(pid));
+    if (!h) {
+        log_event("警告：OpenProcess(API pid " + std::to_string(pid) + ") 失败（error " +
+                  std::to_string(GetLastError()) + "），接管的 API 不随 launcher 退出");
+        return;
+    }
+    job_bind_api(h, pid);
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        g_svc.api_proc = h;
+        g_svc.api_pid = pid;
+    }
+    log_event("接管的 API（pid " + std::to_string(pid) + "）已绑定退出联动 Job");
+}
+
+// 停止/退出兜底：已知 pid 若还活着且映像名匹配我们的二进制，直接补杀。
+// 覆盖"优雅停止流程静默失效"的残留场景；pid 被无关进程复用时按映像名跳过。
+void sweep_kill_pid(int pid, const wchar_t* expect_exe, const char* what) {
+    if (pid <= 0) return;
+    HANDLE h = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION |
+                               SYNCHRONIZE,
+                           FALSE, static_cast<DWORD>(pid));
+    if (!h) return;  // 已退出
+    wchar_t path[MAX_PATH];
+    DWORD n = MAX_PATH;
+    if (QueryFullProcessImageNameW(h, 0, path, &n)) {
+        const wchar_t* base = wcsrchr(path, L'\\');
+        base = base ? base + 1 : path;
+        if (_wcsicmp(base, expect_exe) != 0) {
+            CloseHandle(h);
+            return;  // pid 已被无关进程复用
+        }
+    }
+    log_event(std::string("兜底清扫：") + what + "（pid " + std::to_string(pid) +
+              "）在优雅停止后仍在运行，强制结束");
+    if (!TerminateProcess(h, 0)) {
+        const DWORD e = GetLastError();
+        if (e == ERROR_ACCESS_DENIED) {
+            // 进程已在退出中（主流程的 TerminateProcess 已生效），等它走完
+            if (WaitForSingleObject(h, 3000) == WAIT_OBJECT_0) {
+                CloseHandle(h);
+                return;
+            }
+        }
+        log_event(std::string("兜底清扫失败：") + what + "（pid " + std::to_string(pid) +
+                  "），TerminateProcess error " + std::to_string(e));
+    }
+    WaitForSingleObject(h, 3000);
+    CloseHandle(h);
 }
 #endif  // _WIN32
 
@@ -781,11 +885,16 @@ void do_start_windows(uint64_t gen) {
         return;
     }
 
-    // API 已在运行（外部启动/上次残留）？直接复用，不再 spawn。
+    // API 已在运行（外部启动/上次残留）？直接接管，不再 spawn。
     if (poll_engine_from_api()) {
-        std::lock_guard<std::mutex> lk(g_mtx);
-        g_svc.api_external = true;
+        int apid = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_mtx);
+            g_svc.api_external = true;
+            apid = g_svc.api_pid_seen;
+        }
         log_event("检测到已在运行的 API（外部启动），直接接管控制");
+        adopt_api_bind(apid);  // 接管的 API 同样随 launcher 退出
     } else {
         long ep = 8731;
         svcconf::parse_int(svcconf::cfg(conf, "API_PORT", "8731"), &ep);
@@ -808,7 +917,9 @@ void do_start_windows(uint64_t gen) {
             return;
         }
         CloseHandle(pi.hThread);
+        job_bind_api(pi.hProcess, static_cast<int>(pi.dwProcessId));
         std::lock_guard<std::mutex> lk(g_mtx);
+        if (g_svc.api_proc) CloseHandle(g_svc.api_proc);  // 上轮已死 API 的滞留句柄
         g_svc.api_proc = pi.hProcess;
         g_svc.api_pid = static_cast<int>(pi.dwProcessId);
         g_svc.api_external = false;
@@ -828,43 +939,67 @@ void do_stop_windows() {
             return;  // 路由层已挡，双保险
         }
     }
-    bool ours = false;
-    {
-        std::lock_guard<std::mutex> lk(g_mtx);
-        ours = g_svc.api_proc != nullptr;
-    }
-    // 先停引擎（API 可达时）
-    if (poll_engine_from_api()) {
-        http_call("POST", api_connect_host(), api_port(), "/admin/engine/stop", "{}",
-                  10000);
-        const int64_t deadline = time(nullptr) + 20;
-        while (time(nullptr) < deadline) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            if (!poll_engine_from_api()) break;
+    // 先停引擎：POST /admin/engine/stop + 轮询确认，最多 3 轮；poll 失败也重试，
+    // 不再因单次探测失败就整体跳过（静默跳过 = 服务残留）。
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        if (!poll_engine_from_api()) {
+            if (attempt < 2) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(600));
+                continue;
+            }
+            log_event("警告：API 连续不可达，跳过 HTTP 停止流程（句柄/Job/清扫兜底）");
+            break;
+        }
+        {
             std::lock_guard<std::mutex> lk(g_mtx);
             if (g_svc.eng_state == "stopped" || g_svc.eng_state == "exited") break;
         }
-    }
-    // 我们拉起的 API 一并结束（其 Job 对象确保引擎不残留）
-    if (ours) {
-        HANDLE h = nullptr;
+        http_call("POST", api_connect_host(), api_port(), "/admin/engine/stop", "{}",
+                  10000);
+        const int64_t deadline = time(nullptr) + 20;
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            if (!poll_engine_from_api()) break;  // API 没了：其 Job 会带走引擎
+            std::lock_guard<std::mutex> lk(g_mtx);
+            if (g_svc.eng_state == "stopped" || g_svc.eng_state == "exited") break;
+            if (time(nullptr) >= deadline) break;
+        }
         {
             std::lock_guard<std::mutex> lk(g_mtx);
-            h = g_svc.api_proc;
+            if (g_svc.eng_state == "stopped" || g_svc.eng_state == "exited") break;
         }
-        if (h) {
-            TerminateProcess(h, 0);
-            WaitForSingleObject(h, 5000);
-            CloseHandle(h);
-        }
+        if (attempt < 2)
+            log_event("引擎停止未确认（第 " + std::to_string(attempt + 1) + " 轮），重试");
+    }
+    // 结束 API（owned 与接管绑定的统一走这里）。锁内取走句柄并置空：
+    // monitor 线程不会再看到它，杜绝两边对同一值 CloseHandle 的竞态。
+    HANDLE h = nullptr;
+    int api_pid = 0, eng_pid = 0;
+    {
         std::lock_guard<std::mutex> lk(g_mtx);
+        h = g_svc.api_proc;
+        api_pid = g_svc.api_pid;
+        eng_pid = g_svc.eng_pid;
         g_svc.api_proc = nullptr;
         g_svc.api_pid = 0;
         g_svc.api_up = false;
     }
-    std::lock_guard<std::mutex> lk(g_mtx);
-    g_svc.eng_state = "stopped";
-    set_state_locked("idle", "");
+    if (h) {
+        if (!TerminateProcess(h, 0))
+            log_event("警告：TerminateProcess(API pid " + std::to_string(api_pid) +
+                      ") 失败，error " + std::to_string(GetLastError()));
+        WaitForSingleObject(h, 5000);
+        CloseHandle(h);
+    }
+    // 兜底清扫：优雅流程静默失效（句柄失效/内核级 teardown 卡死之外的一切）
+    // 时按 pid+映像名补杀；已退出的 pid 是 OpenProcess 都拿不到的 no-op。
+    sweep_kill_pid(api_pid, L"qwenox-win.exe", "API");
+    sweep_kill_pid(eng_pid, L"qwenox-engine-win.exe", "引擎");
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        g_svc.eng_state = "stopped";
+        set_state_locked("idle", "");
+    }
     log_event("已停止");
 }
 
@@ -2628,19 +2763,24 @@ int main(int argc, char** argv) {
     // 启动时接管已在运行的服务（Linux：pidfile；Windows：探测 API）
 #ifdef _WIN32
     if (poll_engine_from_api()) {
-        std::lock_guard<std::mutex> lk(g_mtx);
-        g_svc.api_external = true;  // 不是本进程拉起的，退出时不结束它
-        const std::string es = g_svc.eng_state;
-        if (es == "running") {
-            set_state_locked("running", "接管了已在运行的服务");
-        } else if (es == "starting") {
-            set_state_locked("waiting_engine", "接管了正在启动的服务");
+        int apid = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_mtx);
+            g_svc.api_external = true;  // 不是本进程拉起的，但同样绑定 Job 随 launcher 退出
+            apid = g_svc.api_pid_seen;
+            const std::string es = g_svc.eng_state;
+            if (es == "running") {
+                set_state_locked("running", "接管了已在运行的服务");
+            } else if (es == "starting") {
+                set_state_locked("waiting_engine", "接管了正在启动的服务");
+            }
+            if (state_active(g_svc.state)) {
+                log_event("检测到已在运行的 API/引擎，接管监控");
+                const uint64_t gen = g_gen;
+                std::thread(monitor_windows, gen, time(nullptr) + 90).detach();
+            }
         }
-        if (state_active(g_svc.state)) {
-            log_event("检测到已在运行的 API/引擎，接管监控");
-            const uint64_t gen = g_gen;
-            std::thread(monitor_windows, gen, time(nullptr) + 90).detach();
-        }
+        adopt_api_bind(apid);  // 锁外：OpenProcess + AssignProcessToJobObject
     }
 #else
     if (FILE* f = fopen(pidfile_path().c_str(), "rb")) {

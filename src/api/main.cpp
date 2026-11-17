@@ -1764,6 +1764,15 @@ json engine_status_json() {
     json j;
     j["state"] = st.state;
     j["pid"] = st.pid;
+    // API 自身 pid：launcher 重启接管时凭它 OpenProcess 绑定 Job（旧版无此字段，
+    // 对端按 0 降级处理）
+    j["api_pid"] = static_cast<int>(
+#ifdef _WIN32
+            GetCurrentProcessId()
+#else
+            getpid()
+#endif
+    );
     j["exit_code"] = st.exit_code;
     j["log"] = st.log;
     j["external"] = st.external;
