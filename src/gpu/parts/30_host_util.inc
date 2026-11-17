@@ -409,7 +409,11 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
 static void devarena_init(const Checkpoint& ck, int maxctx) {
 #ifdef _WIN32
   size_t need = devarena_estimate(ck, maxctx);
-  double slack_gb = 4.0, cap_gb = 95.0;  // bigalloc 实测 95 GiB 成功 / 96 失败
+  // slack：estimate 的兜底余量。估高部分 + slack 都闲置在 arena 里；视觉塔工作区
+  // 走 arena 外 hipMalloc，吃不到这份闲置——slack 过大反而把全局 hip free 压穿
+  // （64 GiB 显存机器上 slack=4 时 free<1 GiB，视觉准入必拒）。estimate 实测偏高
+  // ~0.7 GiB，默认 2 GiB 足够；service.conf ARENA_SLACK_GB 可调。
+  double slack_gb = 2.0, cap_gb = 95.0;  // bigalloc 实测 95 GiB 成功 / 96 失败
   if (const char* e = getenv("QWENOX_ARENA_SLACK_GB")) slack_gb = atof(e);
   if (const char* e = getenv("QWENOX_ARENA_CAP_GB")) cap_gb = atof(e);
   size_t target = need + (size_t)(slack_gb * 1073741824.0);

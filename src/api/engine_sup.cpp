@@ -486,6 +486,10 @@ bool start(const std::string& root, const svcconf::Conf& conf, std::string* err)
             SetEnvironmentVariableA("QWENOX_KVSNAP_DIR", (kd + "\\qwenox-kvsnap").c_str());
     }
     SetEnvironmentVariableA("QWENOX_RCKPT_MAX", std::to_string(rckpt_max).c_str());
+    // 设备 arena 余量（service.conf ARENA_SLACK_GB，仅 Windows 引擎使用；
+    // 默认 2 GiB）。视觉塔工作区在 arena 外分配，slack 过大反而挤死视觉。
+    SetEnvironmentVariableA("QWENOX_ARENA_SLACK_GB",
+                            svcconf::cfg(conf, "ARENA_SLACK_GB", "2").c_str());
     // 0 = 引擎按模式自选：不设（并删掉外部残留）
     SetEnvironmentVariableA("QWENOX_SPEC_GAMMA",
                             mtp_gamma ? std::to_string(mtp_gamma).c_str() : nullptr);

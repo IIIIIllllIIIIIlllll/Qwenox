@@ -375,6 +375,12 @@ inline bool validate_conf(const Conf& conf, std::string* err) {
                " tokens exceeds the 512K (524288) limit";
         return false;
     }
+    double arena_slack;
+    if (!parse_double(cfg(conf, "ARENA_SLACK_GB", "2"), &arena_slack) ||
+        arena_slack < 0 || arena_slack > 32) {
+        *err = "ARENA_SLACK_GB must be a number in [0, 32]";
+        return false;
+    }
     double rope_factor, rope_fast, rope_slow;
     if (!parse_double(cfg(conf, "ROPE_FACTOR", "1"), &rope_factor)) {
         *err = "ROPE_FACTOR must be a non-negative number";
