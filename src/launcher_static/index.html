@@ -95,11 +95,7 @@ aside{flex:0 0 250px;display:flex;flex-direction:column;min-height:0;
 .pitem.unsaved{border:1px dashed var(--line2)}
 .pitem.unsaved .pname{color:var(--dim)}
 .pempty{color:var(--dim);font-size:12.5px;padding:8px 10px}
-.side-art{flex:0 0 auto;display:flex;justify-content:center;pointer-events:none;
-  max-height:240px;overflow:hidden}
-.side-art img{width:170px;opacity:.9;filter:drop-shadow(0 0 16px rgba(60,80,160,.45))}
 .side-foot{padding:8px 12px 12px;border-top:1px solid var(--line);display:flex;justify-content:center}
-@media(max-height:760px){.side-art{display:none}}
 
 /* ---- 页签 ---- */
 .tabs{display:flex;gap:2px;padding:10px 14px 0;border-bottom:1px solid var(--line);flex:0 0 auto}
@@ -252,7 +248,6 @@ pre#log{background:var(--card2);border:1px solid var(--line);border-radius:8px;
 @media(max-width:820px){
   main{flex-direction:column;overflow-y:auto}
   aside{flex:0 0 auto;max-height:220px}
-  .side-art{display:none}
   .work{flex:1 0 520px}
   .frow{grid-template-columns:1fr}
   .flab{display:flex;gap:8px;align-items:baseline;padding-top:0}
@@ -279,7 +274,6 @@ pre#log{background:var(--card2);border:1px solid var(--line);border-radius:8px;
       <button class="btn ghost mini" id="btnNew" data-i18n="new_pf">＋ 新建</button>
     </div>
     <div class="plist" id="plist"></div>
-    <div class="side-art"><img src="/media/qwen-charactor-alpha.png" alt=""></div>
     <div class="side-foot"><button class="btn ghost mini" id="btnQuit" data-i18n="quit">退出启动器</button></div>
   </aside>
   <section class="work">
