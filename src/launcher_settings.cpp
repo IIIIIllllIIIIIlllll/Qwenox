@@ -191,7 +191,7 @@ const std::pair<const char*, const char*> kDefaults[] = {
     {"ENGINE_HOST", "127.0.0.1"}, {"ENGINE_PORT", "8730"},
     {"API_HOST", "0.0.0.0"}, {"API_PORT", "8731"},
     {"MAX_CONTEXT", "262144"}, {"PARALLEL", "4"},
-    {"KV_PAGED", "1"}, {"KV_POOL_TOKENS", "0"},
+    {"KV_PAGED", "1"}, {"KV_POOL_TOKENS", "0"}, {"KV_TYPE", "bf16"},
     {"PREFILL_CHUNK", "0"}, {"CONC_PREFILL_CHUNK", "8192"},
     {"ROPE_FACTOR", "1"}, {"QSA_INDEXER_BUDGET", "0"},
     {"KVSNAP_MAX_GB", "20"}, {"KVSNAP_DIR", ""}, {"RCKPT_MAX", "8"},
@@ -1268,7 +1268,7 @@ const char* kProfileKeys[] = {
     "MODEL_FILE", "NGRAM_FILE", "OVERLAY_FILE", "MTP_FILE", "VISION_FILE",
     "GGUF_FILE", "GGUF_MTP_FILE", "GGUF_VISION_FILE", "GGUF_PLE_FILE", "TOKENIZER_DIR",
     // 推理设置
-    "MAX_CONTEXT", "PARALLEL", "KV_PAGED", "KV_POOL_TOKENS", "PREFILL_CHUNK",
+    "MAX_CONTEXT", "PARALLEL", "KV_PAGED", "KV_POOL_TOKENS", "KV_TYPE", "PREFILL_CHUNK",
     "CONC_PREFILL_CHUNK", "QSA_INDEXER_BUDGET", "KVSNAP_MAX_GB", "KVSNAP_DIR",
     "MOE_A4", "MAX_IMAGES", "VIZ", "AFFINITY", "PLE_URING", "MEMORY_CAP_GB",
     "MIN_AVAILABLE_GB", "START_TIMEOUT", "STALL_TIMEOUT",
@@ -1642,6 +1642,11 @@ bool extra_validate(const svcconf::Conf& conf, std::string* err) {
     const std::string qsa = svcconf::cfg(conf, "QSA_INDEXER_BUDGET", "0");
     if (qsa != "0" && qsa != "4096") {
         *err = "QSA_INDEXER_BUDGET must be 0 or 4096";
+        return false;
+    }
+    const std::string kvt = svcconf::cfg(conf, "KV_TYPE", "bf16");
+    if (kvt != "bf16" && kvt != "q8") {
+        *err = "KV_TYPE must be bf16 or q8";
         return false;
     }
     if (!int_range("MTP_GAMMA", "0", 0, 8)) return false;

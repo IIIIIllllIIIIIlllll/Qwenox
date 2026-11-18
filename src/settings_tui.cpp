@@ -593,6 +593,10 @@ const std::vector<Field>& field_specs() {
          FieldKind::kText, FieldGroup::kAlways, {}},
         {1, "KV_PAGED", "分页 KV", "并发模式必须开启",
          "Paged KV", "Required for parallel mode", FieldKind::kBool, FieldGroup::kAlways, {}},
+        {1, "KV_TYPE", "KV 缓存类型", "bf16 精度无损；q8 省约一半 KV 显存、精度略降",
+         "KV cache type", "bf16 = lossless; q8 ≈ half KV memory, slightly less precise",
+         FieldKind::kChoice, FieldGroup::kAlways,
+         {{"bf16", "bf16（默认）", "bf16 (default)"}, {"q8", "q8（省显存）", "q8 (saves memory)"}}},
         {1, "PREFILL_CHUNK", "prefill 分段", "0：Linux 默认 16384，Windows 默认 6144",
          "Prefill chunk", "0: Linux default 16384, Windows default 6144",
          FieldKind::kText, FieldGroup::kAlways, {}},
@@ -726,6 +730,7 @@ struct Model {
         values["PARALLEL"] = svcconf::cfg(conf, "PARALLEL", "1");
         values["KV_POOL_TOKENS"] = svcconf::cfg(conf, "KV_POOL_TOKENS", "0");
         values["KV_PAGED"] = svcconf::cfg(conf, "KV_PAGED", "1");
+        values["KV_TYPE"] = svcconf::cfg(conf, "KV_TYPE", "bf16");
         values["PREFILL_CHUNK"] = svcconf::cfg(conf, "PREFILL_CHUNK", "0");
         values["CONC_PREFILL_CHUNK"] = svcconf::cfg(conf, "CONC_PREFILL_CHUNK", "8192");
         values["QSA_INDEXER_BUDGET"] = svcconf::cfg(conf, "QSA_INDEXER_BUDGET", "0");
@@ -1024,6 +1029,8 @@ std::vector<Check> validate(const Model& model) {
     if (model.get("QSA_INDEXER_BUDGET") != "0" && model.get("QSA_INDEXER_BUDGET") != "4096")
         fail(TR("QSA_INDEXER_BUDGET 只允许 0（默认 2048）或 4096",
                 "QSA_INDEXER_BUDGET only accepts 0 (default 2048) or 4096"));
+    if (model.get("KV_TYPE") != "bf16" && model.get("KV_TYPE") != "q8")
+        fail(TR("KV_TYPE 只允许 bf16 或 q8", "KV_TYPE only accepts bf16 or q8"));
     if (model.get("MOE_A4") < "0" || model.get("MOE_A4") > "3" || model.get("MOE_A4").size() != 1)
         fail(TR("MOE_A4 只允许 0、1、2、3", "MOE_A4 only accepts 0, 1, 2 or 3"));
 

@@ -10,7 +10,8 @@
 //          V2 另有"prefill 4-bit 加速"勾选框（MOE_A4，勾 = 3 / 不勾 = 0，会降低
 //          prompt 部分精度，检查区出 [警告] 说明代价；V1/GGUF 不显示、原值保留）。
 //   第 2 页 推理设置：MAX_CONTEXT / PARALLEL / 并发总池（KV_POOL_TOKENS）/
-//          KV_PAGED / PREFILL_CHUNK / QSA_INDEXER_BUDGET（默认 2048，可选 4096）/
+//          KV_PAGED / KV_TYPE 下拉（bf16 默认 / q8 省显存，枚举式，未来加 fp16）/
+//          PREFILL_CHUNK / QSA_INDEXER_BUDGET（默认 2048，可选 4096）/
 //          KV 快照（KVSNAP_MAX_GB + KVSNAP_DIR）/ YaRN 勾选（ROPE_FACTOR 自动推导）/
 //          处理器亲和性三态（不限制 / CCD 0 / CCD 1，落盘 AFFINITY ""/lower-half/upper-half）/
 //          MAX_IMAGES（单请求图片数上限 1–256，API 启动时读取，重启生效）。
@@ -392,6 +393,7 @@ struct PanelVals {
     std::string kvsnap_dir;  // KVSNAP_DIR：空 = 引擎默认 data\kvsnap
     std::string moe_a4 = "0";  // MOE_A4：0 关，1–3 开（只对 V2 生效）
     std::string qsa_indexer_budget = "0";  // 0 = 2048；4096 = 扩大 QSA 检索预算
+    std::string kv_type = "bf16";  // KV_TYPE：bf16（默认）/ q8（省显存）；未来加 fp16
     std::string affinity;
     std::string max_images;    // MAX_IMAGES：单请求图片数上限（1–256），重启生效
     bool viz = false;          // VIZ：运行时可视化（GET /viz），重启生效
@@ -433,6 +435,7 @@ PanelVals panel_vals_from_conf() {
     v.kv_paged = cfg("KV_PAGED", "1") != "0";
     v.prefill_chunk = cfg("PREFILL_CHUNK", "0");
     v.qsa_indexer_budget = cfg("QSA_INDEXER_BUDGET", "0");
+    v.kv_type = cfg("KV_TYPE", "bf16");
     v.rope_factor = cfg("ROPE_FACTOR", "1");
     v.rope_original = cfg("ROPE_ORIGINAL_CTX", "262144");
     v.kvsnap_max_gb = cfg("KVSNAP_MAX_GB", "20");
@@ -489,6 +492,7 @@ std::map<std::string, std::string> panel_vals_to_conf(const PanelVals& v) {
     m["KV_PAGED"] = v.kv_paged ? "1" : "0";
     m["PREFILL_CHUNK"] = v.prefill_chunk;
     m["QSA_INDEXER_BUDGET"] = v.qsa_indexer_budget;
+    m["KV_TYPE"] = v.kv_type;
     m["ROPE_FACTOR"] = v.rope_factor;
     m["KVSNAP_MAX_GB"] = v.kvsnap_max_gb;
     std::string kdir = v.kvsnap_dir;
@@ -724,6 +728,11 @@ void check_context_page(CheckLines& c, const PanelVals& v) {
         check_line(c, kLvWarn,
                    TR("QSA 检索预算 4096 已开启：长上下文检索可能改善，prefill 会变慢",
                       "QSA indexer budget 4096 enabled: long-context retrieval may improve; prefill will be slower"));
+    }
+    if (v.kv_type != "bf16" && v.kv_type != "q8") {
+        check_line(c, kLvFail,
+                   TR("KV_TYPE 只允许 bf16 或 q8", "KV_TYPE must be bf16 or q8"));
+        nums_ok = false;
     }
     if (!nums_ok) return;
     if (parallel > 1 && !v.kv_paged)
@@ -1202,7 +1211,7 @@ enum PanelId : int {
     kBrModel, kBrNgram, kBrOverlay, kBrMtp, kBrVision,
     kBrGguf, kBrGgufMtp, kBrGgufVision, kBrGgufPle,
     kOffOverlay, kOffMtp, kOffVision, kOffGgufMtp, kOffGgufVision, kOffGgufPle,
-    kEdMaxctx, kCbMaxctxPreset, kCbParallel, kEdKvPool, kCkKvPaged, kEdPrefill,
+    kEdMaxctx, kCbMaxctxPreset, kCbParallel, kEdKvPool, kCkKvPaged, kCbKvType, kEdPrefill,
     kCkYarn, kEdKvsnap, kEdKvsnapDir, kBrKvsnapDir, kCbAffinity,
     kEdEHost, kEdEPort, kEdAHost, kEdAPort,
     kEdOut1, kEdOut2, kEdOut3, kEdReport, kEdSummary, kBtnLang,
@@ -1225,6 +1234,7 @@ struct PanelCtl {
          kv_paged = nullptr, prefill = nullptr;
     HWND yarn = nullptr;  // "YaRN 长上下文扩展" 勾选框（ROPE_FACTOR 自动推导，无编辑行）
     HWND qsa_budget = nullptr;
+    HWND kv_type = nullptr;  // KV_TYPE 下拉框（bf16 / q8，枚举式以便将来加 fp16）
     HWND kvsnap = nullptr;
     HWND kvsnap_dir = nullptr, kvsnap_dir_br = nullptr;
     HWND affinity = nullptr;
@@ -1438,6 +1448,18 @@ PanelVals panel_collect() {
     v.kv_paged = get_check(g_pc.kv_paged);
     v.prefill_chunk = get_edit(g_pc.prefill);
     v.qsa_indexer_budget = get_check(g_pc.qsa_budget) ? "4096" : "0";
+    // KV_TYPE：0 = bf16，1 = q8；2+ 是 conf 里手改的未知值，原样保留（保存校验会拦）
+    const int kvt_sel = static_cast<int>(SendMessageW(g_pc.kv_type, CB_GETCURSEL, 0, 0));
+    if (kvt_sel == 0) {
+        v.kv_type = "bf16";
+    } else if (kvt_sel == 1) {
+        v.kv_type = "q8";
+    } else if (kvt_sel >= 2) {
+        wchar_t kvt_buf[64] = {};
+        SendMessageW(g_pc.kv_type, CB_GETLBTEXT, static_cast<WPARAM>(kvt_sel),
+                     reinterpret_cast<LPARAM>(kvt_buf));
+        v.kv_type = from_w(kvt_buf);
+    }
     v.rope_original = cfg("ROPE_ORIGINAL_CTX", "262144");  // 无 UI 行，conf/环境原样读
     v.rope_factor = derive_rope_factor(get_check(g_pc.yarn), v.max_context, v.rope_original);
     v.kvsnap_max_gb = get_edit(g_pc.kvsnap);
@@ -2311,6 +2333,22 @@ PanelResult panel_run() {
                          TR(L"分页 KV（并发必须开启）", L"Paged KV (required for parallel >1)"),
                          kCkKvPaged);
     SendMessageW(g_pc.kv_paged, BM_SETCHECK, init.kv_paged ? BST_CHECKED : BST_UNCHECKED, 0);
+    y2 += 26;
+    plabel(1, h, kLblX, y2, TR(L"KV 缓存类型", L"KV cache type"));
+    g_pc.kv_type = pctl(1, h, L"ComboBox", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, kEdX,
+                        y2, 180, 200, L"", kCbKvType);
+    SendMessageW(g_pc.kv_type, CB_ADDSTRING, 0,
+                 reinterpret_cast<LPARAM>(TR(L"BF16（默认）", L"BF16 (default)")));
+    SendMessageW(g_pc.kv_type, CB_ADDSTRING, 0,
+                 reinterpret_cast<LPARAM>(TR(L"Q8（约省一半 KV 显存）", L"Q8 (≈ half KV memory)")));
+    int kvt_sel = init.kv_type == "q8" ? 1 : init.kv_type == "bf16" ? 0 : -1;
+    if (kvt_sel < 0) {  // conf 里手改的未知值：追加显示，保存时原样保留（校验会拦）
+        SendMessageW(g_pc.kv_type, CB_ADDSTRING, 0,
+                     reinterpret_cast<LPARAM>(to_w(init.kv_type).c_str()));
+        kvt_sel = 2;
+    }
+    SendMessageW(g_pc.kv_type, CB_SETCURSEL, static_cast<WPARAM>(kvt_sel), 0);
+    plabel(1, h, kHintX, y2, TR(L"q8 精度略降", L"q8 is less precise"), kHintW);
     y2 += 26;
     plabel(1, h, kLblX, y2, TR(L"prefill 分段", L"Prefill chunk"));
     g_pc.prefill = pctl(1, h, L"Edit", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kEdX, y2, 120,
