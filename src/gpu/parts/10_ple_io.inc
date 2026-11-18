@@ -797,6 +797,31 @@ __device__ __forceinline__ float4 kv_ld4(const uint16_t* __restrict__ p) {
   return v;
 }
 
+// Logical element view of packed Q8 blocks. Pointer arithmetic in the
+// attention kernels stays in elements; scale bytes are never treated as KV.
+struct KvQ8View {
+  const KvQ8Block* blocks;
+  size_t offset;
+  __device__ __forceinline__ KvQ8View operator+(size_t n) const {
+    return {blocks, offset + n};
+  }
+};
+template <class T>
+__device__ __forceinline__ const T* kv_view(const T* p) { return p; }
+__device__ __forceinline__ KvQ8View kv_view(const KvQ8Block* p) { return {p, 0}; }
+__device__ __forceinline__ float kv_ld1(KvQ8View p) {
+  const KvQ8Block& b = p.blocks[p.offset / 32];
+  return (float)b.q[p.offset % 32] * __half2float(b.scale);
+}
+__device__ __forceinline__ float4 kv_ld4(KvQ8View p) {
+  // All callers use 4-aligned offsets, so the vector stays in one group.
+  const KvQ8Block& b = p.blocks[p.offset / 32];
+  const int i = p.offset % 32;
+  const float s = __half2float(b.scale);
+  return make_float4((float)b.q[i] * s, (float)b.q[i+1] * s,
+                     (float)b.q[i+2] * s, (float)b.q[i+3] * s);
+}
+
 // Indexer Q and pooled K use the same 64 rotary dimensions as main attention.
 // cs_tab (the k_rope_cs per-token cos/sin table, indexed by position-tab_base)
 // replaces the inline fp64 cos/sin when the position is covered; values are

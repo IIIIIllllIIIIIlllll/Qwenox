@@ -26,6 +26,7 @@ serve_init() {
   ENGINE_HOST="${ENGINE_HOST:-127.0.0.1}"
   # 旧版 service.conf 没有这几项时的缺省值（与 service.conf 相同）
   KV_PAGED="${KV_PAGED:-1}"
+  KV_TYPE="${KV_TYPE:-bf16}"
   KV_POOL_TOKENS="${KV_POOL_TOKENS:-0}"
   PARALLEL="${PARALLEL:-1}"
   CONC_PREFILL_CHUNK="${CONC_PREFILL_CHUNK:-8192}"
@@ -67,6 +68,7 @@ serve_init() {
     [[ "$value" =~ ^(0|[1-9][0-9]*)$ && ${#value} -le 8 ]] || fail "$key 必须为非负整数"
   done
   [[ "$PLE_URING" =~ ^[01]$ ]] || fail 'PLE_URING 必须为 0 或 1'
+  [[ "$KV_TYPE" == bf16 || "$KV_TYPE" == q8 ]] || fail "KV_TYPE must be bf16 or q8"
   [[ "$KV_PAGED" =~ ^[01]$ ]] || fail 'KV_PAGED 必须为 0 或 1'
   [[ "$PARALLEL" =~ ^[1-8]$ ]] || fail 'PARALLEL 范围为 1–8'
   [[ "${MOE_A4:-0}" =~ ^[0-3]$ ]] || fail 'MOE_A4 范围为 0–3'
@@ -119,6 +121,7 @@ serve_run() {
   (( available >= MIN_AVAILABLE_GB )) || fail "可用内存 ${available} GiB，要求至少 ${MIN_AVAILABLE_GB} GiB"
   # Existing production options; no closed-source modules or experimental paths.
   # （放在 --check 之前：--check 会打印这些变量，tools/a5_verify.sh 等据此复现生产环境）
+  export QWENOX_KV_TYPE="$KV_TYPE"
   export QWENOX_QSA_KV_BF16=1 QWENOX_QSA_WMMA=1 QWENOX_QSA_WMMA_BTV=1
   # 自写 WMMA dense GEMM（Phase 3g）：8K +2%、32K +3%，对拍 8049 token 仅尾部分歧 4 个。
   export QWENOX_GEMM_WMMA=1

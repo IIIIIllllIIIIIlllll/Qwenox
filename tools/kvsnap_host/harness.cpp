@@ -66,6 +66,9 @@ static const char* log_ts() { return "[t]"; }
 
 // ---- stubs for what kvsnap uses from the engine -------------------------------
 static const int KV_PAGE = 256, KV_PAGE_BLOCKS = 64;
+static size_t kv_format_row_bytes(int format) {
+  return format == 8 ? 16 * 34 : (size_t)512 * format;
+}
 struct Rope {
   double factor = 0, beta_fast = 0, beta_slow = 0, attention_factor = 0;
   int original_max_position_embeddings = 0;
@@ -108,7 +111,8 @@ static bool has_image_tok(const T* t, size_t n) {
 static const int MAXCTX = 4096;
 struct GpuModel {
   // geometry: nqsa = 1 QSA layer + 1 MTP layer, BF16 KV, indexer keys on
-  bool qsa_kv_fp32 = false, qsa_wmma_btv = false, kv_paged = false, ple_on = true;
+  bool qsa_kv_q8 = false, qsa_kv_fp32 = false, qsa_wmma_btv = false,
+       kv_paged = false, ple_on = true;
   bool mrope_active_ = false;
   uint64_t img_hash_ = 0;
   std::vector<std::array<int, 3>> mrope_grids_;
@@ -119,6 +123,7 @@ struct GpuModel {
   std::vector<uint16_t> kc, vc;
   std::vector<float> ik, S, conv, ring, iraw, R, miraw;
   uint16_t *d_kcb, *d_vcb;
+  char *d_kcq = nullptr, *d_vcq = nullptr;
   float *d_kc = nullptr, *d_vc = nullptr, *d_ik, *d_ikh = nullptr;
   float *d_S, *d_convst, *d_ring, *d_iraw, *d_R, *d_miraw;
   int pos_dev = 0, mpos_dev = 0, ringpos_dev = 0;

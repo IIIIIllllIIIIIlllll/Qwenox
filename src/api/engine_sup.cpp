@@ -473,6 +473,7 @@ bool start(const std::string& root, const svcconf::Conf& conf, std::string* err)
         "QWENOX_INDEX_FUSED2", "QWENOX_PP_MOE_OUT", "QWENOX_INDEX_STREAM_SELECT",
     };
     for (const char* f : flags) SetEnvironmentVariableA(f, "1");
+    SetEnvironmentVariableA("QWENOX_KV_TYPE", svcconf::cfg(conf, "KV_TYPE", "bf16").c_str());
     SetEnvironmentVariableA("QWENOX_INDEXER_BUDGET",
                             qsa_budget == "4096" ? "4096" : nullptr);
     SetEnvironmentVariableA("QWENOX_KVSNAP", kvsnap_max_gb ? "1" : "0");

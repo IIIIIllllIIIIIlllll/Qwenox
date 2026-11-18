@@ -288,6 +288,7 @@ static void configure_runtime(const BenchConfig& config) {
     if (!value.empty()) set_env_value(env_key, value);
   };
   set_env_value("QWENOX_QSA_KV_BF16", "1");
+  set_if_configured("QWENOX_KV_TYPE", "KV_TYPE");
   set_env_value("QWENOX_QSA_WMMA", "1");
   set_env_value("QWENOX_QSA_WMMA_BTV", "1");
   set_env_value("QWENOX_GEMM_WMMA", "1");

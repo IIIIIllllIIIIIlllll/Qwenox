@@ -1402,7 +1402,7 @@ __global__ void k_qsa_step(const float* __restrict__ q, const KVT* __restrict__ 
   int t = threadIdx.x;
   float mx = -1e30f;
   for (int p = t; p < ntok; p += blockDim.x) {
-    const KVT* kp = kc + ((size_t)kv_row(ptab, qsa_source_pos(p, visible, selected)) * hkv + kvh) * dh;
+    const auto kp = kv_view(kc) + ((size_t)kv_row(ptab, qsa_source_pos(p, visible, selected)) * hkv + kvh) * dh;
     float acc = 0.f;
     for (int i = 0; i < dh; i++) acc += qh[i] * kv_ld1(kp + i);
     mx = fmaxf(mx, acc * scale);
@@ -1420,7 +1420,7 @@ __global__ void k_qsa_step(const float* __restrict__ q, const KVT* __restrict__ 
   // pass 2: exp sum
   float se = 0.f;
   for (int p = t; p < ntok; p += blockDim.x) {
-    const KVT* kp = kc + ((size_t)kv_row(ptab, qsa_source_pos(p, visible, selected)) * hkv + kvh) * dh;
+    const auto kp = kv_view(kc) + ((size_t)kv_row(ptab, qsa_source_pos(p, visible, selected)) * hkv + kvh) * dh;
     float acc = 0.f;
     for (int i = 0; i < dh; i++) acc += qh[i] * kv_ld1(kp + i);
     se += expf(acc * scale - mx);
@@ -1438,11 +1438,11 @@ __global__ void k_qsa_step(const float* __restrict__ q, const KVT* __restrict__ 
     float acc = 0.f;
     for (int p = 0; p < ntok; p++) {
       int source = kv_row(ptab, qsa_source_pos(p, visible, selected));
-      const KVT* kp = kc + ((size_t)source * hkv + kvh) * dh;
+      const auto kp = kv_view(kc) + ((size_t)source * hkv + kvh) * dh;
       float s = 0.f;
       for (int i = 0; i < dh; i++) s += qh[i] * kv_ld1(kp + i);
       float w = expf(s * scale - mx) * invsum;
-      acc += w * kv_ld1(vc + ((size_t)source * hkv + kvh) * dh + t);
+      acc += w * kv_ld1(kv_view(vc) + ((size_t)source * hkv + kvh) * dh + t);
     }
     out[h * dh + t] = acc;
   }
@@ -2024,6 +2024,40 @@ __global__ void k_store_kv_bf16(const float* __restrict__ kb,
   const uint16_t v = f2bf(vb[i]);
   vc[off] = v;
   if (vct) vct[((size_t)(row >> 2) * 512 + i) * 4 + (pos & 3)] = v;
+}
+
+// Quantize K and V together: one wave owns one independent 32-dim group.
+// Works for prefill, decode, MTP, non-bound slots and captured verify graphs.
+// ptab maps logical rows; dbase supplies the graph's replay-time base.
+__global__ void k_store_kv_q8(const float* __restrict__ k,
+                              const float* __restrict__ v,
+                              KvQ8Block* __restrict__ kc,
+                              KvQ8Block* __restrict__ vc, int P, int base,
+                              const int* __restrict__ ptab = nullptr,
+                              const int* __restrict__ dbase = nullptr) {
+  const int g = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  if (g >= P * 16) return;
+  const int lane = threadIdx.x & 31, row = g / 16, group = g % 16;
+  const size_t i = (size_t)row * 512 + group * 32 + lane;
+  const float a = k[i], b = v[i];
+  float ak = fabsf(a), av = fabsf(b);
+#pragma unroll
+  for (int d = 16; d; d >>= 1) {
+    ak = fmaxf(ak, __shfl_xor_sync(~0ull, ak, d));
+    av = fmaxf(av, __shfl_xor_sync(~0ull, av, d));
+  }
+  // Quantize with the stored (rounded) scale. Clamp tiny nonzero scales to
+  // the minimum fp16 subnormal, so a finite input never divides by zero.
+  const __half sk = __float2half_rn(ak == 0 ? 0.f : fmaxf(ak / 127.f, 0x1p-24f));
+  const __half sv = __float2half_rn(av == 0 ? 0.f : fmaxf(av / 127.f, 0x1p-24f));
+  const float dk = __half2float(sk), dv = __half2float(sv);
+  const int qk = dk == 0 ? 0 : max(-127, min(127, __float2int_rn(a / dk)));
+  const int qv = dv == 0 ? 0 : max(-127, min(127, __float2int_rn(b / dv)));
+  const int pos = (dbase ? *dbase : base) + row;
+  const size_t dst = (size_t)kv_row(ptab, pos) * 16 + group;
+  kc[dst].q[lane] = (int8_t)qk;
+  vc[dst].q[lane] = (int8_t)qv;
+  if (lane == 0) { kc[dst].scale = sk; vc[dst].scale = sv; }
 }
 
 // --- end-of-step: pos++, ringpos = (ringpos+1)%9 ----------------------------

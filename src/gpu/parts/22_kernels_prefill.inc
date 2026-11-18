@@ -238,6 +238,37 @@ __global__ void k_f32_to_bf16_v4_bt(const float* __restrict__ x,
   }
 }
 
+// Expand one Q8 layer into logical BF16 K and block-transposed BF16 V.
+// A wave owns 32 dimensions x 4 token slots. The source may be paged, but
+// both outputs are contiguous logical rows; attention must use ptab=null.
+// Zero the incomplete final block so stale/future V cannot enter WMMA.
+__global__ void k_q8_prefill_expand(const KvQ8Block* __restrict__ kc,
+                                    const KvQ8Block* __restrict__ vc,
+                                    uint16_t* __restrict__ kb,
+                                    uint16_t* __restrict__ vt, int N,
+                                    const int* __restrict__ ptab = nullptr) {
+  const int wave = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+  const int lane = threadIdx.x & 31;
+  const int block = wave / 16, group = wave % 16;
+  if (block >= (N + 3) / 4) return;
+  uint16_t v[4];
+#pragma unroll
+  for (int s = 0; s < 4; s++) {
+    const int row = block * 4 + s;
+    uint16_t k = 0;
+    v[s] = 0;
+    if (row < N) {
+      const size_t src = (size_t)kv_row(ptab, row) * 16 + group;
+      k = f2bf(__half2float(kc[src].scale) * (float)kc[src].q[lane]);
+      v[s] = f2bf(__half2float(vc[src].scale) * (float)vc[src].q[lane]);
+    }
+    kb[(size_t)row * 512 + group * 32 + lane] = k;
+  }
+  const uint2 packed = {(uint32_t)v[0] | ((uint32_t)v[1] << 16),
+                        (uint32_t)v[2] | ((uint32_t)v[3] << 16)};
+  *(uint2*)(vt + ((size_t)block * 512 + group * 32 + lane) * 4) = packed;
+}
+
 // P3-B: device-base + page-table variants for graph capture. Logical rows
 // [*dvb, *dvb+P) are mapped through kv_row (identity when ptab == null), so a
 // single launch replaces the host kv_runs loop; element math is the same
@@ -1071,7 +1102,7 @@ __global__ void k_qsa_flash(const float* __restrict__ q, const KVT* __restrict__
   const float scale = 1.f / sqrtf((float)dh);
   // K chunk staging slice: thread tid stages row tid/16, floats (tid%16)*16..
   const int spi = tid / 16, spf = (tid % 16) * 16;
-  const KVT* kg = kc + (size_t)kvh * dh + spf;
+  const auto kg = kv_view(kc) + (size_t)kvh * dh + spf;
   float4 st0, st1, st2, st3;
   if (!Sparse) {
     int source = min(spi, ntok - 1);
@@ -1098,13 +1129,13 @@ __global__ void k_qsa_flash(const float* __restrict__ q, const KVT* __restrict__
     if (Sparse) {
       // Sparse address bookkeeping plus the 16-float prefetch spills VGPRs.
       int source = kv_row(ptab, qsa_source_pos(min(p0 + spi, ntok - 1), token + 1, blocks));
-      const KVT* src = kg + (size_t)source * hkv * dh;
+      const auto src = kg + (size_t)source * hkv * dh;
       *(float4*)&kt[spi][spf] = kv_ld4(src);
       *(float4*)&kt[spi][spf + 4] = kv_ld4(src + 4);
       *(float4*)&kt[spi][spf + 8] = kv_ld4(src + 8);
       *(float4*)&kt[spi][spf + 12] = kv_ld4(src + 12);
       if (SharedV) {
-        const KVT* vs = vc + ((size_t)source * hkv + kvh) * dh + spf;
+        const auto vs = kv_view(vc) + ((size_t)source * hkv + kvh) * dh + spf;
         *(float4*)&vt[spi][spf] = kv_ld4(vs);
         *(float4*)&vt[spi][spf + 4] = kv_ld4(vs + 4);
         *(float4*)&vt[spi][spf + 8] = kv_ld4(vs + 8);
@@ -1185,7 +1216,7 @@ __global__ void k_qsa_flash(const float* __restrict__ q, const KVT* __restrict__
         } else {
           int pr = min(p0 + p, ntok - 1);
           if (Sparse) pr = qsa_source_pos(pr, token + 1, blocks);
-          const KVT* vg = vc + ((size_t)kv_row(ptab, pr) * hkv + kvh) * dh + dg * 4;
+          const auto vg = kv_view(vc) + ((size_t)kv_row(ptab, pr) * hkv + kvh) * dh + dg * 4;
           for (int f = 0; f < 8; f++) {
             float4 vv = kv_ld4(vg + f * 32);
             acc[f].x += ev * vv.x;
@@ -1348,7 +1379,7 @@ __global__ void k_qsa_flash_bf16(const float* __restrict__ q,
   const float scale = 1.f / sqrtf((float)dh);
   // K/V chunk staging slice: thread tid stages row tid/16, elems (tid%16)*16..
   const int spi = tid / 16, spf = (tid % 16) * 16;
-  const KVT* kg = kc + (size_t)kvh * dh + spf;
+  const auto kg = kv_view(kc) + (size_t)kvh * dh + spf;
   for (int p0 = 0; p0 < ntok; p0 += QSA_KT) {
     // stage K and V chunks into the bf16 LDS tiles
     int source = qsa_source_pos(min(p0 + spi, ntok - 1), token + 1, blocks);
@@ -1458,6 +1489,15 @@ __device__ __forceinline__ qw_shortx16 qw_ld16(const uint16_t* p) {
   memcpy(&v, tmp, 32);
   return v;
 }
+__device__ __forceinline__ qw_shortx16 qw_ld16(KvQ8View p) {
+  qw_shortx16 v;
+  const KvQ8Block& b = p.blocks[p.offset / 32];
+  const int off = p.offset % 32;
+  const float s = __half2float(b.scale);
+#pragma unroll
+  for (int j = 0; j < 16; j++) v[j] = (short)f2bf((float)b.q[off + j] * s);
+  return v;
+}
 __device__ __forceinline__ qw_shortx16 qw_zero16() {
   short tmp[16] = {};
   qw_shortx16 v;
@@ -1517,10 +1557,10 @@ __device__ __forceinline__ void tr16x16_bf16(unsigned a[8]) {
 // launcher uses grid = (dense_P, 2), first = kbase = base, selected = nullptr.
 // Body of k_qsa_wmma for grid cell (bx, kvh); k_qsa_wmma_vseg (batched
 // multi-segment verify) runs the same body per segment row window.
-template <bool TransposedV, bool Paged, bool Dense>
+template <bool TransposedV, bool Paged, bool Dense, class KVT>
 __device__ __forceinline__ void qsa_wmma_body(
     const int bx, const int kvh_, const float* __restrict__ q,
-    const uint16_t* __restrict__ kc, const uint16_t* __restrict__ vc,
+    const KVT* __restrict__ kc, const KVT* __restrict__ vc,
     const uint16_t* __restrict__ vct, float* __restrict__ out, int P, int dh,
     int hkv, int hq, const int* __restrict__ selected, int first, int kbase,
     const int* __restrict__ ptab, const int* __restrict__ dvb, int dvb_edge) {
@@ -1603,7 +1643,7 @@ __device__ __forceinline__ void qsa_wmma_body(
                                      : tail0 + gkey - qsa_index_tokens();
     }
     if constexpr (Paged) src = kv_row(ptab, (int)src);
-    const uint16_t* kp = kc + ((size_t)src * hkv + kvh) * dh;
+    const auto kp = kv_view(kc) + ((size_t)src * hkv + kvh) * dh;
 #pragma unroll
     for (int k4 = 0; k4 < 4; ++k4) {
       qw_shortx16 a[4], b[4];
@@ -1761,11 +1801,15 @@ __device__ __forceinline__ void qsa_wmma_body(
                                       : tail0 + vk - qsa_index_tokens();
         }
         if constexpr (Paged) vs = kv_row(ptab, (int)vs);
-        const uint16_t* vp =
-            vc + ((size_t)vs * hkv + kvh) * dh + w * 32 + (lane >> 4) * 16;
+        const auto vp =
+            kv_view(vc) + ((size_t)vs * hkv + kvh) * dh + w * 32 + (lane >> 4) * 16;
         unsigned va[8];
-        *(uint4*)&va[0] = *(const uint4*)vp;
-        *(uint4*)&va[4] = *(const uint4*)(vp + 8);
+        auto frag = qw_ld16(vp);
+        // Rejected/future rows must have no arithmetic effect on this row.
+        if constexpr (sizeof(KVT) == sizeof(KvQ8Block)) {
+          if (vk >= ntok) frag = qw_zero16();
+        }
+        memcpy(va, &frag, sizeof va);
         tr16x16_bf16(va);  // half (lane>>4) now holds B cols of d-tile (lane>>4)
         unsigned vo[8];
 #pragma unroll
@@ -1812,10 +1856,11 @@ __device__ __forceinline__ void qsa_wmma_body(
       if (r < hq / hkv) ob[(size_t)r * dh + w * 32 + dt * 16 + c16] = acc[dt][e] * lfin[e];
     }
 }
-template <bool TransposedV = false, bool Paged = false, bool Dense = false>
+template <bool TransposedV = false, bool Paged = false, bool Dense = false,
+          class KVT = uint16_t>
 __global__ void __launch_bounds__(256)
-    k_qsa_wmma(const float* __restrict__ q, const uint16_t* __restrict__ kc,
-               const uint16_t* __restrict__ vc, const uint16_t* __restrict__ vct,
+    k_qsa_wmma(const float* __restrict__ q, const KVT* __restrict__ kc,
+               const KVT* __restrict__ vc, const uint16_t* __restrict__ vct,
                float* __restrict__ out, int P,
                int dh, int hkv, int hq, const int* __restrict__ selected,
                int first, int kbase = 0, const int* __restrict__ ptab = nullptr,

@@ -113,9 +113,9 @@ static Geo geo(const GpuModel& m) {
   Geo G;
   G.nqsa = g_cfg.layers / 4;
   G.ngdn = g_cfg.layers - G.nqsa;
-  G.kvb = m.qsa_kv_fp32 ? 4 : 2;
+  G.kvb = m.qsa_kv_q8 ? 8 : (m.qsa_kv_fp32 ? 4 : 2);
   G.has_ik = m.d_ik ? 1 : 0;
-  G.row_b = (size_t)512 * G.kvb;
+  G.row_b = kv_format_row_bytes(G.kvb);
   G.s_b = (size_t)G.ngdn * 48 * 128 * 128 * 4;
   G.conv_b = (size_t)G.ngdn * 3 * 10240 * 4;
   G.ring_b = 9 * 10240 * 4;
@@ -124,7 +124,7 @@ static Geo geo(const GpuModel& m) {
 }
 // one layer of one page: K rows, V rows, indexer key blocks
 static size_t page_layer_b(int kvb, int has_ik) {
-  return 2 * (size_t)KV_PAGE * 512 * kvb + (has_ik ? (size_t)KV_PAGE_BLOCKS * 512 : 0);
+  return 2 * (size_t)KV_PAGE * kv_format_row_bytes(kvb) + (has_ik ? (size_t)KV_PAGE_BLOCKS * 512 : 0);
 }
 static const char MAG_C[8] = "GDKVC1", MAG_M[8] = "GDKVM1", MAG_K[8] = "GDKCK1";
 struct ChHdr {  // c_<key>.kvc (trunk page) / m_<key>.kvm (MTP section)
@@ -143,13 +143,13 @@ static_assert(sizeof(ChHdr) % 8 == 0 && sizeof(CkHdr) % 8 == 0, "header alignmen
 static size_t ck_body_b(const CkHdr& h) {
   const size_t nt = (size_t)h.n - (size_t)h.nc * KV_PAGE;
   return (size_t)h.nc * 16 + nt * 4 + h.s_b + h.conv_b + h.ring_b + h.iraw_b + h.mR_b +
-         h.miraw_b + (size_t)h.nl * (2 * nt * 512 * h.kvb + (size_t)h.nik * 512);
+         h.miraw_b + (size_t)h.nl * (2 * nt * kv_format_row_bytes(h.kvb) + (size_t)h.nik * 512);
 }
 static bool ck_sane(const CkHdr& h) {
   const uint64_t big = 1ull << 36;
   return !memcmp(h.magic, MAG_K, 8) && h.n > 0 && h.n < (1 << 24) &&
          h.nc == (h.n - 1) / KV_PAGE && h.nl > 0 && h.nl <= 64 &&
-         (h.kvb == 2 || h.kvb == 4) && h.nik >= 0 && h.nik <= 2 * KV_PAGE_BLOCKS &&
+         (h.kvb == 2 || h.kvb == 4 || h.kvb == 8) && h.nik >= 0 && h.nik <= 2 * KV_PAGE_BLOCKS &&
          h.s_b < big && h.conv_b < big && h.ring_b < big && h.iraw_b < big &&
          h.mR_b < big && h.miraw_b < big;
 }
@@ -164,9 +164,10 @@ static int tail_ik(const GpuModel& m, int n, int nc) {
 
 // Device slices (layer nqsa = the MTP layer, B0).
 static char* kv_layer(GpuModel& m, int half, int l) {
-  char* b = m.qsa_kv_fp32 ? (char*)(half ? m.d_vc : m.d_kc)
-                          : (char*)(half ? m.d_vcb : m.d_kcb);
-  return b + (size_t)l * m.kv_layer_rows * 512 * (m.qsa_kv_fp32 ? 4 : 2);
+  char* b = m.qsa_kv_q8 ? (char*)(half ? m.d_vcq : m.d_kcq)
+            : m.qsa_kv_fp32 ? (char*)(half ? m.d_vc : m.d_kc)
+                            : (char*)(half ? m.d_vcb : m.d_kcb);
+  return b + (size_t)l * m.kv_layer_rows * geo(m).row_b;
 }
 static char* ik_layer(GpuModel& m, int l) {
   return (char*)(m.d_ik + (size_t)l * m.ik_layer_blocks * 128);
@@ -1656,6 +1657,7 @@ static uint64_t fingerprint(const GpuModel& m) {
                      bits(g_cfg.rope.beta_fast), bits(g_cfg.rope.beta_slow),
                      bits(g_cfg.rope.attention_factor)})
     add(v);
+  if (m.qsa_kv_q8) add(0x4b56513847333201ULL);  // Q8 group32 schema v1
   // GGUF native dense weights (not the q8g32 requant): different numerics,
   // so snapshots of the two layouts never mix. Other setups keep their hash.
   if (g_gguf_dense && gguf_map::g_native_dense) add(0x4e41544956453031ULL);

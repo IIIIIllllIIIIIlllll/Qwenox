@@ -180,9 +180,10 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
   }
 #endif
   const bool qsa_dense = getenv("QWENOX_QSA_DENSE") != nullptr;
-  const bool kv_fp32 = getenv("QWENOX_QSA_KV_BF16") == nullptr;
+  const bool kv_q8 = kv_type_env() == KvType::Q8;
+  const bool kv_fp32 = kv_type_env() == KvType::F32;
   const bool index_f32 = getenv("QWENOX_INDEX_BF16") == nullptr;
-  const bool btv = getenv("QWENOX_QSA_WMMA") && !kv_fp32 &&
+  const bool btv = !kv_q8 && getenv("QWENOX_QSA_WMMA") && !kv_fp32 &&
                    getenv("QWENOX_QSA_WMMA_BTV");
   const bool fused = getenv("QWENOX_PREFILL_UNFUSED") == nullptr;
   const char* cut_off = getenv("QWENOX_CUT_INPASS");
@@ -215,7 +216,7 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
   const bool kv_bf16_pg_ok =
       qsa_dense || (getenv("QWENOX_QSA_WMMA") && !(btv && getenv("QWENOX_QSA_WMMA6")) &&
                     !(btv && getenv("QWENOX_QSA_UNION")));
-  const bool kv_paged = (kv_fp32 || kv_bf16_pg_ok) && kvpe && atoi(kvpe) != 0;
+  const bool kv_paged = (kv_q8 || kv_fp32 || kv_bf16_pg_ok) && kvpe && atoi(kvpe) != 0;
   const size_t kvpg = (mc + KV_PAGE - 1) / KV_PAGE;
   // A2/A3：物理页池 = kv_pool_pages_for(mc) 页（默认 kvpg，QWENOX_KV_POOL_TOKENS 可加大）
   // + 1 个 guard 页；页表仍是每序列 kvpg 项
@@ -274,7 +275,22 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
     add((size_t)std::min(mc, (size_t)INDEX_BATCH) * 4 * ib * 4);  // d_iscores
     add(bc * INDEX_BUDGET * 4);             // d_iselected
   }
-  if (kv_fp32) {
+  if (kv_q8) {
+    add(nkv * kv_rows * KV_Q8_ROW_BYTES);  // K, including per-group scales
+    add(nkv * kv_rows * KV_Q8_ROW_BYTES);  // V; no full-size BF16 twin
+    if (q8_prefill_expand_env()) {
+      const size_t rows = (mc + 3) & ~(size_t)3;
+      add(rows * 512 * 2);  // one layer's BF16 K
+      add(rows * 512 * 2);  // one layer's transposed BF16 V
+      const char* u = getenv("QWENOX_QSA_UNION");
+      if (g_index_budget == 512 && mc <= 262144 && !(u && !strcmp(u, "0"))) {
+        const size_t ng = std::min(mc, BP) / 4 + 1;
+        add(ng * QSA_UCAP * 2);
+        add(ng * QSA_UCAP * 2);
+        add(ng * 4);
+      }
+    }
+  } else if (kv_fp32) {
     add(2 * nkv * kv_rows * 512 * 4);       // d_kc + d_vc（含 MTP 层）
   } else {
     add(2 * nkv * kv_rows * 512 * 2);       // d_kcb + d_vcb（含 MTP 层）
