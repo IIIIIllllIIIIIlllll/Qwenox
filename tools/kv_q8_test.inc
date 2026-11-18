@@ -6,7 +6,83 @@ static std::vector<T> q8_get(const T* p, size_t n) {
   return v;
 }
 
+static void test_q8_prefill_expand() {
+  // Reverse pages, cross a page boundary, and leave a partial final block.
+  // Poison every future Q8 row and guard the outputs against overrun.
+  for (int sparse = 0; sparse < 2; sparse++) {
+    const int base = sparse ? g_index_first : KV_PAGE - 3;
+    const int P = 10, N = base + P, padded = (N + 3) & ~3;
+    const int nr = ((padded + KV_PAGE - 1) / KV_PAGE) * KV_PAGE;
+    std::vector<float> k((size_t)nr * 512), v(k.size()), q((size_t)P * 6144);
+    for (size_t i = 0; i < k.size(); i++) {
+      float scale = (i / 32) % 3 == 0 ? 0.f : ((i / 32) % 3 == 1 ? 1e-7f : 4.f);
+      k[i] = frand() * scale; v[i] = frand() * scale * 3.f;
+    }
+    for (auto& x : q) x = frand();
+    std::vector<int> tab(nr / KV_PAGE), sel((size_t)P * g_index_budget);
+    for (size_t i = 0; i < tab.size(); i++) tab[i] = (int)tab.size() - 1 - (int)i;
+    for (int r = 0; r < P; r++) for (int i = 0; i < g_index_budget; i++)
+      // Production union consumes sorted, unique complete-block selections.
+      sel[(size_t)r * g_index_budget + i] = (base + r + 1) / 4 - g_index_budget + i;
+    auto* dk = dup(k); auto* dv = dup(v); auto* dq = dup(q);
+    auto* dt = dup(tab); auto* ds = dup(sel);
+    std::vector<KvQ8Block> empty((size_t)nr * 16);
+    auto* kq = dup(empty); auto* vq = dup(empty);
+    k_store_kv_q8<<<nr * 4, 128>>>(dk, dv, kq, vq, nr, 0, dt);
+    auto hk = q8_get(kq, empty.size()), hv = q8_get(vq, empty.size());
+    const uint16_t sentinel = 0x7fc1;
+    std::vector<uint16_t> kb((size_t)(padded + 4) * 512, sentinel), vt(kb.size(), sentinel);
+    for (int t = 0; t < padded; t++) for (int d = 0; d < 512; d++) {
+      const size_t src = (size_t)(tab[t / KV_PAGE] * KV_PAGE + t % KV_PAGE) * 16 + d / 32;
+      kb[(size_t)t * 512 + d] = t < N ? bf16_bits(__half2float(hk[src].scale) * hk[src].q[d % 32]) : 0;
+      vt[((size_t)(t / 4) * 512 + d) * 4 + t % 4] =
+          t < N ? bf16_bits(__half2float(hv[src].scale) * hv[src].q[d % 32]) : 0;
+    }
+    auto* ek = dup(kb); auto* ev = dup(vt);
+    std::vector<uint16_t> poison(kb.size(), sentinel);
+    auto* sk = dup(poison); auto* sv = dup(poison);
+    k_q8_prefill_expand<<<((N + 3) / 4 * 16 + 3) / 4, 128>>>(kq, vq, sk, sv, N, dt);
+    auto gotk = q8_get(sk, kb.size()), gotv = q8_get(sv, vt.size());
+    check(sparse ? "q8_expand_sparse_paged_tail" : "q8_expand_dense_paged_tail",
+          memcmp(kb.data(), gotk.data(), kb.size() * 2) ||
+          memcmp(vt.data(), gotv.data(), vt.size() * 2), 0);
+    float *a = dalloc(q.size()), *ref = dalloc(q.size());
+    if (sparse) {
+      const int ga = (base + 3) & ~3, ge = (base + P) & ~3, ng = (ge - ga) / 4;
+      auto* ub = dup(std::vector<uint16_t>((size_t)ng * QSA_UCAP));
+      auto* um = dup(std::vector<uint16_t>((size_t)ng * QSA_UCAP));
+      auto* uc = dup(std::vector<int>(ng));
+      k_qsa_union_merge<<<ng, 128>>>(ds, ga, ub, um, uc, QSA_UCAP, base, P);
+      k_qsa_wmma_u<<<dim3(ng, 2), 256>>>(dq, sk, sv, a, 256, 2, 24,
+          ub, um, uc, QSA_UCAP, ga, base, nullptr, P);
+      k_qsa_wmma_u<<<dim3(ng, 2), 256>>>(dq, ek, ev, ref, 256, 2, 24,
+          ub, um, uc, QSA_UCAP, ga, base, nullptr, P);
+      for (auto edge : {std::pair<int,int>{base, ga - base}, {ge, base + P - ge}}) {
+        if (!edge.second) continue;
+        auto* es = ds + (size_t)(edge.first - base) * g_index_budget;
+        k_qsa_wmma<true><<<dim3(edge.second, 2), 256>>>(dq, sk, (const uint16_t*)nullptr, sv, a, P, 256, 2, 24, es, edge.first, base);
+        k_qsa_wmma<true><<<dim3(edge.second, 2), 256>>>(dq, ek, (const uint16_t*)nullptr, ev, ref, P, 256, 2, 24, es, edge.first, base);
+      }
+      TCK(hipFree(ub)); TCK(hipFree(um)); TCK(hipFree(uc));
+    } else {
+      k_qsa_wmma<true, false, true><<<dim3(P, 2), 256>>>(dq, sk, (const uint16_t*)nullptr, sv, a, P, 256, 2, 24, nullptr, base, base);
+      k_qsa_wmma<true, false, true><<<dim3(P, 2), 256>>>(dq, ek, (const uint16_t*)nullptr, ev, ref, P, 256, 2, 24, nullptr, base, base);
+    }
+    auto ah = dget(a, q.size()), rh = dget(ref, q.size());
+    double bad = 0;
+    for (size_t i = 0; i < ah.size(); i++)
+      bad += !std::isfinite(ah[i]) || ah[i] != rh[i];
+    check(sparse ? "q8_expand_union_ragged_reference" : "q8_expand_dense_btv_reference", bad, 0);
+    for (void* p : {(void*)dk, (void*)dv, (void*)dq, (void*)dt, (void*)ds,
+                    (void*)kq, (void*)vq, (void*)ek, (void*)ev, (void*)sk,
+                    (void*)sv, (void*)a, (void*)ref}) TCK(hipFree(p));
+  }
+}
+
 static void test_kv_q8() {
+  const auto saved_rng = rng;
+  test_q8_prefill_expand();
+  rng = saved_rng;  // keep all existing deterministic regression inputs
   // Reverse physical pages and write across a page seam. Zero, subnormal,
   // normal and outlier groups exercise independent scales for K and V.
   const int P = KV_PAGE + 7, base = KV_PAGE - 3, rows = 3 * KV_PAGE;

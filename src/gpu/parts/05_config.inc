@@ -43,6 +43,19 @@ struct KvQ8Block {
 };
 static_assert(sizeof(KvQ8Block) == 34, "Q8 KV block layout");
 static constexpr size_t KV_Q8_ROW_BYTES = 16 * sizeof(KvQ8Block);
+// One layer's logical BF16 K + transposed V workspace, reused across layers.
+// Keep this gate shared with the Windows arena estimate.
+static bool q8_prefill_expand_env() {
+  const char* e = getenv("QWENOX_Q8_PREFILL_EXPAND");
+  return kv_type_env() == KvType::Q8 && !(e && !strcmp(e, "0")) &&
+         getenv("QWENOX_QSA_WMMA") && getenv("QWENOX_QSA_WMMA_BTV") &&
+         !getenv("QWENOX_QSA_DENSE") && !getenv("QWENOX_QSA_LOOP") &&
+         !getenv("QWENOX_QSA_GLOBAL_V");
+}
+static int q8_prefill_min_env() {
+  const char* e = getenv("QWENOX_Q8_PREFILL_MIN");
+  return e ? std::max(1, atoi(e)) : 256;
+}
 static size_t kv_format_row_bytes(int format) {
   // Snapshot format tags: 2 = BF16, 4 = FP32, 8 = native Q8 group32.
   return format == 8 ? KV_Q8_ROW_BYTES : (size_t)512 * format;

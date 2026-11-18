@@ -238,6 +238,37 @@ __global__ void k_f32_to_bf16_v4_bt(const float* __restrict__ x,
   }
 }
 
+// Expand one Q8 layer into logical BF16 K and block-transposed BF16 V.
+// A wave owns 32 dimensions x 4 token slots. The source may be paged, but
+// both outputs are contiguous logical rows; attention must use ptab=null.
+// Zero the incomplete final block so stale/future V cannot enter WMMA.
+__global__ void k_q8_prefill_expand(const KvQ8Block* __restrict__ kc,
+                                    const KvQ8Block* __restrict__ vc,
+                                    uint16_t* __restrict__ kb,
+                                    uint16_t* __restrict__ vt, int N,
+                                    const int* __restrict__ ptab = nullptr) {
+  const int wave = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+  const int lane = threadIdx.x & 31;
+  const int block = wave / 16, group = wave % 16;
+  if (block >= (N + 3) / 4) return;
+  uint16_t v[4];
+#pragma unroll
+  for (int s = 0; s < 4; s++) {
+    const int row = block * 4 + s;
+    uint16_t k = 0;
+    v[s] = 0;
+    if (row < N) {
+      const size_t src = (size_t)kv_row(ptab, row) * 16 + group;
+      k = f2bf(__half2float(kc[src].scale) * (float)kc[src].q[lane]);
+      v[s] = f2bf(__half2float(vc[src].scale) * (float)vc[src].q[lane]);
+    }
+    kb[(size_t)row * 512 + group * 32 + lane] = k;
+  }
+  const uint2 packed = {(uint32_t)v[0] | ((uint32_t)v[1] << 16),
+                        (uint32_t)v[2] | ((uint32_t)v[3] << 16)};
+  *(uint2*)(vt + ((size_t)block * 512 + group * 32 + lane) * 4) = packed;
+}
+
 // P3-B: device-base + page-table variants for graph capture. Logical rows
 // [*dvb, *dvb+P) are mapped through kv_row (identity when ptab == null), so a
 // single launch replaces the host kv_runs loop; element math is the same

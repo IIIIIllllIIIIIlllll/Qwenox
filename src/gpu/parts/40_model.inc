@@ -109,6 +109,7 @@ struct GpuModel {
   KvQ8Block *d_kcq = nullptr, *d_vcq = nullptr;  // packed Q8, 16 blocks/row
   uint16_t *d_kcb = nullptr, *d_vcb = nullptr;  // BF16 KV cache (default mode)
   uint16_t *d_vcbt = nullptr;  // optional BF16 V cache: [block][kvh][dim][slot]
+  uint16_t *d_q8pk = nullptr, *d_q8pvt = nullptr;  // one-layer prefill scratch
   float *d_qg, *d_qs, *d_gs, *d_kb, *d_vb, *d_attn;
   float *d_pacc = nullptr, *d_pml = nullptr;  // QSA decode flash-decoding partials
   float *d_iproj = nullptr, *d_iq = nullptr, *d_ik = nullptr;
@@ -497,6 +498,10 @@ struct GpuModel {
   // (γ=2 vs γ=3 near-tie flip at pos 8193; d2s1b_vgd_* probes pcL3).
   bool qsa_union = g_index_budget == 512 && qsa_wmma_btv &&
                    !env_zero("QWENOX_QSA_UNION");
+  bool q8_prefill_expand = q8_prefill_expand_env();
+  bool q8_prefill_union = q8_prefill_expand && g_index_budget == 512 &&
+                          !env_zero("QWENOX_QSA_UNION");
+  int q8_prefill_min = q8_prefill_min_env();
   uint16_t* d_ublk = nullptr;  // [ngroups][QSA_UCAP] 并集块号
   uint16_t* d_umask = nullptr; // [ngroups][QSA_UCAP] 4 query x 4 slot 掩码
   int* d_ucount = nullptr;     // [ngroups] 并集块数（含 pad，4 的倍数）
@@ -1060,10 +1065,11 @@ struct GpuModel {
   }();
 
   explicit GpuModel(const Checkpoint& c, int mc) : ckpt(c), maxctx(mc) {
-    if (qsa_union && maxctx > 262144) {  // block ids uint16: 65536 blocks max
+    if ((qsa_union || q8_prefill_union) && maxctx > 262144) {  // uint16 block ids
       fprintf(stderr, "qsa: disabling QWENOX_QSA_UNION above 256K because its "
                       "block ids are uint16\n");
       qsa_union = false;
+      q8_prefill_union = false;
     }
     ensure_rope_tab(g_cfg.rope_theta, g_cfg.rotary_dim);
     CK(hipStreamSynchronize(nullptr));
@@ -1336,6 +1342,13 @@ struct GpuModel {
       DALLOC(&d_vcq, (size_t)kv_nl * kv_layer_rows * KV_Q8_ROW_BYTES);
       fprintf(stderr, "kv: q8g32, 34 bytes/32 elements, K+V %.3f GiB; dequantize on load\n",
               2.0 * kv_nl * kv_layer_rows * KV_Q8_ROW_BYTES / (1ull << 30));
+      if (q8_prefill_expand) {
+        const size_t rows = ((size_t)maxctx + 3) & ~(size_t)3;
+        DALLOC(&d_q8pk, rows * 512 * 2);
+        DALLOC(&d_q8pvt, rows * 512 * 2);
+        fprintf(stderr, "kv: Q8 prefill expand K+Vt scratch %.3f GiB, min=%d, union=%d\n",
+                2.0 * rows * 512 * 2 / (1ull << 30), q8_prefill_min, (int)q8_prefill_union);
+      }
     } else if (qsa_kv_fp32) {
       DALLOC(&d_kc, (size_t)kv_nl * kv_layer_rows * 512 * 4);
       DALLOC(&d_vc, (size_t)kv_nl * kv_layer_rows * 512 * 4);
@@ -1348,13 +1361,13 @@ struct GpuModel {
         qsa_vt_blocks = (kv_layer_rows + 3) / 4;
         DALLOC(&d_vcbt, (size_t)nqsa * qsa_vt_blocks * 2 * 256 * 4 * 2);
       }
-      if (qsa_union) {
+    }
+    if (qsa_union || q8_prefill_union) {
         // 并集工作区按单 chunk 的组数分配（maxbatch_cap/4 组，每组 ≤ 2052 块）
         const size_t ng = (size_t)maxbatch_cap / 4 + 1;
         DALLOC(&d_ublk, ng * QSA_UCAP * 2);
         DALLOC(&d_umask, ng * QSA_UCAP * 2);
         DALLOC(&d_ucount, ng * 4);
-      }
     }
     if (kv_paged)  // A2: the guard page must read as finite data (zeros)
       kv_guard_regions([&](void* p, size_t n) { CK(hipMemset(p, 0, n)); });
@@ -4402,8 +4415,7 @@ struct GpuModel {
             base, P, qi, h[0], h[1], h[2], h[3], h[4], h[5], h[6]);
   }
 
-  // Q8 uses row-major WMMA: expand only the fragment being consumed.
-  // No context-sized dequantization workspace or transposed BF16 copy.
+  // Direct Q8 path: decode/verify and small prefill expand only consumed fragments.
   void qsa_flash_b(const KvQ8Block* kc, const KvQ8Block* vc, int P,
                    int dense_P, int base = 0, const uint16_t* = nullptr,
                    const int* ptab = nullptr, const int* dvb = nullptr,
@@ -4445,7 +4457,7 @@ struct GpuModel {
   void qsa_flash_b(const KVT* kc, const KVT* vc, int P, int dense_P, int base = 0,
                    const uint16_t* vc_transposed = nullptr,
                    const int* ptab = nullptr, const int* dvb = nullptr,
-                   int row0 = 0, int spec_ovr = -1) {
+                   int row0 = 0, int spec_ovr = -1, bool expanded_q8 = false) {
     // D2-S1c: row0 shifts the batch-local row bases of the [BP] workspaces
     // (d_qsb/d_attnb/d_iselected) so one segment of a multi-segment verify
     // batch reads/writes only its own rows; spec_ovr >= 0 overrides the
@@ -4515,7 +4527,7 @@ struct GpuModel {
         // and the union kernel is NOT bit-identical to the per-token one
         // (key order). Row invariance across gamma requires one kernel.
         // ngram 验证和拒绝后的前缀重放也必须保持逐 token 算术。
-        if (qsa_union && vc_transposed && !usnap &&
+        if ((qsa_union || (expanded_q8 && q8_prefill_union)) && vc_transposed && !usnap &&
             !(spec_row_invariant && ngram_verify_active)) {
           // 并集路径：[ga, ge) 内的 4 对齐完整组走 merge + k_qsa_wmma_u，
           // 两侧 ragged 边缘回退逐 token 的 k_qsa_wmma<true>
@@ -4573,7 +4585,7 @@ struct GpuModel {
           k_qsa_wmma6<<<dim3(nsparse, 2), 128, 0, g_str>>>(
               qsb, kc, vc, vc_transposed, attnb, P, 256, 2, 24, sel,
               first_abs, base);
-        else if (qsa_wmma_btv && vc_transposed) {
+        else if ((qsa_wmma_btv || expanded_q8) && vc_transposed) {
           if (ptab)  // A1c paged instantiation (never taken unpaged)
             k_qsa_wmma<true, true><<<dim3(nsparse, 2), 256, 0, g_str>>>(
                 qsb, kc, vc, vc_transposed, attnb, P, 256, 2, 24, sel, first_abs,
@@ -5418,8 +5430,24 @@ struct GpuModel {
             kbb, knw, kbb, nullptr, g_cfg.norm_eps, base, ropecs);
         k_store_kv_q8<<<P * 4, 128, 0, g_str>>>(kbb, vbb, kc, vc, P, base, ptabc, dvb);
         KP_SUB_END();
+        // Expand after the canonical Q8 store. Reuse this layer's scratch
+        // only for ordinary prefill; verify keeps its row-invariant Q8 math.
+        const bool expand = q8_prefill_expand && P >= q8_prefill_min &&
+                            !vseg && !dvb && !defer_attn && !state_only &&
+                            !slot_spec_snap(bs) && !slot_ngram_verify_active(bs);
+        if (expand) {
+          KP_SUB("qsa:expand");
+          const int n = base + P;
+          k_q8_prefill_expand<<<((n + 3) / 4 * 16 + 3) / 4, 128, 0, g_str>>>(
+              kc, vc, d_q8pk, d_q8pvt, n, ptabc);
+          KP_SUB_END();
+        }
         KP_SUB("qsa:flash");
-        if (!defer_attn) qsa_flash_b(kc, vc, P, dense_P, base, nullptr, ptabc, dvb, r0, sovr);
+        if (expand)
+          qsa_flash_b<uint16_t>(d_q8pk, nullptr, P, dense_P, base,
+                               d_q8pvt, nullptr, nullptr, r0, sovr, true);
+        else if (!defer_attn)
+          qsa_flash_b(kc, vc, P, dense_P, base, nullptr, ptabc, dvb, r0, sovr);
         KP_SUB_END();
       } else if (qsa_kv_fp32) {
         float* kc = d_kc + qsa_off;

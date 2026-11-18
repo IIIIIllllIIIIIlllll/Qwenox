@@ -269,6 +269,18 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
   if (kv_q8) {
     add(nkv * kv_rows * KV_Q8_ROW_BYTES);  // K, including per-group scales
     add(nkv * kv_rows * KV_Q8_ROW_BYTES);  // V; no full-size BF16 twin
+    if (q8_prefill_expand_env()) {
+      const size_t rows = (mc + 3) & ~(size_t)3;
+      add(rows * 512 * 2);  // one layer's BF16 K
+      add(rows * 512 * 2);  // one layer's transposed BF16 V
+      const char* u = getenv("QWENOX_QSA_UNION");
+      if (g_index_budget == 512 && mc <= 262144 && !(u && !strcmp(u, "0"))) {
+        const size_t ng = std::min(mc, BP) / 4 + 1;
+        add(ng * QSA_UCAP * 2);
+        add(ng * QSA_UCAP * 2);
+        add(ng * 4);
+      }
+    }
   } else if (kv_fp32) {
     add(2 * nkv * kv_rows * 512 * 4);       // d_kc + d_vc（含 MTP 层）
   } else {
