@@ -73,6 +73,7 @@ RCKPT_MAX="${RCKPT_MAX:-8}"
 # Windows 的 arena 上限 95 GiB：v2 权重 512K 池（KV_POOL_TOKENS=524288）用 92–94 GiB，放得下；
 # w4b 只放得下 256K。
 KV_PAGED="${KV_PAGED:-1}"
+KV_TYPE="${KV_TYPE:-bf16}"
 KV_POOL_TOKENS="${KV_POOL_TOKENS:-0}"
 PARALLEL="${PARALLEL:-1}"
 # 单请求图片数上限（1–256）：多轮绘图/视觉对话会累计历史图片，按需调大。
@@ -93,6 +94,7 @@ if [[ "$engine_connect_host" == 0.0.0.0 ]]; then engine_connect_host=127.0.0.1; 
 [[ "$MTP_GAMMA" =~ ^[0-8]$ ]] || fail 'MTP_GAMMA 范围为 0–8（0=引擎按模式自选 greedy 4 / 采样自适应）'
 [[ "$KVSNAP_MAX_GB" =~ ^(0|[1-9][0-9]*)$ ]] || fail 'KVSNAP_MAX_GB 必须为非负整数'
 [[ "$RCKPT_MAX" =~ ^(0|[1-9][0-9]*)$ ]] || fail 'RCKPT_MAX 必须为非负整数'
+[[ "$KV_TYPE" == bf16 || "$KV_TYPE" == q8 ]] || fail "KV_TYPE must be bf16 or q8"
 [[ "$KV_PAGED" =~ ^[01]$ ]] || fail 'KV_PAGED 必须为 0 或 1'
 [[ "$KV_POOL_TOKENS" =~ ^(0|[1-9][0-9]*)$ && ${#KV_POOL_TOKENS} -le 8 ]] || fail 'KV_POOL_TOKENS 必须为非负整数'
 [[ "$PARALLEL" =~ ^[1-8]$ ]] || fail 'PARALLEL 范围为 1–8'
@@ -151,6 +153,7 @@ fi
 # 生产选项与 Linux start.sh 一致，唯独不设 QWENOX_PREFILL_CHUNK：
 # Windows 默认 6144（256K 下 16384 会顶破 95 GiB arena 上限；6144 与 8192 的 PP 差
 # 约 0.5%，工作区少约 1.7 GiB，实测见 PORTING-WINDOWS.md）。
+export QWENOX_KV_TYPE="$KV_TYPE"
 export QWENOX_QSA_KV_BF16=1 QWENOX_QSA_WMMA=1 QWENOX_QSA_WMMA_BTV=1
 export QWENOX_MOE_LT=1 QWENOX_MOE_LT_BF16=1 QWENOX_GR_BF16=1
 export QWENOX_GDN_STREAM=1 QWENOX_GDN_WAVE=1 QWENOX_NOWARMUP=1

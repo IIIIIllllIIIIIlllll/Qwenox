@@ -106,6 +106,7 @@ struct GpuModel {
   float *d_Alog, *d_dtbias;               // (gdn_layers, 48)
   float* d_gdnnorm = nullptr;             // (gdn_layers, 128)
   float *d_kc = nullptr, *d_vc = nullptr;  // (qsa_layers, maxctx, 512), FP32 mode
+  KvQ8Block *d_kcq = nullptr, *d_vcq = nullptr;  // packed Q8, 16 blocks/row
   uint16_t *d_kcb = nullptr, *d_vcb = nullptr;  // BF16 KV cache (default mode)
   uint16_t *d_vcbt = nullptr;  // optional BF16 V cache: [block][kvh][dim][slot]
   float *d_qg, *d_qs, *d_gs, *d_kb, *d_vb, *d_attn;
@@ -473,13 +474,14 @@ struct GpuModel {
   bool qsa_dense = getenv("QWENOX_QSA_DENSE") != nullptr;
   // BF16 KV cache: measured parity at 32K (QSA is latency-bound, not DRAM-bound)
   // and flips the 8192 oracle -> opt-in experiment, default stays FP32.
-  bool qsa_kv_fp32 = getenv("QWENOX_QSA_KV_BF16") == nullptr;  // default: FP32 cache
+  bool qsa_kv_q8 = kv_type_env() == KvType::Q8;
+  bool qsa_kv_fp32 = kv_type_env() == KvType::F32;  // default: FP32 cache
   // WMMA sparse prefill attention (k_qsa_wmma): opt-in on top of BF16 KV mode.
   // bf16 P + WMMA accumulation is not bitwise fp32 — FP32 kernels stay default.
   bool qsa_wmma = getenv("QWENOX_QSA_WMMA") != nullptr;
   // Keep the established row-major cache for decode, MTP, snapshots, and
   // the default WMMA path; this second cache is a prefill-only opt-in.
-  bool qsa_wmma_btv = qsa_wmma && !qsa_kv_fp32 &&
+  bool qsa_wmma_btv = !qsa_kv_q8 && qsa_wmma && !qsa_kv_fp32 &&
                       getenv("QWENOX_QSA_WMMA_BTV") != nullptr;
   // QWENOX_QSA_WMMA6=1: dim-split 128-thread rewrite (k_qsa_wmma6); layered on
   // the transposed-V path since it reads B fragments from that cache.
@@ -824,6 +826,7 @@ struct GpuModel {
   // MTP KV / indexer keys: views of pool layer nqsa (B0), not allocations
   float* d_mkcf = nullptr;     // FP32 mode (kv_layer_rows, 512)
   float* d_mvcf = nullptr;
+  KvQ8Block *d_mkcq = nullptr, *d_mvcq = nullptr;  // MTP views of pool layer nqsa
   uint16_t* d_mkcb = nullptr;  // BF16 mode
   uint16_t* d_mvcb = nullptr;
   float* d_mik = nullptr;      // pooled keys (ik_layer_blocks, 128)
@@ -1270,7 +1273,7 @@ struct GpuModel {
       // k_qsa_wmma<*, true> (sparse prefill, with or without BTV) kernels.
       // The union / wmma6 / k_qsa_flash_bf16 sparse kernels are not paged.
       const bool bf16_ok = qsa_dense || (qsa_wmma && !qsa_wmma6);  // union: paged since aggr
-      if (mode && !qsa_kv_fp32 && !bf16_ok) {
+      if (mode && !qsa_kv_q8 && !qsa_kv_fp32 && !bf16_ok) {
         fprintf(stderr, "[kvpage] QWENOX_KV_PAGED ignored: with QWENOX_QSA_KV_BF16, "
                         "paging needs QWENOX_QSA_WMMA (with or without _BTV) and no "
                         "QWENOX_QSA_WMMA6 / QWENOX_QSA_UNION\n");
@@ -1295,7 +1298,7 @@ struct GpuModel {
                 "on-demand alloc=%s, kv=%s\n",
                 kv_pool_pages, KV_PAGE,
                 mode == 2 ? "scrambled+fifo(self-test)" : "lowest-first",
-                qsa_kv_fp32 ? "fp32" : (qsa_wmma_btv ? "bf16+btv" : "bf16"));
+                qsa_kv_q8 ? "q8g32 (no BF16 twin)" : (qsa_kv_fp32 ? "fp32" : (qsa_wmma_btv ? "bf16+btv" : "bf16")));
         if (kv_pool_pages > kv_lpages)
           fprintf(stderr, "[kvpage] pool enlarged: %d pages = %.2fx one sequence "
                           "(QWENOX_KV_POOL_TOKENS)\n",
@@ -1328,7 +1331,12 @@ struct GpuModel {
       DALLOC(&d_iscores, (size_t)std::min(maxctx, INDEX_BATCH) * 4 * index_blocks * 4);
       DALLOC(&d_iselected, (size_t)maxbatch_cap * INDEX_BUDGET * 4);
     }
-    if (qsa_kv_fp32) {
+    if (qsa_kv_q8) {
+      DALLOC(&d_kcq, (size_t)kv_nl * kv_layer_rows * KV_Q8_ROW_BYTES);
+      DALLOC(&d_vcq, (size_t)kv_nl * kv_layer_rows * KV_Q8_ROW_BYTES);
+      fprintf(stderr, "kv: q8g32, 34 bytes/32 elements, K+V %.3f GiB; dequantize on load\n",
+              2.0 * kv_nl * kv_layer_rows * KV_Q8_ROW_BYTES / (1ull << 30));
+    } else if (qsa_kv_fp32) {
       DALLOC(&d_kc, (size_t)kv_nl * kv_layer_rows * 512 * 4);
       DALLOC(&d_vc, (size_t)kv_nl * kv_layer_rows * 512 * 4);
     } else {
@@ -1620,7 +1628,10 @@ struct GpuModel {
         upload("mtp.pre_fc_norm_hidden.weight", d_mnorm_h, rb);
         // B0: pool layer nqsa (allocated above since kv_nl == nqsa + 1)
         const size_t moff = (size_t)nqsa * kv_layer_rows * 512;
-        if (qsa_kv_fp32) {
+        if (qsa_kv_q8) {
+          d_mkcq = d_kcq + moff / 32;
+          d_mvcq = d_vcq + moff / 32;
+        } else if (qsa_kv_fp32) {
           d_mkcf = d_kc + moff;
           d_mvcf = d_vc + moff;
         } else {
@@ -1660,7 +1671,7 @@ struct GpuModel {
                 "mtp: draft head enabled (norm=%s hagg=%s kv=%s fc_hidden dtype=%d)\n",
                 mtp_norm_mode ? "branch" : "full",
                 mtp_hagg_mode ? "branch" : "sum",
-                qsa_kv_fp32 ? "fp32" : "bf16",
+                qsa_kv_q8 ? "q8g32" : (qsa_kv_fp32 ? "fp32" : "bf16"),
                 (int)ckpt.at("mtp.fc_hidden.weight").dtype);
       }
     }
@@ -2425,7 +2436,12 @@ struct GpuModel {
     k_rope<<<(2 * 32 + 127) / 128, 128, 0, g_str>>>(d_kb, 2, 256, 64, d_pos,
                                                     g_cfg.rope_theta, d_rdelta);
     // append to cache at *d_pos
-    if (qsa_kv_fp32) {
+    if (qsa_kv_q8) {
+      auto* kc = d_kcq + (size_t)qi * kv_layer_rows * 16;
+      auto* vc = d_vcq + (size_t)qi * kv_layer_rows * 16;
+      k_store_kv_q8<<<4, 128, 0, g_str>>>(d_kb, d_vb, kc, vc, 1, 0, kvpt(), d_pos);
+      qsa_attn(kc, vc, kvpt());
+    } else if (qsa_kv_fp32) {
       float* kc = d_kc + (size_t)qi * kv_layer_rows * 512;
       float* vc = d_vc + (size_t)qi * kv_layer_rows * 512;
       k_store_kv<<<2, 256, 0, g_str>>>(d_kb, d_vb, kc, vc, d_pos, kvpt());
@@ -4386,6 +4402,41 @@ struct GpuModel {
             base, P, qi, h[0], h[1], h[2], h[3], h[4], h[5], h[6]);
   }
 
+  // Q8 uses row-major WMMA: expand only the fragment being consumed.
+  // No context-sized dequantization workspace or transposed BF16 copy.
+  void qsa_flash_b(const KvQ8Block* kc, const KvQ8Block* vc, int P,
+                   int dense_P, int base = 0, const uint16_t* = nullptr,
+                   const int* ptab = nullptr, const int* dvb = nullptr,
+                   int row0 = 0, int = -1) {
+    const float* q = d_qsb + (size_t)row0 * 6144;
+    float* out = d_attnb + (size_t)row0 * 6144;
+    const int* sel = d_iselected + (size_t)row0 * g_index_budget;
+    if (dense_P > 0) {
+      if (qsa_dense) {
+        k_qsa_flash<false, false, KvQ8Block><<<dim3((dense_P + 15) / 16, 24), 128, 0, g_str>>>(
+            q, kc, vc, out, dense_P, 256, 2, 24, nullptr, 0, nullptr, nullptr,
+            nullptr, base, ptab, dvb);
+      } else if (ptab) {
+        k_qsa_wmma<false, true, true><<<dim3(dense_P, 2), 256, 0, g_str>>>(
+            q, kc, vc, nullptr, out, dense_P, 256, 2, 24, nullptr, base, base, ptab, dvb);
+      } else {
+        k_qsa_wmma<false, false, true><<<dim3(dense_P, 2), 256, 0, g_str>>>(
+            q, kc, vc, nullptr, out, dense_P, 256, 2, 24, nullptr, base, base, nullptr, dvb);
+      }
+    }
+    const int first = std::max(base, g_index_first);
+    const int n = dvb ? P : base + P - first;
+    if (!qsa_dense && n > 0) {
+      if (!dvb) sel += (size_t)(first - base) * g_index_budget;
+      if (ptab)
+        k_qsa_wmma<false, true><<<dim3(n, 2), 256, 0, g_str>>>(
+            q, kc, vc, nullptr, out, P, 256, 2, 24, sel, first, base, ptab, dvb);
+      else
+        k_qsa_wmma<false><<<dim3(n, 2), 256, 0, g_str>>>(
+            q, kc, vc, nullptr, out, P, 256, 2, 24, sel, first, base, nullptr, dvb);
+    }
+  }
+
   // QSA prefill flash over the KV cache: dense prefix plus the sparse tail.
   // base = absolute position of batch row 0 (0 for a fresh prefill; > 0 when
   // continuing from live KV/state). Dense rows are the batch-local prefix,
@@ -4703,7 +4754,10 @@ struct GpuModel {
   }
   void kv_zero_unpaged() {
     const size_t nqsa = (size_t)(g_cfg.layers / 4), rows = (size_t)kv_nl * kv_layer_rows;
-    if (qsa_kv_fp32) {
+    if (qsa_kv_q8) {
+      if (kv_zero_has('k')) CK(hipMemset(d_kcq, 0, rows * KV_Q8_ROW_BYTES));
+      if (kv_zero_has('v')) CK(hipMemset(d_vcq, 0, rows * KV_Q8_ROW_BYTES));
+    } else if (qsa_kv_fp32) {
       if (kv_zero_has('k')) CK(hipMemset(d_kc, 0, rows * 512 * 4));
       if (kv_zero_has('v')) CK(hipMemset(d_vc, 0, rows * 512 * 4));
     } else {
@@ -4785,7 +4839,10 @@ struct GpuModel {
     const size_t g = (size_t)page;
     for (int qi = 0; qi < kv_nl; qi++) {
       const size_t row0 = (size_t)qi * kv_layer_rows + g * KV_PAGE;
-      if (qsa_kv_fp32) {
+      if (qsa_kv_q8) {
+        fn(d_kcq + row0 * 16, (size_t)KV_PAGE * KV_Q8_ROW_BYTES, 'k');
+        fn(d_vcq + row0 * 16, (size_t)KV_PAGE * KV_Q8_ROW_BYTES, 'v');
+      } else if (qsa_kv_fp32) {
         fn(d_kc + row0 * 512, (size_t)KV_PAGE * 512 * 4, 'k');
         fn(d_vc + row0 * 512, (size_t)KV_PAGE * 512 * 4, 'v');
       } else {
@@ -5354,7 +5411,17 @@ struct GpuModel {
       npu_qg_submit_g(l, xb);  // M4：gate 半趁 qsa:flash（~200ms）跑
 #endif
       int dense_P = qsa_dense ? P : min(P, std::max(0, g_index_first - base));
-      if (qsa_kv_fp32) {
+      if (qsa_kv_q8) {
+        auto* kc = d_kcq + qsa_off / 32;
+        auto* vc = d_vcq + qsa_off / 32;
+        k_qsa_kprep<false><<<dim3(2, P), 256, 0, g_str>>>(
+            kbb, knw, kbb, nullptr, g_cfg.norm_eps, base, ropecs);
+        k_store_kv_q8<<<P * 4, 128, 0, g_str>>>(kbb, vbb, kc, vc, P, base, ptabc, dvb);
+        KP_SUB_END();
+        KP_SUB("qsa:flash");
+        if (!defer_attn) qsa_flash_b(kc, vc, P, dense_P, base, nullptr, ptabc, dvb, r0, sovr);
+        KP_SUB_END();
+      } else if (qsa_kv_fp32) {
         float* kc = d_kc + qsa_off;
         float* vc = d_vc + qsa_off;
         k_qsa_kprep<false><<<dim3(2, P), 256, 0, g_str>>>(kbb, knw, kbb,
@@ -5539,7 +5606,14 @@ struct GpuModel {
                                                          g_cfg.rope_theta);
         k_rope<<<(2 * 32 + 127) / 128, 128, 0, g_str>>>(kb, 2, 256, 64, pabs,
                                                         g_cfg.rope_theta);
-        if (qsa_kv_fp32) {
+        if (qsa_kv_q8) {
+          auto* kc = d_kcq + qsa_off / 32;
+          auto* vc = d_vcq + qsa_off / 32;
+          k_store_kv_q8<<<4, 128, 0, g_str>>>(kb, vb, kc, vc, 1, 0, ptabc, pabs);
+          k_qsa_step<KvQ8Block><<<24, 256, 0, g_str>>>(
+              qs, kc, vc, att, pabs, 256, 2, 24,
+              qsa_dense ? nullptr : iselb + (size_t)t * g_index_budget, false, ptabc);
+        } else if (qsa_kv_fp32) {
           k_store_kv<<<2, 256, 0, g_str>>>(kb, vb, d_kc + qsa_off, d_vc + qsa_off,
                                            pabs, ptabc);
           k_qsa_step<float><<<24, 256, 0, g_str>>>(
@@ -8551,7 +8625,10 @@ struct GpuModel {
     k_rope<<<(2 * 32 + 127) / 128, 128, 0, g_str>>>(d_kb, 2, 256, 64, d_mpos,
                                                     g_cfg.rope_theta,
                                                     d_rdelta);
-    if (qsa_kv_fp32) {
+    if (qsa_kv_q8) {
+      k_store_kv_q8<<<4, 128, 0, g_str>>>(d_kb, d_vb, d_mkcq, d_mvcq, 1, 0, kvpt(), d_mpos);
+      mtp_qsa_attn(d_mkcq, d_mvcq);
+    } else if (qsa_kv_fp32) {
       k_store_kv<<<2, 256, 0, g_str>>>(d_kb, d_vb, d_mkcf, d_mvcf, d_mpos, kvpt());
       mtp_qsa_attn(d_mkcf, d_mvcf);
     } else {
@@ -8630,7 +8707,10 @@ struct GpuModel {
                                                      g_cfg.rope_theta, rd);
     k_rope<<<(2 * 32 + 127) / 128, 128, 0, g_str>>>(kb, 2, 256, 64, mp,
                                                     g_cfg.rope_theta, rd);
-    if (qsa_kv_fp32) {
+    if (qsa_kv_q8) {
+      k_store_kv_q8<<<4, 128, 0, g_str>>>(kb, vb, d_mkcq, d_mvcq, 1, 0, pt, mp);
+      mtp_qsa_attn_slot(s, qs, at, d_mkcq, d_mvcq);
+    } else if (qsa_kv_fp32) {
       k_store_kv<<<2, 256, 0, g_str>>>(kb, vb, d_mkcf, d_mvcf, mp, pt);
       mtp_qsa_attn_slot(s, qs, at, d_mkcf, d_mvcf);
     } else {
@@ -9192,7 +9272,11 @@ struct GpuModel {
     int dense_P = qsa_dense ? P : min(P, std::max(0, g_index_first - base));
     // rows [base, base+P) of pool layer nqsa: one copy / convert per
     // physically contiguous page run (a single one unpaged)
-    if (qsa_kv_fp32) {
+    if (qsa_kv_q8) {
+      k_store_kv_q8<<<P * 4, 128, 0, g_str>>>(
+          d_kbb, d_vbb, d_mkcq, d_mvcq, P, base, kvpt());
+      if (!kv_only) qsa_flash_b(d_mkcq, d_mvcq, P, dense_P, base, nullptr, kvpt());
+    } else if (qsa_kv_fp32) {
       kv_rows_store(d_mkcf, d_kbb, base, P);
       kv_rows_store(d_mvcf, d_vbb, base, P);
       if (!kv_only) qsa_flash_b(d_mkcf, d_mvcf, P, dense_P, base, nullptr, kvpt());
@@ -9319,12 +9403,12 @@ struct GpuModel {
       uint64_t hk = 1469598103934665603ULL, hv = hk, hi = hk, hr = hk;
       std::vector<uint8_t> tmp;
       kv_runs(base, base + P, KV_PAGE, [&](int, size_t pr, int n) {
-        const size_t bytes = (size_t)n * 512 * (qsa_kv_fp32 ? 4 : 2);
+        const size_t bytes = (size_t)n * kv_format_row_bytes(qsa_kv_q8 ? 8 : (qsa_kv_fp32 ? 4 : 2));
         tmp.resize(bytes);
-        CK(hipMemcpy(tmp.data(), qsa_kv_fp32 ? (void*)(d_mkcf + pr * 512) : (void*)(d_mkcb + pr * 512),
+        CK(hipMemcpy(tmp.data(), qsa_kv_q8 ? (void*)(d_mkcq + pr * 16) : (qsa_kv_fp32 ? (void*)(d_mkcf + pr * 512) : (void*)(d_mkcb + pr * 512)),
                      bytes, hipMemcpyDeviceToHost));
         hk = fnv(hk, tmp.data(), bytes);
-        CK(hipMemcpy(tmp.data(), qsa_kv_fp32 ? (void*)(d_mvcf + pr * 512) : (void*)(d_mvcb + pr * 512),
+        CK(hipMemcpy(tmp.data(), qsa_kv_q8 ? (void*)(d_mvcq + pr * 16) : (qsa_kv_fp32 ? (void*)(d_mvcf + pr * 512) : (void*)(d_mvcb + pr * 512)),
                      bytes, hipMemcpyDeviceToHost));
         hv = fnv(hv, tmp.data(), bytes);
       });

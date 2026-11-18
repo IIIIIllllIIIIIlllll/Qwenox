@@ -408,7 +408,10 @@ __global__ void __launch_bounds__(256) k_gr_scatter_norm_inj_bf16_old(
   }
 }
 
+#include "kv_q8_test.inc"
+
 int main() {
+  test_kv_q8();
   // ---- 1. k_rmsnorm_zc_grouped batched wrap (grid = 4*P, ngroups = 4) ----
   {
     const int P = 3, G = 4, N = 2560;

@@ -26,7 +26,7 @@ using Conf = std::map<std::string, std::string>;
 inline const char* kManagedKeys[] = {
     "MODEL_FILE", "NGRAM_FILE", "OVERLAY_FILE", "MTP_FILE", "VISION_FILE",
     "GGUF_FILE", "GGUF_MTP_FILE", "GGUF_VISION_FILE", "GGUF_PLE_FILE",
-    "TOKENIZER_DIR", "MAX_CONTEXT", "PARALLEL", "KV_POOL_TOKENS", "KV_PAGED",
+    "TOKENIZER_DIR", "MAX_CONTEXT", "PARALLEL", "KV_POOL_TOKENS", "KV_PAGED", "KV_TYPE",
     "PREFILL_CHUNK", "ROPE_FACTOR",
     "KVSNAP_MAX_GB", "KVSNAP_DIR", "MOE_A4", "QSA_INDEXER_BUDGET", "AFFINITY",
     "ENGINE_HOST", "ENGINE_PORT", "API_HOST", "API_PORT",
@@ -351,6 +351,11 @@ inline bool validate_conf(const Conf& conf, std::string* err) {
     if (!get_int("API_PORT", 8731, 1, 65535, &api_port)) return false;
     if (!get_int("MAX_CONTEXT", 262144, 1024, 1 << 20, &max_context)) return false;
     if (!get_int("PARALLEL", 1, 1, 8, &parallel)) return false;
+    const std::string kv_type = cfg(conf, "KV_TYPE", "bf16");
+    if (kv_type != "bf16" && kv_type != "q8") {
+        *err = "KV_TYPE must be bf16 or q8";
+        return false;
+    }
     if (!get_int("KV_PAGED", 1, 0, 1, &kv_paged)) return false;
     if (!get_int("KV_POOL_TOKENS", 0, 0, 1 << 24, &kv_pool_tokens)) return false;
     if (!get_int("PREFILL_CHUNK", 0, 0, 1 << 20, &prefill_chunk)) return false;
