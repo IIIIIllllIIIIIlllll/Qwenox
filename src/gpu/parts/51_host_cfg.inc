@@ -113,7 +113,7 @@ static Geo geo(const GpuModel& m) {
   Geo G;
   G.nqsa = g_cfg.layers / 4;
   G.ngdn = g_cfg.layers - G.nqsa;
-  G.kvb = m.qsa_kv_q8 ? 8 : (m.qsa_kv_fp32 ? 4 : 2);
+  G.kvb = m.qsa_kv_q8 ? 8 : (m.qsa_kv_fp16 ? 16 : (m.qsa_kv_fp32 ? 4 : 2));
   G.has_ik = m.d_ik ? 1 : 0;
   G.row_b = kv_format_row_bytes(G.kvb);
   G.s_b = (size_t)G.ngdn * 48 * 128 * 128 * 4;
@@ -149,7 +149,8 @@ static bool ck_sane(const CkHdr& h) {
   const uint64_t big = 1ull << 36;
   return !memcmp(h.magic, MAG_K, 8) && h.n > 0 && h.n < (1 << 24) &&
          h.nc == (h.n - 1) / KV_PAGE && h.nl > 0 && h.nl <= 64 &&
-         (h.kvb == 2 || h.kvb == 4 || h.kvb == 8) && h.nik >= 0 && h.nik <= 2 * KV_PAGE_BLOCKS &&
+         (h.kvb == 2 || h.kvb == 4 || h.kvb == 8 || h.kvb == 16) &&
+         h.nik >= 0 && h.nik <= 2 * KV_PAGE_BLOCKS &&
          h.s_b < big && h.conv_b < big && h.ring_b < big && h.iraw_b < big &&
          h.mR_b < big && h.miraw_b < big;
 }

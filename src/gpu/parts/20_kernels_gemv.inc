@@ -2026,6 +2026,22 @@ __global__ void k_store_kv_bf16(const float* __restrict__ kb,
   if (vct) vct[((size_t)(row >> 2) * 512 + i) * 4 + (pos & 3)] = v;
 }
 
+// Native FP16 rows, shared by prefill, decode, MTP and graph replay. Convert
+// directly from FP32 with RNE; never pass through BF16 or keep a BF16 twin.
+__global__ void k_store_kv_fp16(const float* __restrict__ k,
+                                const float* __restrict__ v,
+                                __half* __restrict__ kc,
+                                __half* __restrict__ vc, int P, int base,
+                                const int* __restrict__ ptab = nullptr,
+                                const int* __restrict__ dbase = nullptr) {
+  const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= (size_t)P * 512) return;
+  const int pos = (dbase ? *dbase : base) + (int)(i / 512);
+  const size_t dst = (size_t)kv_row(ptab, pos) * 512 + i % 512;
+  kc[dst] = __float2half_rn(k[i]);
+  vc[dst] = __float2half_rn(v[i]);
+}
+
 // Quantize K and V together: one wave owns one independent 32-dim group.
 // Works for prefill, decode, MTP, non-bound slots and captured verify graphs.
 // ptab maps logical rows; dbase supplies the graph's replay-time base.

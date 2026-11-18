@@ -352,8 +352,8 @@ inline bool validate_conf(const Conf& conf, std::string* err) {
     if (!get_int("MAX_CONTEXT", 262144, 1024, 1 << 20, &max_context)) return false;
     if (!get_int("PARALLEL", 1, 1, 8, &parallel)) return false;
     const std::string kv_type = cfg(conf, "KV_TYPE", "bf16");
-    if (kv_type != "bf16" && kv_type != "q8") {
-        *err = "KV_TYPE must be bf16 or q8";
+    if (kv_type != "bf16" && kv_type != "fp16" && kv_type != "q8") {
+        *err = "KV_TYPE must be bf16, fp16 or q8";
         return false;
     }
     if (!get_int("KV_PAGED", 1, 0, 1, &kv_paged)) return false;

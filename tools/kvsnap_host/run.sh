@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # One-shot host test of kvsnap (no GPU): extract the namespace from the repo,
 # compile with -Wall -Wextra -Werror, run save + restart-index stages.
-# usage: tools/kvsnap_host/run.sh [REPO] [DIR]  (Linux, g++ only; no GPU, no model)
+# usage: tools/kvsnap_host/run.sh [REPO] [DIR] [bf16|fp16] (Linux; no GPU/model)
 #  -> ends with KVSNAP HOST TEST: PASS/FAIL
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 repo="${1:-$here/../..}"
 dir="${2:-/tmp/kvsnap-host-test}"
+precision="${3:-bf16}"
+[[ "$precision" == bf16 || "$precision" == fp16 ]] || { echo 'expected bf16 or fp16' >&2; exit 2; }
 src="$repo/src/gpu/parts/51_host_cfg.inc"
 end=$(grep -n '^}  // namespace kvsnap' "$src" | cut -d: -f1)
 build=/tmp/kvsnap-host-build
@@ -21,8 +23,8 @@ g++ -std=c++17 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter \
     -I"$build" "$build/harness.cpp" -o "$build/harness"
 rm -rf "$dir" "$dir.index"
 rc=0
-timeout 120 "$build/harness" save "$dir" 2>"$build/save.err" || rc=1
-timeout 120 "$build/harness" index "$dir" 2>"$build/index.err" || rc=1
+timeout 120 "$build/harness" save "$dir" "$precision" 2>"$build/save.err" || rc=1
+timeout 120 "$build/harness" index "$dir" "$precision" 2>"$build/index.err" || rc=1
 echo "---- engine log (stderr) ----"; tail -n 12 "$build/save.err"; tail -n 8 "$build/index.err"
 ((rc == 0)) && echo "KVSNAP HOST TEST: PASS" || echo "KVSNAP HOST TEST: FAIL"
 exit $rc

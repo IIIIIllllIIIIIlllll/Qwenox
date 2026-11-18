@@ -67,7 +67,7 @@ static const char* log_ts() { return "[t]"; }
 // ---- stubs for what kvsnap uses from the engine -------------------------------
 static const int KV_PAGE = 256, KV_PAGE_BLOCKS = 64;
 static size_t kv_format_row_bytes(int format) {
-  return format == 8 ? 16 * 34 : (size_t)512 * format;
+  return format == 8 ? 16 * 34 : (size_t)512 * (format == 16 ? 2 : format);
 }
 struct Rope {
   double factor = 0, beta_fast = 0, beta_slow = 0, attention_factor = 0;
@@ -110,8 +110,8 @@ static bool has_image_tok(const T* t, size_t n) {
 
 static const int MAXCTX = 4096;
 struct GpuModel {
-  // geometry: nqsa = 1 QSA layer + 1 MTP layer, BF16 KV, indexer keys on
-  bool qsa_kv_q8 = false, qsa_kv_fp32 = false, qsa_wmma_btv = false,
+  // geometry: nqsa = 1 QSA layer + 1 MTP layer, 16-bit KV, indexer keys on
+  bool qsa_kv_q8 = false, qsa_kv_fp16 = false, qsa_kv_fp32 = false, qsa_wmma_btv = false,
        kv_paged = false, ple_on = true;
   bool mrope_active_ = false;
   uint64_t img_hash_ = 0;
@@ -552,6 +552,12 @@ int main(int argc, char** argv) {
   const std::string mode = argv[1], dir = argv[2];
   kvsnap::g_model_files = {"/dev/null"};
   GpuModel m;
+  if (argc > 3 && std::string(argv[3]) == "fp16") m.qsa_kv_fp16 = true;
+  const auto original_fp = kvsnap::fingerprint(m);
+  m.qsa_kv_fp16 = !m.qsa_kv_fp16;
+  check(kvsnap::fingerprint(m) != original_fp, "FP16 / BF16 snapshot fingerprints differ");
+  m.qsa_kv_fp16 = !m.qsa_kv_fp16;
+  check(kvsnap::geo(m).row_b == 1024, "16-bit KV row size stays 1024 bytes");
   kvsnap::Cfg cfg;
   cfg.dir = dir;
   cfg.min_tokens = 1;
@@ -565,6 +571,24 @@ int main(int argc, char** argv) {
     kvsnap::init(m, cfg);
     save(m, A), save(m, B);
     check(disk_ok(dir, &info), "保存 A、B 后索引 == 磁盘", info);
+    // Even a caller holding the old entry must not restore the other
+    // 16-bit encoding; rejecting it must leave the live KV untouched.
+    const auto entry = kvsnap::match(toks(1301, 7, A), kvsnap::g_fp);
+    check((bool)entry, "snapshot entry available for encoding check");
+    if (!entry) return 1;
+    kvsnap::BusyGuard encoding_guard{entry};
+    const auto before_k = m.kc, before_v = m.vc;
+    m.qsa_kv_fp16 = !m.qsa_kv_fp16;
+    uint64_t bad_page = 0;
+    int npages = 0;
+    bool mtp_wrong = false;
+    kvsnap::RsTime wrong_time;
+    const int wrong = kvsnap::restore_body(m, *entry, toks(1301, 7, A),
+                                            &mtp_wrong, &bad_page, &npages, wrong_time);
+    check(wrong == kvsnap::RS_OTHER && m.kc == before_k && m.vc == before_v,
+          "FP16 / BF16 restore rejects mismatched encoding before writes");
+    m.qsa_kv_fp16 = !m.qsa_kv_fp16;
+    encoding_guard.drop();
     bool mt = false;
     int r = restore(m, A, &mt);
     check(r == (int)A.size() && same_as(m, A) && mt, "恢复 A 逐字节一致（含 MTP）",

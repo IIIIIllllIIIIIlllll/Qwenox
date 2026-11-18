@@ -1645,8 +1645,8 @@ bool extra_validate(const svcconf::Conf& conf, std::string* err) {
         return false;
     }
     const std::string kvt = svcconf::cfg(conf, "KV_TYPE", "bf16");
-    if (kvt != "bf16" && kvt != "q8") {
-        *err = "KV_TYPE must be bf16 or q8";
+    if (kvt != "bf16" && kvt != "fp16" && kvt != "q8") {
+        *err = "KV_TYPE must be bf16, fp16 or q8";
         return false;
     }
     if (!int_range("MTP_GAMMA", "0", 0, 8)) return false;

@@ -23,15 +23,16 @@ struct Cfg {
 };
 static Cfg g_cfg;
 
-enum class KvType { F32, BF16, Q8 };
+enum class KvType { F32, BF16, F16, Q8 };
 static KvType kv_type_env() {
   const char* e = getenv("QWENOX_KV_TYPE");
   if (!e || !*e)
     return getenv("QWENOX_QSA_KV_BF16") ? KvType::BF16 : KvType::F32;
   if (!strcmp(e, "bf16")) return KvType::BF16;
+  if (!strcmp(e, "fp16") || !strcmp(e, "f16")) return KvType::F16;
   if (!strcmp(e, "fp32") || !strcmp(e, "f32")) return KvType::F32;
   if (!strcmp(e, "q8") || !strcmp(e, "q8_0")) return KvType::Q8;
-  throw std::runtime_error("QWENOX_KV_TYPE must be bf16, fp32, or q8");
+  throw std::runtime_error("QWENOX_KV_TYPE must be bf16, fp16, fp32, or q8");
 }
 
 // Native KV format: symmetric int8, 32 consecutive dimensions per group,
@@ -57,8 +58,9 @@ static int q8_prefill_min_env() {
   return e ? std::max(1, atoi(e)) : 256;
 }
 static size_t kv_format_row_bytes(int format) {
-  // Snapshot format tags: 2 = BF16, 4 = FP32, 8 = native Q8 group32.
-  return format == 8 ? KV_Q8_ROW_BYTES : (size_t)512 * format;
+  // Snapshot tags are encodings, not element sizes: 16 distinguishes FP16
+  // from the established BF16 tag 2 while retaining the same row size.
+  return format == 8 ? KV_Q8_ROW_BYTES : (size_t)512 * (format == 16 ? 2 : format);
 }
 static int g_index_budget = 512;
 static int g_index_tokens = 2048;

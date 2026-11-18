@@ -776,6 +776,9 @@ static inline int kv_pool_pages_for(int maxctx) {
 // KV cache element access: FP32 caches load directly; BF16 caches expand to
 // fp32 in registers (LDS staging and arithmetic stay fp32 either way).
 __device__ __forceinline__ float kv_ld1(const float* __restrict__ p) { return *p; }
+__device__ __forceinline__ float kv_ld1(const __half* __restrict__ p) {
+  return __half2float(*p);
+}
 __device__ __forceinline__ float kv_ld1(const uint16_t* __restrict__ p) {
   uint32_t u = (uint32_t)*p << 16;
   float f;
@@ -784,6 +787,13 @@ __device__ __forceinline__ float kv_ld1(const uint16_t* __restrict__ p) {
 }
 __device__ __forceinline__ float4 kv_ld4(const float* __restrict__ p) {
   return *(const float4*)p;
+}
+__device__ __forceinline__ float4 kv_ld4(const __half* __restrict__ p) {
+  const uint2 bits = *(const uint2*)p;
+  return make_float4(__half2float(__ushort_as_half((uint16_t)bits.x)),
+                     __half2float(__ushort_as_half((uint16_t)(bits.x >> 16))),
+                     __half2float(__ushort_as_half((uint16_t)bits.y)),
+                     __half2float(__ushort_as_half((uint16_t)(bits.y >> 16))));
 }
 __device__ __forceinline__ float4 kv_ld4(const uint16_t* __restrict__ p) {
   uint2 pk = *(const uint2*)p;  // 4 bf16, little-endian pairs

@@ -68,7 +68,7 @@ serve_init() {
     [[ "$value" =~ ^(0|[1-9][0-9]*)$ && ${#value} -le 8 ]] || fail "$key 必须为非负整数"
   done
   [[ "$PLE_URING" =~ ^[01]$ ]] || fail 'PLE_URING 必须为 0 或 1'
-  [[ "$KV_TYPE" == bf16 || "$KV_TYPE" == q8 ]] || fail "KV_TYPE must be bf16 or q8"
+  [[ "$KV_TYPE" == bf16 || "$KV_TYPE" == fp16 || "$KV_TYPE" == q8 ]] || fail "KV_TYPE must be bf16, fp16 or q8"
   [[ "$KV_PAGED" =~ ^[01]$ ]] || fail 'KV_PAGED 必须为 0 或 1'
   [[ "$PARALLEL" =~ ^[1-8]$ ]] || fail 'PARALLEL 范围为 1–8'
   [[ "${MOE_A4:-0}" =~ ^[0-3]$ ]] || fail 'MOE_A4 范围为 0–3'

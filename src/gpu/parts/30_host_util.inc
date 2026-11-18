@@ -181,9 +181,10 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
 #endif
   const bool qsa_dense = getenv("QWENOX_QSA_DENSE") != nullptr;
   const bool kv_q8 = kv_type_env() == KvType::Q8;
+  const bool kv_fp16 = kv_type_env() == KvType::F16;
   const bool kv_fp32 = kv_type_env() == KvType::F32;
   const bool index_f32 = getenv("QWENOX_INDEX_BF16") == nullptr;
-  const bool btv = !kv_q8 && getenv("QWENOX_QSA_WMMA") && !kv_fp32 &&
+  const bool btv = !kv_q8 && !kv_fp16 && getenv("QWENOX_QSA_WMMA") && !kv_fp32 &&
                    getenv("QWENOX_QSA_WMMA_BTV");
   const bool fused = getenv("QWENOX_PREFILL_UNFUSED") == nullptr;
   const char* cut_off = getenv("QWENOX_CUT_INPASS");
@@ -216,7 +217,7 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
   const bool kv_bf16_pg_ok =
       qsa_dense || (getenv("QWENOX_QSA_WMMA") && !(btv && getenv("QWENOX_QSA_WMMA6")) &&
                     !(btv && getenv("QWENOX_QSA_UNION")));
-  const bool kv_paged = (kv_q8 || kv_fp32 || kv_bf16_pg_ok) && kvpe && atoi(kvpe) != 0;
+  const bool kv_paged = (kv_q8 || kv_fp16 || kv_fp32 || kv_bf16_pg_ok) && kvpe && atoi(kvpe) != 0;
   const size_t kvpg = (mc + KV_PAGE - 1) / KV_PAGE;
   // A2/A3：物理页池 = kv_pool_pages_for(mc) 页（默认 kvpg，QWENOX_KV_POOL_TOKENS 可加大）
   // + 1 个 guard 页；页表仍是每序列 kvpg 项

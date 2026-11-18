@@ -1,5 +1,7 @@
 # Experimental Q8 KV cache
 
+Native FP16 KV is also available; see [KV-FP16.md](KV-FP16.md).
+
 Build the updated engine and launcher/API first. Set `KV_TYPE=q8` in the
 environment or service.conf and restart the engine. The launcher default is
 `bf16`. Direct engine invocations use `QWENOX_KV_TYPE=q8`;

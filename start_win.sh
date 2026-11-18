@@ -94,7 +94,7 @@ if [[ "$engine_connect_host" == 0.0.0.0 ]]; then engine_connect_host=127.0.0.1; 
 [[ "$MTP_GAMMA" =~ ^[0-8]$ ]] || fail 'MTP_GAMMA 范围为 0–8（0=引擎按模式自选 greedy 4 / 采样自适应）'
 [[ "$KVSNAP_MAX_GB" =~ ^(0|[1-9][0-9]*)$ ]] || fail 'KVSNAP_MAX_GB 必须为非负整数'
 [[ "$RCKPT_MAX" =~ ^(0|[1-9][0-9]*)$ ]] || fail 'RCKPT_MAX 必须为非负整数'
-[[ "$KV_TYPE" == bf16 || "$KV_TYPE" == q8 ]] || fail "KV_TYPE must be bf16 or q8"
+[[ "$KV_TYPE" == bf16 || "$KV_TYPE" == fp16 || "$KV_TYPE" == q8 ]] || fail "KV_TYPE must be bf16, fp16 or q8"
 [[ "$KV_PAGED" =~ ^[01]$ ]] || fail 'KV_PAGED 必须为 0 或 1'
 [[ "$KV_POOL_TOKENS" =~ ^(0|[1-9][0-9]*)$ && ${#KV_POOL_TOKENS} -le 8 ]] || fail 'KV_POOL_TOKENS 必须为非负整数'
 [[ "$PARALLEL" =~ ^[1-8]$ ]] || fail 'PARALLEL 范围为 1–8'

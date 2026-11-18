@@ -593,10 +593,10 @@ const std::vector<Field>& field_specs() {
          FieldKind::kText, FieldGroup::kAlways, {}},
         {1, "KV_PAGED", "分页 KV", "并发模式必须开启",
          "Paged KV", "Required for parallel mode", FieldKind::kBool, FieldGroup::kAlways, {}},
-        {1, "KV_TYPE", "KV 缓存类型", "bf16 精度无损；q8 省约一半 KV 显存、精度略降",
-         "KV cache type", "bf16 = lossless; q8 ≈ half KV memory, slightly less precise",
+        {1, "KV_TYPE", "KV 缓存类型", "bf16 默认；fp16 同为 16 位、尾数更精细；q8 省显存",
+         "KV cache type", "bf16 = default; fp16 = finer mantissa, same row size; q8 = saves memory",
          FieldKind::kChoice, FieldGroup::kAlways,
-         {{"bf16", "bf16（默认）", "bf16 (default)"}, {"q8", "q8（省显存）", "q8 (saves memory)"}}},
+         {{"bf16", "bf16（默认）", "bf16 (default)"}, {"fp16", "fp16（半精度）", "fp16 (half precision)"}, {"q8", "q8（省显存）", "q8 (saves memory)"}}},
         {1, "PREFILL_CHUNK", "prefill 分段", "0：Linux 默认 16384，Windows 默认 6144",
          "Prefill chunk", "0: Linux default 16384, Windows default 6144",
          FieldKind::kText, FieldGroup::kAlways, {}},
@@ -1029,8 +1029,8 @@ std::vector<Check> validate(const Model& model) {
     if (model.get("QSA_INDEXER_BUDGET") != "0" && model.get("QSA_INDEXER_BUDGET") != "4096")
         fail(TR("QSA_INDEXER_BUDGET 只允许 0（默认 2048）或 4096",
                 "QSA_INDEXER_BUDGET only accepts 0 (default 2048) or 4096"));
-    if (model.get("KV_TYPE") != "bf16" && model.get("KV_TYPE") != "q8")
-        fail(TR("KV_TYPE 只允许 bf16 或 q8", "KV_TYPE only accepts bf16 or q8"));
+    if (model.get("KV_TYPE") != "bf16" && model.get("KV_TYPE") != "fp16" && model.get("KV_TYPE") != "q8")
+        fail(TR("KV_TYPE 只允许 bf16、fp16 或 q8", "KV_TYPE only accepts bf16, fp16 or q8"));
     if (model.get("MOE_A4") < "0" || model.get("MOE_A4") > "3" || model.get("MOE_A4").size() != 1)
         fail(TR("MOE_A4 只允许 0、1、2、3", "MOE_A4 only accepts 0, 1, 2 or 3"));
 

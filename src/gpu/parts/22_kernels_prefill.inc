@@ -1,3 +1,5 @@
+#include <type_traits>
+
 // ================== prefill batch (Phase 3a) kernels =========================
 
 // fp32 -> bf16 (round to nearest even)
@@ -1481,6 +1483,30 @@ __global__ void k_qsa_flash_bf16(const float* __restrict__ q,
 // 1.6e-4 vs the bf16-P fp32 reference path.
 using qw_shortx16 = __attribute__((ext_vector_type(16))) short;
 using qw_floatx8 = __attribute__((ext_vector_type(8))) float;
+using qw_halfx16 = __attribute__((ext_vector_type(16))) _Float16;
+template <class KVT>
+__device__ __forceinline__ uint16_t qw_f2bits(float x) { return f2bf(x); }
+template <>
+__device__ __forceinline__ uint16_t qw_f2bits<__half>(float x) {
+  return __half_as_ushort(__float2half_rn(x));
+}
+template <class KVT>
+__device__ __forceinline__ uint32_t qw_pack2(float a, float b) {
+  return (uint32_t)qw_f2bits<KVT>(a) | ((uint32_t)qw_f2bits<KVT>(b) << 16);
+}
+template <class KVT>
+__device__ __forceinline__ qw_floatx8 qw_mma(qw_shortx16 a, qw_shortx16 b,
+                                            qw_floatx8 c) {
+  return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c);
+}
+template <>
+__device__ __forceinline__ qw_floatx8 qw_mma<__half>(qw_shortx16 a, qw_shortx16 b,
+                                                   qw_floatx8 c) {
+  qw_halfx16 ah, bh;
+  memcpy(&ah, &a, sizeof ah);
+  memcpy(&bh, &b, sizeof bh);
+  return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(ah, bh, c);
+}
 __device__ __forceinline__ qw_shortx16 qw_ld16(const uint16_t* p) {
   short tmp[16];
   *(uint4*)&tmp[0] = *(const uint4*)p;
@@ -1488,6 +1514,9 @@ __device__ __forceinline__ qw_shortx16 qw_ld16(const uint16_t* p) {
   qw_shortx16 v;
   memcpy(&v, tmp, 32);
   return v;
+}
+__device__ __forceinline__ qw_shortx16 qw_ld16(const __half* p) {
+  return qw_ld16(reinterpret_cast<const uint16_t*>(p));
 }
 __device__ __forceinline__ qw_shortx16 qw_ld16(KvQ8View p) {
   qw_shortx16 v;
@@ -1604,8 +1633,8 @@ __device__ __forceinline__ void qsa_wmma_body(
       if (r < hq / hkv) {
         const float4* q4 = (const float4*)(qb + r * dh + c8 * 8);
         float4 a = q4[0], b = q4[1];
-        v.x = pack_bf2(a.x, a.y); v.y = pack_bf2(a.z, a.w);
-        v.z = pack_bf2(b.x, b.y); v.w = pack_bf2(b.z, b.w);
+        v.x = qw_pack2<KVT>(a.x, a.y); v.y = qw_pack2<KVT>(a.z, a.w);
+        v.z = qw_pack2<KVT>(b.x, b.y); v.w = qw_pack2<KVT>(b.z, b.w);
       }
       *(uint4*)&Qs[r][c8 * 8] = v;
     }
@@ -1655,9 +1684,9 @@ __device__ __forceinline__ void qsa_wmma_body(
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
         if ((k4 * 4 + j) & 1)
-          s1 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a[j], b[j], s1);
+          s1 = qw_mma<KVT>(a[j], b[j], s1);
         else
-          s0 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a[j], b[j], s0);
+          s0 = qw_mma<KVT>(a[j], b[j], s0);
       }
     }
     qw_floatx8 s;
@@ -1696,7 +1725,7 @@ __device__ __forceinline__ void qsa_wmma_body(
       int r = (lane < 16) ? e : 8 + e;
       float mn = fmaxf(m_run[e], __shfl_sync(~0ull, mrow, r));
       float p = (s[e] <= -1e29f) ? 0.f : __expf(s[e] - mn);
-      pb[e] = f2bf(p);
+      pb[e] = qw_f2bits<KVT>(p);
       float cf = __expf(m_run[e] - mn);
       float ls = p;
       ls += __shfl_xor_sync(~0ull, ls, 1);
@@ -1787,7 +1816,7 @@ __device__ __forceinline__ void qsa_wmma_body(
           qw_floatx8 o;
 #pragma unroll
           for (int e = 0; e < 8; ++e) o[e] = acc[dt][e];
-          o = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(ap, bv, o);
+          o = qw_mma<KVT>(ap, bv, o);
 #pragma unroll
           for (int e = 0; e < 8; ++e) acc[dt][e] = o[e];
         }
@@ -1806,7 +1835,7 @@ __device__ __forceinline__ void qsa_wmma_body(
         unsigned va[8];
         auto frag = qw_ld16(vp);
         // Rejected/future rows must have no arithmetic effect on this row.
-        if constexpr (sizeof(KVT) == sizeof(KvQ8Block)) {
+        if constexpr (sizeof(KVT) == sizeof(KvQ8Block) || std::is_same<KVT, __half>::value) {
           if (vk >= ntok) frag = qw_zero16();
         }
         memcpy(va, &frag, sizeof va);
@@ -1825,7 +1854,7 @@ __device__ __forceinline__ void qsa_wmma_body(
           qw_floatx8 o;
 #pragma unroll
           for (int e = 0; e < 8; ++e) o[e] = acc[dt][e];
-          o = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(ap, bv, o);
+          o = qw_mma<KVT>(ap, bv, o);
 #pragma unroll
           for (int e = 0; e < 8; ++e) acc[dt][e] = o[e];
         }
