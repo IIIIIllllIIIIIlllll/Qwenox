@@ -764,15 +764,18 @@ void check_context_page(CheckLines& c, const PanelVals& v) {
                                    TR("；调小上限或调大总池", "; lower the cap or grow the pool"));
     // Windows 设备内存是硬上限 95 GiB 的 arena：v2 权重 512K 池实测用 92.2（2 路）–93.8（8 路）
     // GiB，已是放得下的上限。有效值 = max(池, 上限)
-    // （0 = 跟随，上限超 512K 时跟随逻辑同样会把池顶超）。
+    // （0 = 跟随，上限超上限时跟随逻辑同样会把池顶超）。
+    // q8 的 KV 行只有 bf16 的约一半（544 B 对 1024 B，且不存转置 V），上限翻倍。
+    const long pool_max = v.kv_type == "q8" ? 1048576 : 524288;
     const long pool_eff = kv_pool > maxctx ? kv_pool : maxctx;
-    if (pool_eff > 524288)
+    if (pool_eff > pool_max)
         check_line(c, kLvFail,
                    TR("并发总池有效值 ", "Effective KV pool ") + std::to_string(pool_eff) +
-                       TR(" 超过 512K（524288 token）：Windows 95 GiB 显存 arena"
-                          " 放不下更大的池；调小 MAX_CONTEXT 或 KV_POOL_TOKENS",
-                          " exceeds 512K (524288 tokens): the 95 GiB Windows VRAM arena cannot "
-                          "fit a larger pool; lower MAX_CONTEXT or KV_POOL_TOKENS"));
+                       TR(" 超过上限 ", " exceeds the limit ") + std::to_string(pool_max) +
+                       TR(" token（Windows 95 GiB 显存 arena；q8 的 KV 行约为 bf16 一半，"
+                          "上限为 1M）；调小 MAX_CONTEXT 或 KV_POOL_TOKENS",
+                          " tokens (Windows 95 GiB VRAM arena; q8 rows are about half the bf16 "
+                          "size, so the cap is 1M); lower MAX_CONTEXT or KV_POOL_TOKENS"));
     if (!c.fatal)
         check_line(c, kLvPass,
                    TR("数值校验：上下文/并发/YaRN 参数合法",

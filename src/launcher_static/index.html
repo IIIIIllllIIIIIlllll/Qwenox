@@ -356,7 +356,7 @@ zh:{
   fb_empty:"（空目录或过滤后无匹配）",
   // 校验
   v_int:"需要整数", v_range:"范围 {a}–{b}", v_req:"必填", v_port:"不能和引擎端口相同",
-  v_par:"并发大于 1 需要开启分页 KV", v_pool:"有效 KV 池不能超过 512K（524288）",
+  v_par:"并发大于 1 需要开启分页 KV", v_pool:"有效 KV 池超过上限（q8 为 1M，其他 512K）",
   v_ip:"需要 IPv4 地址", v_aff:"需要非零整数掩码（如 0xFFFF）",
   // 字段补充
   yarn:"超过 256K，自动开启 YaRN", pool_auto:"0 = 一条最大上下文",
@@ -424,7 +424,7 @@ en:{
   fb_hint_dir:"Click a directory to enter, then pick it", fb_hint_file:"Click a file to pick; ↑ goes up; type a path + Enter",
   fb_empty:"(empty or filtered out)",
   v_int:"Integer required", v_range:"Range {a}–{b}", v_req:"Required", v_port:"Must differ from engine port",
-  v_par:"Concurrency > 1 needs paged KV", v_pool:"Effective KV pool must be ≤ 512K (524288)",
+  v_par:"Concurrency > 1 needs paged KV", v_pool:"Effective KV pool exceeds the cap (1M for q8, 512K otherwise)",
   v_ip:"IPv4 address required", v_aff:"Non-zero integer mask required (e.g. 0xFFFF)",
   yarn:"Above 256K — YaRN turns on automatically", pool_auto:"0 = one max context",
   aff_unset:"(unset)", aff_custom:"Custom mask…", aff_ph:"mask, e.g. 0xFFFF",
@@ -648,8 +648,9 @@ function validate(d){
   const n = k => parseIntStrict(eff(d, k));
   if (!err.API_PORT && !err.ENGINE_PORT && n("API_PORT") === n("ENGINE_PORT")) err.API_PORT = t("v_port");
   if (!err.PARALLEL && n("PARALLEL") > 1 && eff(d, "KV_PAGED") !== "1") err.PARALLEL = t("v_par");
-  if (!err.MAX_CONTEXT && !err.KV_POOL_TOKENS && Math.max(n("MAX_CONTEXT"), n("KV_POOL_TOKENS")) > 524288)
-    err[n("MAX_CONTEXT") > 524288 ? "MAX_CONTEXT" : "KV_POOL_TOKENS"] = t("v_pool");
+  const poolMax = eff(d, "KV_TYPE") === "q8" ? 1048576 : 524288;
+  if (!err.MAX_CONTEXT && !err.KV_POOL_TOKENS && Math.max(n("MAX_CONTEXT"), n("KV_POOL_TOKENS")) > poolMax)
+    err[n("MAX_CONTEXT") > poolMax ? "MAX_CONTEXT" : "KV_POOL_TOKENS"] = t("v_pool");
   return err;
 }
 
