@@ -27,6 +27,11 @@ serve_init() {
   # 旧版 service.conf 没有这几项时的缺省值（与 service.conf 相同）
   KV_PAGED="${KV_PAGED:-1}"
   KV_TYPE="${KV_TYPE:-bf16}"
+  # 控制向量（CVEC，见 docs/CVEC.md）：留空 = 关闭。
+  CVEC="${CVEC-}"
+  CVEC_MODE="${CVEC_MODE:-project}"
+  CVEC_SCALE="${CVEC_SCALE:-1.0}"
+  CVEC_LAYERS="${CVEC_LAYERS:-4 44}"
   KV_POOL_TOKENS="${KV_POOL_TOKENS:-0}"
   PARALLEL="${PARALLEL:-1}"
   CONC_PREFILL_CHUNK="${CONC_PREFILL_CHUNK:-8192}"
@@ -69,6 +74,17 @@ serve_init() {
   done
   [[ "$PLE_URING" =~ ^[01]$ ]] || fail 'PLE_URING 必须为 0 或 1'
   [[ "$KV_TYPE" == bf16 || "$KV_TYPE" == fp16 || "$KV_TYPE" == q8 ]] || fail "KV_TYPE must be bf16, fp16 or q8"
+  # 控制向量：只在启用（CVEC 非空）时校验模式/scale/层区间，关闭时不理会残留参数。
+  if [[ -n "$CVEC" ]]; then
+    [[ "$CVEC_MODE" == project || "$CVEC_MODE" == add ]] || fail 'CVEC_MODE 只允许 project 或 add'
+    [[ "$CVEC_SCALE" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail 'CVEC_SCALE 必须为正小数'
+    awk "BEGIN { exit !($CVEC_SCALE > 0) }" || fail 'CVEC_SCALE 必须大于 0'
+    read -r cvec_lo cvec_hi <<< "${CVEC_LAYERS//,/ }"
+    [[ "$cvec_lo" =~ ^[1-9][0-9]?$ && "$cvec_hi" =~ ^[1-9][0-9]?$ ]] || \
+      fail 'CVEC_LAYERS 必须为 "<起> <止>" 两个正整数'
+    (( cvec_lo >= 1 && cvec_hi >= cvec_lo && cvec_hi <= 47 )) || \
+      fail "CVEC_LAYERS 范围为 1–47 且起<=止（当前 $cvec_lo..$cvec_hi）"
+  fi
   [[ "$KV_PAGED" =~ ^[01]$ ]] || fail 'KV_PAGED 必须为 0 或 1'
   [[ "$PARALLEL" =~ ^[1-8]$ ]] || fail 'PARALLEL 范围为 1–8'
   [[ "${MOE_A4:-0}" =~ ^[0-3]$ ]] || fail 'MOE_A4 范围为 0–3'
@@ -101,6 +117,7 @@ serve_run() {
   if [[ "$FORMAT" != GGUF ]]; then
     need tokenizer "$TOKENIZER_DIR/tokenizer.json" 'hgn 权重用；GGUF 用内嵌词表'
   fi
+  [[ -z "$CVEC" ]] || need cvec "$CVEC" 'refusal projection 控制向量；不需要时留空'
   if (( ${#MISSING[@]} )); then
     {
       echo "错误：$LAUNCHER（$FORMAT 权重）缺少以下文件："
@@ -122,6 +139,13 @@ serve_run() {
   # Existing production options; no closed-source modules or experimental paths.
   # （放在 --check 之前：--check 会打印这些变量，tools/a5_verify.sh 等据此复现生产环境）
   export QWENOX_KV_TYPE="$KV_TYPE"
+  # 控制向量（CVEC）：留空时清掉外部残留，其余参数只在开启时导出。
+  unset QWENOX_CVEC QWENOX_CVEC_MODE QWENOX_CVEC_SCALE QWENOX_CVEC_LAYERS \
+        QWENOX_CVEC_DIR QWENOX_CVEC_PROBE
+  if [[ -n "$CVEC" ]]; then
+    export QWENOX_CVEC="$CVEC" QWENOX_CVEC_MODE="$CVEC_MODE" \
+           QWENOX_CVEC_SCALE="$CVEC_SCALE" QWENOX_CVEC_LAYERS="$CVEC_LAYERS"
+  fi
   export QWENOX_QSA_KV_BF16=1 QWENOX_QSA_WMMA=1 QWENOX_QSA_WMMA_BTV=1
   # 自写 WMMA dense GEMM（Phase 3g）：8K +2%、32K +3%，对拍 8049 token 仅尾部分歧 4 个。
   export QWENOX_GEMM_WMMA=1
@@ -186,6 +210,9 @@ serve_run() {
     echo "KV：分页，页池 $(( (KV_POOL_TOKENS > MAX_CONTEXT ? KV_POOL_TOKENS : MAX_CONTEXT) )) token（${PARALLEL} 路并发共享），RAM 检查点 ${RCKPT_MAX} 个"
   else
     echo "KV：不分页（KV_PAGED=0）"
+  fi
+  if [[ -n "$CVEC" ]]; then
+    echo "控制向量：$CVEC（$CVEC_MODE，层 $CVEC_LAYERS，scale $CVEC_SCALE）"
   fi
   if (( PARALLEL > 1 && CONC_PREFILL_CHUNK > 0 )); then
     local conc=$CONC_PREFILL_CHUNK

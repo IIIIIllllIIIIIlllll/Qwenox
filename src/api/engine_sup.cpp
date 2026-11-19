@@ -385,6 +385,8 @@ bool start(const std::string& root, const svcconf::Conf& conf, std::string* err)
         gguf ? svcconf::cfg_optional(conf, "GGUF_VISION_FILE", "")
              : svcconf::cfg_optional(conf, "VISION_FILE", model_dir + "\\heretic-vision.hgn");
     std::string overlay_file = gguf ? "" : svcconf::cfg_optional(conf, "OVERLAY_FILE", "");
+    // 控制向量（CVEC，见 docs/CVEC.md）：空 = 关闭；与权重格式无关。
+    const std::string cvec_file = svcconf::cfg_optional(conf, "CVEC", "");
     if (gguf && model_file.empty()) {
         *err = "weights=gguf but GGUF_FILE is not set (first shard *-00001-of-0000N.gguf)";
         return false;
@@ -457,6 +459,10 @@ bool start(const std::string& root, const svcconf::Conf& conf, std::string* err)
         *err = "vision tower not found: " + vision_file;
         return false;
     }
+    if (!cvec_file.empty() && !file_exists(cvec_file)) {
+        *err = "control vector not found: " + cvec_file;
+        return false;
+    }
     if (!overlay_file.empty() && !file_exists(overlay_file)) overlay_file.clear();
     if (!dir_exists(root + "\\build\\rocblas\\library") ||
         !dir_exists(root + "\\build\\hipblaslt\\library")) {
@@ -474,6 +480,21 @@ bool start(const std::string& root, const svcconf::Conf& conf, std::string* err)
     };
     for (const char* f : flags) SetEnvironmentVariableA(f, "1");
     SetEnvironmentVariableA("QWENOX_KV_TYPE", svcconf::cfg(conf, "KV_TYPE", "bf16").c_str());
+    // 控制向量（CVEC）：空值 = 清除外部残留。
+    SetEnvironmentVariableA("QWENOX_CVEC", cvec_file.empty() ? nullptr : cvec_file.c_str());
+    SetEnvironmentVariableA("QWENOX_CVEC_MODE",
+                            cvec_file.empty()
+                                ? nullptr
+                                : svcconf::cfg(conf, "CVEC_MODE", "project").c_str());
+    SetEnvironmentVariableA("QWENOX_CVEC_SCALE",
+                            cvec_file.empty()
+                                ? nullptr
+                                : svcconf::cfg(conf, "CVEC_SCALE", "1.0").c_str());
+    SetEnvironmentVariableA("QWENOX_CVEC_LAYERS",
+                            cvec_file.empty()
+                                ? nullptr
+                                : svcconf::cfg(conf, "CVEC_LAYERS", "4 44").c_str());
+    // CVEC_DIR / CVEC_PROBE 只走环境变量（外部指定照常生效，残留不动）。
     SetEnvironmentVariableA("QWENOX_INDEXER_BUDGET",
                             qsa_budget == "4096" ? "4096" : nullptr);
     SetEnvironmentVariableA("QWENOX_KVSNAP", kvsnap_max_gb ? "1" : "0");

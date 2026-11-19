@@ -74,6 +74,11 @@ RCKPT_MAX="${RCKPT_MAX:-8}"
 # w4b 只放得下 256K。
 KV_PAGED="${KV_PAGED:-1}"
 KV_TYPE="${KV_TYPE:-bf16}"
+# 控制向量（CVEC，见 docs/CVEC.md）：留空 = 关闭。
+CVEC="${CVEC-}"
+CVEC_MODE="${CVEC_MODE:-project}"
+CVEC_SCALE="${CVEC_SCALE:-1.0}"
+CVEC_LAYERS="${CVEC_LAYERS:-4 44}"
 KV_POOL_TOKENS="${KV_POOL_TOKENS:-0}"
 PARALLEL="${PARALLEL:-1}"
 # 单请求图片数上限（1–256）：多轮绘图/视觉对话会累计历史图片，按需调大。
@@ -95,6 +100,17 @@ if [[ "$engine_connect_host" == 0.0.0.0 ]]; then engine_connect_host=127.0.0.1; 
 [[ "$KVSNAP_MAX_GB" =~ ^(0|[1-9][0-9]*)$ ]] || fail 'KVSNAP_MAX_GB 必须为非负整数'
 [[ "$RCKPT_MAX" =~ ^(0|[1-9][0-9]*)$ ]] || fail 'RCKPT_MAX 必须为非负整数'
 [[ "$KV_TYPE" == bf16 || "$KV_TYPE" == fp16 || "$KV_TYPE" == q8 ]] || fail "KV_TYPE must be bf16, fp16 or q8"
+# 控制向量：只在启用（CVEC 非空）时校验模式/scale/层区间。
+if [[ -n "$CVEC" ]]; then
+  [[ "$CVEC_MODE" == project || "$CVEC_MODE" == add ]] || fail 'CVEC_MODE 只允许 project 或 add'
+  [[ "$CVEC_SCALE" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail 'CVEC_SCALE 必须为正小数'
+  awk "BEGIN { exit !($CVEC_SCALE > 0) }" || fail 'CVEC_SCALE 必须大于 0'
+  read -r cvec_lo cvec_hi <<< "${CVEC_LAYERS//,/ }"
+  [[ "$cvec_lo" =~ ^[1-9][0-9]?$ && "$cvec_hi" =~ ^[1-9][0-9]?$ ]] || \
+    fail 'CVEC_LAYERS 必须为 "<起> <止>" 两个正整数'
+  (( cvec_lo >= 1 && cvec_hi >= cvec_lo && cvec_hi <= 47 )) || \
+    fail "CVEC_LAYERS 范围为 1–47 且起<=止（当前 $cvec_lo..$cvec_hi）"
+fi
 [[ "$KV_PAGED" =~ ^[01]$ ]] || fail 'KV_PAGED 必须为 0 或 1'
 [[ "$KV_POOL_TOKENS" =~ ^(0|[1-9][0-9]*)$ && ${#KV_POOL_TOKENS} -le 8 ]] || fail 'KV_POOL_TOKENS 必须为非负整数'
 [[ "$PARALLEL" =~ ^[1-8]$ ]] || fail 'PARALLEL 范围为 1–8'
@@ -124,6 +140,7 @@ if [[ "$WEIGHTS" == gguf ]]; then
   [[ -z "$GGUF_MTP_FILE" || -r "$GGUF_MTP_FILE" ]] || fail "找不到 GGUF MTP sidecar：$GGUF_MTP_FILE"
 fi
 [[ -z "$VISION_FILE" || -r "$VISION_FILE" ]] || fail "找不到视觉塔：$VISION_FILE（纯文本可设 VISION_FILE=\"\"）"
+[[ -z "$CVEC" || -r "$CVEC" ]] || fail "找不到控制向量：$CVEC（不用时可设 CVEC=\"\"）"
 if [[ -n "$OVERLAY_FILE" && ! -r "$OVERLAY_FILE" ]]; then  # 可选：只警告并跳过
   echo "警告：找不到 overlay：$OVERLAY_FILE，已跳过（v2 权重不用 overlay；不想看到这条可设 OVERLAY_FILE=\"\"）" >&2
   OVERLAY_FILE=
@@ -145,6 +162,7 @@ if (( KV_PAGED )); then
 else
   echo "KV：不分页（KV_PAGED=0）"
 fi
+[[ -z "$CVEC" ]] || echo "控制向量：$CVEC（$CVEC_MODE，层 $CVEC_LAYERS，scale $CVEC_SCALE）"
 if [[ "${1:-}" == --check ]]; then
   echo '检查通过；没有启动引擎或 API。'
   exit 0
@@ -154,6 +172,13 @@ fi
 # Windows 默认 6144（256K 下 16384 会顶破 95 GiB arena 上限；6144 与 8192 的 PP 差
 # 约 0.5%，工作区少约 1.7 GiB，实测见 PORTING-WINDOWS.md）。
 export QWENOX_KV_TYPE="$KV_TYPE"
+# 控制向量（CVEC）：留空时清掉外部残留，其余参数只在开启时导出。
+unset QWENOX_CVEC QWENOX_CVEC_MODE QWENOX_CVEC_SCALE QWENOX_CVEC_LAYERS \
+      QWENOX_CVEC_DIR QWENOX_CVEC_PROBE
+if [[ -n "$CVEC" ]]; then
+  export QWENOX_CVEC="$CVEC" QWENOX_CVEC_MODE="$CVEC_MODE" \
+         QWENOX_CVEC_SCALE="$CVEC_SCALE" QWENOX_CVEC_LAYERS="$CVEC_LAYERS"
+fi
 export QWENOX_QSA_KV_BF16=1 QWENOX_QSA_WMMA=1 QWENOX_QSA_WMMA_BTV=1
 export QWENOX_MOE_LT=1 QWENOX_MOE_LT_BF16=1 QWENOX_GR_BF16=1
 export QWENOX_GDN_STREAM=1 QWENOX_GDN_WAVE=1 QWENOX_NOWARMUP=1

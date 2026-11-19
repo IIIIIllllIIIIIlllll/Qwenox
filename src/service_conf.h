@@ -29,6 +29,7 @@ inline const char* kManagedKeys[] = {
     "TOKENIZER_DIR", "MAX_CONTEXT", "PARALLEL", "KV_POOL_TOKENS", "KV_PAGED", "KV_TYPE",
     "PREFILL_CHUNK", "ROPE_FACTOR",
     "KVSNAP_MAX_GB", "KVSNAP_DIR", "MOE_A4", "QSA_INDEXER_BUDGET", "AFFINITY",
+    "CVEC", "CVEC_MODE", "CVEC_SCALE", "CVEC_LAYERS",
     "ENGINE_HOST", "ENGINE_PORT", "API_HOST", "API_PORT",
 };
 inline const size_t kManagedKeysCount = sizeof(kManagedKeys) / sizeof(kManagedKeys[0]);
@@ -37,7 +38,7 @@ inline const size_t kManagedKeysCount = sizeof(kManagedKeys) / sizeof(kManagedKe
 // 与 service.conf 现状一致。KVSNAP_DIR 留空 = 引擎默认 data\kvsnap，也是这个风格。
 inline const char* kOptionalFileKeys[] = {"OVERLAY_FILE", "MTP_FILE", "VISION_FILE",
                                           "GGUF_MTP_FILE", "GGUF_VISION_FILE", "GGUF_PLE_FILE",
-                                          "KVSNAP_DIR"};
+                                          "KVSNAP_DIR", "CVEC"};
 
 inline bool is_optional_file_key(const std::string& key) {
     for (const char* k : kOptionalFileKeys)
@@ -403,6 +404,34 @@ inline bool validate_conf(const Conf& conf, std::string* err) {
     if (rope_factor > 1 && max_context > rope_factor * rope_original) {
         *err = "MAX_CONTEXT exceeds ROPE_FACTOR*ROPE_ORIGINAL_CTX (YaRN limit)";
         return false;
+    }
+    // 控制向量（CVEC，见 docs/CVEC.md）：只在启用时校验模式/scale/层区间，
+    // 关闭（CVEC 留空）时不理会残留参数。
+    if (!cfg_optional(conf, "CVEC", "").empty()) {
+        const std::string cvec_mode = cfg(conf, "CVEC_MODE", "project");
+        if (cvec_mode != "project" && cvec_mode != "add") {
+            *err = "CVEC_MODE must be project or add";
+            return false;
+        }
+        double cvec_scale;
+        if (!parse_double(cfg(conf, "CVEC_SCALE", "1.0"), &cvec_scale) || !(cvec_scale > 0) ||
+            cvec_scale > 100.0) {
+            *err = "CVEC_SCALE must be a number in (0, 100]";
+            return false;
+        }
+        const std::string cl = cfg(conf, "CVEC_LAYERS", "4 44");
+        long lo = -1, hi = -1;
+        const size_t sp = cl.find_first_of(" ,");
+        bool ok = sp != std::string::npos;
+        if (ok) {
+            std::string a = trim(cl.substr(0, sp));
+            std::string b = trim(cl.substr(sp + 1));
+            ok = parse_int(a, &lo) && parse_int(b, &hi) && lo >= 1 && hi >= lo && hi <= 47;
+        }
+        if (!ok) {
+            *err = "CVEC_LAYERS must be \"<lo> <hi>\" with 1 <= lo <= hi <= 47";
+            return false;
+        }
     }
     const std::string affinity = cfg(conf, "AFFINITY", "");
     if (!affinity.empty() && !parse_affinity(affinity)) {
