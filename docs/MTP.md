@@ -32,6 +32,63 @@ temperature=0 是贪心对照，不保证提高接受率。随后用你日常的
 
 本实现没有单独的 draft_temperature 或可调接受阈值：贪心模式验证 token 是否匹配，采样模式按 p/q 拒绝采样。QWENOX_MTP_NORM/HAGG 是历史结构调试开关，保留默认值。
 
+## r2 的 mtp.spec_cost 标定（cost 门控）
+
+`qwen38-flash-next-drafter-r2.hgn` 除 31 个 `mtp.*` 张量外还带 5 个 f32 张量：
+`mtp.spec_cost.cal_g[50]` / `abar_g[8]` / `cal_s[50]` / `abar_s[8]` / `t[2]`。
+引擎在 MTP 初始化时读取；5 个张量齐备才整组覆盖内置默认表（默认表逆向自上游
+halogen 0.20.7 的内嵌 profile，旧 `mtp.hgn` 没有标定时用它兜底，与上游回退一致）。
+默认门与上游一致：采样走 `QWENOX_SAMPLED_GATE`（抽中概率 0.95/0.98），greedy 走
+`QWENOX_GREEDY_CONF`（默认关）；要使用标定：
+
+```bash
+QWENOX_MTP_GATE_RULE=cost bash start_hgn.sh   # 或只对采样开启：QWENOX_SAMPLED_GATE=cost
+```
+
+门控公式与上游原式一致（2026-11-19 自 flash_serve 逆向；n = 已并入第 n 个草稿的
+校准接受率后的链长，prev 从 1 起逐位累乘）：
+
+- greedy：第 n 位先按 top-1 置信度分箱查 `cal_g`，`prev *= cal_g[bin]`；
+  n≥2 时 `prev·Tg < T(n+1)-T(n)` 则砍掉末位草稿（保留 n-1）；n≤6 时
+  `prev·abar_g[n+1]·Tg < T(n+2)-T(n+1)+Hg` 则停在 n；7 封顶。
+- 采样：按**抽中 token** 的概率分箱查 `cal_s`（不是 top-1），单判定
+  `prev·abar_s[n+1]·Ts < T(n+2)-T(n+1)+Hs` 则停在 n。
+
+`T(1..8)`、`Hg/Hs` 是引擎内置的逐行验证耗时 profile；`t = {Tg, Ts}` 来自头文件
+（旧头兜底 14.0ms）。greedy 输出逐位不变，采样仍为精确拒绝采样，门控只改变草稿
+长度。启动日志打印 `mtp: spec cost from the head file (...)` 或 `from built-in
+defaults (...)`；缺一个张量即整组回退默认表。
+
+`QWENOX_SAMPLED_GATE=t1,t2` 是采样置信门的默认口径（默认 **0.95,0.98**，与上游
+halogen 一致）：作用于**抽中 token 的概率**，第 1 个草稿用 t1、后续用 t2。显式
+`0` 关闭并退回 `QWENOX_SPEC_CONF` 的 top-1 口径（默认 0.9）；两者同时设置时
+SAMPLED_GATE 优先。
+
+`QWENOX_SPEC_COST_SCALE` 默认 **1.0**（= 上游原式）。它是 Qwenox 自留的成本侧
+纯倍率，值越小草稿越深：内置 T/H profile 拟合自上游引擎，本机轮/回滚成本不同
+时可按实测调整（本机 A/B 见下）。低置信/合成 token（如 qsa-oracle）上 cost 可能
+因 rollback 变慢，那里建议调大 scale 或不用 cost 规则。
+
+本机 A/B（2026-11-19，同一二进制、同一 3072-token 代码生成 prompt、采样默认
+参数、JOINT 开，3 次测量取中位）：
+
+| 配置 | tok/s | commit/round | MTP 逐草稿接受 |
+| --- | --- | --- | --- |
+| 旧头 + top-1 0.9 门（`SAMPLED_GATE=0`） | 68.8 | 6.1 | 0.81 |
+| r2 + 上游门（默认 0.95,0.98） | 67.0 | 5.4 | 0.83 |
+| 旧头 + 上游门 | 64.5 | 5.6 | 0.82 |
+| r2 + top-1 0.9 门（`SAMPLED_GATE=0`） | 64.5 | 5.4 | 0.82 |
+| r2 + cost（scale 0.5） | 64.1 | 5.4 | 0.78 |
+| r2 + cost（scale 1.0） | 52.9 | 3.6 | 0.59 |
+| 旧头 + cost（scale 1.0，内置表） | 50.8 | 3.5 | 0.61 |
+
+读法：内置 T/H profile 拟合自上游引擎，scale 1.0 时静态链上限只有 2（启动日志
+的 `max_g`），在本机（逐行边际成本显著更低）过度收短链；scale 0.5 时追平 top-1
+门。门控口径上，top-1 0.9 按「自信」放链，旧头系统性过自信（top-1≈0.9 时真实
+接受率 0.64，r2 为 0.85），在高接受率的代码负载上靠长链占优；上游的抽中概率门
+精确砍掉「抽中低概率 token、本就会被拒」的草稿，r2 的诚实校准随即反超旧头
++3.9%（67.0 vs 64.5），复现了上游宣称的幅度——这也是默认门对齐上游的原因。
+
 ## 看日志
 
 ```bash

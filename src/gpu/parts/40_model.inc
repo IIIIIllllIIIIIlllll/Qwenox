@@ -804,6 +804,40 @@ struct GpuModel {
   // t_{p+2} from (trunk h_p, emb(t_{p+1})) (DeepSeek-style wiring). Owns its
   // stream/KV/indexer state; reuses trunk scratch (strictly serial use).
   bool mtp_avail = false;      // checkpoint has mtp.* tensors and env is default
+  // Optional drafter-r2 calibration (mtp.spec_cost.*): per-mode calibrated
+  // acceptance tables, per-depth acceptance priors and the decode times.
+  // Heads without the five tensors fall back to the built-in default
+  // calibration — halogen's own behavior (its binary carries the same table
+  // as the "geometry's table, built in"). QWENOX_MTP_GATE_RULE=cost enables
+  // the per-depth cost gate; the default keeps the old gate rule.
+  bool msc_on = false;
+  bool msc_cost_rule = false;
+  // Built-in defaults = halogen 0.20.7's embedded table (reversed 2026-11-19),
+  // measured on the pre-r2 head.
+  float msc_cal[2][50] = {
+      {0.0667f, 0.0667f, 0.0667f, 0.0667f, 0.0667f, 0.0667f, 0.0667f, 0.0667f,
+       0.0667f, 0.1446f, 0.1446f, 0.1446f, 0.1935f, 0.2043f, 0.2043f, 0.2264f,
+       0.2264f, 0.3059f, 0.3059f, 0.3059f, 0.3059f, 0.3059f, 0.3059f, 0.3059f,
+       0.3580f, 0.3580f, 0.3580f, 0.3956f, 0.4065f, 0.4065f, 0.4065f, 0.4606f,
+       0.4606f, 0.4606f, 0.4831f, 0.4831f, 0.5117f, 0.5117f, 0.5117f, 0.5127f,
+       0.5127f, 0.5663f, 0.6161f, 0.6167f, 0.6194f, 0.6444f, 0.6444f, 0.7834f,
+       0.7891f, 0.7891f},
+      {0.0874f, 0.2067f, 0.2862f, 0.3930f, 0.3930f, 0.3930f, 0.3930f, 0.3930f,
+       0.3930f, 0.3930f, 0.3930f, 0.4077f, 0.4077f, 0.4077f, 0.4077f, 0.4077f,
+       0.4077f, 0.4077f, 0.4077f, 0.4372f, 0.4372f, 0.4372f, 0.4812f, 0.4812f,
+       0.4812f, 0.4812f, 0.4897f, 0.4897f, 0.4897f, 0.4897f, 0.4897f, 0.4897f,
+       0.4897f, 0.5030f, 0.5076f, 0.5424f, 0.5424f, 0.5738f, 0.5738f, 0.5738f,
+       0.5738f, 0.5911f, 0.5911f, 0.5911f, 0.6212f, 0.6212f, 0.7032f, 0.7032f,
+       0.7711f, 0.9564f}};
+  float msc_abar[2][8] = {{0.f, 0.7214f, 0.6774f, 0.7056f, 0.7309f, 0.7292f,
+                           0.7445f, 0.6974f},
+                          {0.f, 0.7281f, 0.7353f, 0.7437f, 0.7616f, 0.7747f,
+                           0.7843f, 0.7688f}};
+  float msc_t[2] = {14.028f, 14.102f};  // Tg, Ts (ms per decoded token)
+  float msc_scale = 1.f;  // QWENOX_SPEC_COST_SCALE (upstream has none; 1 = exact)
+  float msc_T[9] = {0.f, 24.1f, 29.7f, 34.4f, 38.3f,
+                    43.1f, 46.6f, 51.8f, 55.2f};  // round time T(1..8)
+  float msc_H[2] = {1.28f, 2.47f};                 // base cost, [greedy, sampled]
   // mtp_avail's condition, known before the KV pool is sized (B0: the MTP
   // layer is pool layer nqsa).
   bool mtp_moe_default() const {
@@ -1699,6 +1733,64 @@ struct GpuModel {
                 mtp_hagg_mode ? "branch" : "sum",
                 qsa_kv_q8 ? "q8g32" : (qsa_kv_fp16 ? "fp16" : (qsa_kv_fp32 ? "fp32" : "bf16")),
                 (int)ckpt.at("mtp.fc_hidden.weight").dtype);
+        // drafter r2 (and later): optional mtp.spec_cost.* calibration. The
+        // per-round time table and the two base costs are the engine's
+        // built-in profile (upstream v2: T(1..8) = 24.1..55.2 ms, H =
+        // 1.28/2.47). The five f32 tensors override the built-in default
+        // calibration as a group (all five, or none — same rule as
+        // upstream). QWENOX_MTP_GATE_RULE=cost turns the per-depth cost gate
+        // on; without it the old gate is kept. Gate formula (greedy, n = the
+        // chain's draft count after folding in its calibrated acceptance a_n;
+        // reversed from halogen 0.20.7's flash_serve, 2026-11-19):
+        //   prev *= cal_g[bin(p_n)]                     (50 bins of top-1 p)
+        //   n >= 2: trim to n-1 if prev*Tg <  T[n+1]-T[n]           (no H)
+        //   n <= 6: stop at n  if prev*abar_g[n+1]*Tg < T[n+2]-T[n+1]+H_g
+        //   n == 7: cap (check1 still applies)
+        // Sampled is one check per draft: prev folds cal_s[bin(q_drawn)]
+        // instead, then stop at n if prev*abar_s[n+1]*Ts < T[n+2]-T[n+1]+H_s.
+        const char* msc_rule = getenv("QWENOX_MTP_GATE_RULE");
+        const char* msc_srule = getenv("QWENOX_SAMPLED_GATE");
+        msc_cost_rule = (msc_rule && !strcmp(msc_rule, "cost")) ||
+                        (msc_srule && !strcmp(msc_srule, "cost"));
+        auto read_msc = [&](const char* n, float* dst, uint64_t cnt) {
+          const Tensor* t = ckpt.find(n);
+          if (!t || t->dtype != 1 || t->numel() != cnt) return 0;
+          memcpy(dst, t->data, (size_t)cnt * 4);
+          return 1;
+        };
+        float msc_new[2][50], msc_ab[2][8], msc_tt[2];
+        int msc_have = 0;
+        msc_have += read_msc("mtp.spec_cost.cal_g", msc_new[0], 50);
+        msc_have += read_msc("mtp.spec_cost.abar_g", msc_ab[0], 8);
+        msc_have += read_msc("mtp.spec_cost.cal_s", msc_new[1], 50);
+        msc_have += read_msc("mtp.spec_cost.abar_s", msc_ab[1], 8);
+        msc_have += read_msc("mtp.spec_cost.t", msc_tt, 2);
+        msc_on = true;
+        char msc_src[64] = "built-in defaults";
+        if (msc_have == 5) {
+          memcpy(msc_cal, msc_new, sizeof(msc_new));
+          memcpy(msc_abar, msc_ab, sizeof(msc_ab));
+          memcpy(msc_t, msc_tt, sizeof(msc_tt));
+          snprintf(msc_src, sizeof(msc_src), "the head file");
+        } else if (msc_have) {
+          snprintf(msc_src, sizeof(msc_src),
+                   "built-in defaults (head has %d/5)", msc_have);
+        }
+        // QWENOX_SPEC_COST_SCALE: Qwenox-only knob, a plain multiplier on the
+        // cost side of the rule (smaller = draft deeper). 1.0 = the upstream
+        // formula; the T/H profile is fitted on halogen's engine, so tune
+        // here if this machine's round/rollback costs differ materially.
+        if (const char* e = getenv("QWENOX_SPEC_COST_SCALE")) {
+          const float v = (float)atof(e);
+          if (v > 0.f) msc_scale = v;
+        }
+        fprintf(stderr,
+                "mtp: spec cost from %s (Tg=%.3f Ts=%.3f scale=%.2f; "
+                "max_g greedy %d sampled %d)%s\n",
+                msc_src, msc_t[0], msc_t[1], msc_scale, msc_max_g(false),
+                msc_max_g(true),
+                msc_cost_rule ? "; cost rule on"
+                              : "; set QWENOX_MTP_GATE_RULE=cost to use");
       }
     }
     // DFlash2 verify rollback snapshots (per-row GDN/conv/indexer state) are
@@ -10241,12 +10333,87 @@ struct GpuModel {
       if (ph[j] < th) return j + 1;
     return g;
   }
+  // drafter r2's cost gate: the same read-back, but the threshold depends on
+  // the draft depth (computed from the mtp.spec_cost tables at startup).
+  // 规划深度：用逐深度先验 abar 的连乘估计链积，第一个「延长不值」的深度封顶
+  // （与运行时采样式同式：prev*abar[n+1]*t < T[n+2]-T[n+1]+H）。上限 7 = 8 个
+  // verify 行的预算（7 草稿 + 1 当前，与 kSpecConfMax 一致）。
+  int msc_max_g(bool sample) const {
+    const int m = sample ? 1 : 0;
+    float prev = 1.f;
+    for (int n = 1; n <= 6; n++) {
+      prev *= msc_abar[m][n];
+      if (prev * msc_abar[m][n + 1] * msc_t[m] <
+          (msc_T[n + 2] - msc_T[n + 1] + msc_H[m]) * msc_scale)
+        return n;
+    }
+    return 7;
+  }
+  // Greedy 运行时判定（与加载处注释的上游公式逐项对应）：prev 先并入当前草稿
+  // 的校准接受率，check1（无 H）砍掉不值的末位草稿，check2（前瞻 abar[n+1]，
+  // 含 H）决定不再延长；n=7 封顶（check1 仍生效）。
+  int msc_conf_truncate(int g, int gd, const float* d_arr) {
+    float ph[8];
+    CK(hipMemcpy(ph, d_arr, (size_t)gd * sizeof(float), hipMemcpyDeviceToHost));
+    float prev = 1.f;
+    const int last = std::min(gd, g);
+    for (int j = 0; j < last; j++) {
+      const int idx = std::min(49, std::max(0, (int)(ph[j] * 50.f)));
+      prev *= msc_cal[0][idx];
+      const int n = j + 1;
+      if (n >= 2 && prev * msc_t[0] < (msc_T[n + 1] - msc_T[n]) * msc_scale)
+        return n - 1;
+      if (n >= 7) return 7;
+      if (prev * msc_abar[0][n + 1] * msc_t[0] <
+          (msc_T[n + 2] - msc_T[n + 1] + msc_H[0]) * msc_scale)
+        return n;
+    }
+    return g;
+  }
+  int gate_truncate(int g, int gd, float th, const float* d_arr) {
+    return (msc_on && msc_cost_rule) ? msc_conf_truncate(g, gd, d_arr)
+                                     : conf_truncate(g, gd, th, d_arr);
+  }
+  // QWENOX_SAMPLED_GATE=t1[,t2]（上游 HALOGEN_SAMPLED_GATE 口径，默认
+  // 0.95,0.98 与上游一致）：第二个草稿需第一次抽中的概率 >= t1，第三个起
+  // 各需前一次抽中 >= t2。显式 0 = 关（退回 spec_conf 的 top-1 阈值）。
+  // 值 "cost" 等价于 QWENOX_MTP_GATE_RULE=cost。
+  static float sampled_gate(int k) {
+    static const std::pair<float, float> v = [] {
+      float a = 0.95f, b = 0.98f;
+      if (const char* e = getenv("QWENOX_SAMPLED_GATE")) {
+        if (sscanf(e, "%f,%f", &a, &b) >= 1) {
+          a = std::max(0.f, std::min(1.f, a));
+          b = b > 0.f ? std::max(0.f, std::min(1.f, b)) : a;
+        }
+      }
+      return std::make_pair(a, b);
+    }();
+    return k ? v.second : v.first;
+  }
   // True when drafting should stop after step j (of g planned). sparse = the
-  // prepared sparse probabilities, else dense = prepared full-vocab probs.
-  static bool spec_conf_stop(int j, int g, const std::vector<float>* sparse,
-                             const std::vector<float>& dense) {
+  // prepared sparse probabilities, else dense = prepared full-vocab probs;
+  // qlp = log q of the drawn draft token (from draw_prepared/draw_sparse).
+  bool spec_conf_stop(int j, int g, const std::vector<float>* sparse,
+                      const std::vector<float>& dense, float& msc_prev,
+                      float qlp) {
+    if (j + 1 >= g) return false;
+    if (msc_on && msc_cost_rule) {
+      // 上游采样回路的单判定（见加载处注释）：链积先并入当前草稿——抽中 token
+      // 的 q（50 分箱查 cal_s），再与前瞻 abar_s[n+1]、ΔT+H 比较。无 greedy
+      // 的 check1。
+      const float qx = expf(qlp);
+      const int idx = std::min(49, std::max(0, (int)(qx * 50.f)));
+      msc_prev *= msc_cal[1][idx];
+      const int n = j + 1;
+      if (n >= 7) return true;
+      return msc_prev * msc_abar[1][n + 1] * msc_t[1] <
+             (msc_T[n + 2] - msc_T[n + 1] + msc_H[1]) * msc_scale;
+    }
+    if (sampled_gate(0) > 0.f)
+      return expf(qlp) < (j == 0 ? sampled_gate(0) : sampled_gate(1));
     const float th = spec_conf();
-    if (th <= 0.f || j + 1 >= g) return false;
+    if (th <= 0.f) return false;
     float m = 0.f;
     if (sparse)
       for (float v : *sparse) m = std::max(m, v);
@@ -10579,7 +10746,8 @@ struct GpuModel {
       yield_point();  // round top: mtp_pos == pos-1, d_R == h_{pos-1}
       int q = pos - 1;  // trunk processed through q
       if (d_iraw) vg_dump_buf("irT", 2, d_iraw, 512 * 4);  // P3-B bisect
-      int g = std::min(gctl.cur, gen - (int)out.size());
+      int g = std::min((msc_on && msc_cost_rule) ? msc_max_g(false) : gctl.cur,
+                       gen - (int)out.size());
       // D2-S2a row budget + D2 阶段 3 occupancy γ (round-top snapshot of the
       // rendezvous membership; may return 0 = batched AR round).
       g = occ.pick(g, vseg_active_fn ? vseg_active_fn() : 1, (int)kVSnapRows);
@@ -10598,8 +10766,9 @@ struct GpuModel {
       // truth. Later drafts pollute the ring; save/restore around them.
       // 置信度门控：每步草稿后把草稿分布的 top-1 概率流式写入 conf_arr，
       // 草稿突发结束后一次读回收链（只截 verify 行数，输出逐位不变）。
+      const bool msc_gate = msc_on && msc_cost_rule;
       const float gth = greedy_conf();
-      float* d_conf = gth > 0.f ? conf_arr() : nullptr;
+      float* d_conf = (msc_gate || gth > 0.f) ? conf_arr() : nullptr;
       // 置信度门控的口径跟随草稿实际打分范围：QDV1 子表只写了 n_dv 项。
       const int dvn_conf = n_dv > 0 ? n_dv
                                     : draft_vocab > 0
@@ -10617,7 +10786,7 @@ struct GpuModel {
         }
         CK(hipMemcpy(drafts.data(), d_argmax_arr, (size_t)gd * sizeof(int),
                      hipMemcpyDeviceToHost));
-        if (d_conf) g = conf_truncate(g, gd, gth, d_conf);
+        if (d_conf) g = gate_truncate(g, gd, gth, d_conf);
       } else {
         drafts[0] = mtp_step(d_R, cur);
         if (d_conf) top1_prob_enq(d_logits, dvn_conf, d_conf, g_str);
@@ -10627,7 +10796,7 @@ struct GpuModel {
           drafts[j] = mtp_step(d_mR, drafts[j - 1]);
           if (d_conf) top1_prob_enq(d_logits, dvn_conf, d_conf + j, g_str);
         }
-        if (d_conf) g = conf_truncate(g, gd, gth, d_conf);
+        if (d_conf) g = gate_truncate(g, gd, gth, d_conf);
       }
       }
       auto t1 = std::chrono::steady_clock::now();
@@ -11069,7 +11238,9 @@ struct GpuModel {
         // ---- (same machinery as spec_loop). This worker is counted by the
         // ---- loop-scope VrLoop; the rendezvous happens at the verify below.
         int q = pos - 1;
-        int g = std::min({gctl.cur, gen - (int)out.size(), maxctx - pos - 1});
+        int g = std::min({(msc_on && msc_cost_rule) ? msc_max_g(false)
+                                                    : gctl.cur,
+                          gen - (int)out.size(), maxctx - pos - 1});
         if (g < 1) break;  // context edge: no room for even one draft
         // Shared row budget + occupancy γ, as spec_loop (may return 0: the
         // round still drafts one step to keep the MTP KV, verifies cur only).
@@ -11085,8 +11256,9 @@ struct GpuModel {
         // draft 1's indexer ring rows are truth; later drafts pollute them.
         // 置信度门控：同 spec_loop，逐步写 top-1 概率，突发结束一次读回。
         // 口径跟随草稿实际打分范围：QDV1 子表只写了 n_dv 项。
+        const bool msc_gate = msc_on && msc_cost_rule;
         const float gth = greedy_conf();
-        float* d_conf = gth > 0.f ? conf_arr() : nullptr;
+        float* d_conf = (msc_gate || gth > 0.f) ? conf_arr() : nullptr;
         const int dvn_conf = n_dv > 0 ? n_dv
                                       : draft_vocab > 0
                                             ? std::min(draft_vocab, g_cfg.vocab)
@@ -11103,7 +11275,7 @@ struct GpuModel {
           }
           CK(hipMemcpy(drafts.data(), d_argmax_arr, (size_t)gd * sizeof(int),
                        hipMemcpyDeviceToHost));
-          if (d_conf) g = conf_truncate(g, gd, gth, d_conf);
+          if (d_conf) g = gate_truncate(g, gd, gth, d_conf);
         } else {
           drafts[0] = mtp_step(d_R, cur);
           if (d_conf) top1_prob_enq(d_logits, dvn_conf, d_conf, g_str);
@@ -11113,7 +11285,7 @@ struct GpuModel {
             drafts[j] = mtp_step(d_mR, drafts[j - 1]);
             if (d_conf) top1_prob_enq(d_logits, dvn_conf, d_conf + j, g_str);
           }
-          if (d_conf) g = conf_truncate(g, gd, gth, d_conf);
+          if (d_conf) g = gate_truncate(g, gd, gth, d_conf);
         }
         }
         // 联合起草（QWENOX_JOINT）：MTP 链定稿后按扩展历史（chist + cur +
@@ -11296,7 +11468,8 @@ struct GpuModel {
     while ((int)out.size() < gen) {
       yield_point();  // round top: mtp_pos == pos-1, d_R == h_{pos-1}
       int q = pos - 1;
-      int g = std::min(spec_conf() > 0 ? kSpecConfMax : gctl.cur,
+      int g = std::min(((msc_on && msc_cost_rule) ? msc_max_g(true)
+                                                  : (spec_conf() > 0 ? kSpecConfMax : gctl.cur)),
                        gen - (int)out.size());
       size_t chist_sz = chist.size();
       mtp_ckpt_save();
@@ -11311,6 +11484,7 @@ struct GpuModel {
       const bool smg = sms_gpu_active(sampler) && sms_round_shared(sampler);
       std::vector<typename Sampler::SDist> q_sd(smg ? g : 0);
       std::vector<char> q_sparse(g, 0);
+      float msc_prev = 1.f;
       for (int j = 0; j < g; j++) {
         bool dense = true;
         if (smg) {
@@ -11348,7 +11522,8 @@ struct GpuModel {
           CK(hipMemcpyAsync(d_mring_ckpt, d_miraw, 512 * 4,
                             hipMemcpyDeviceToDevice, g_str));
         }
-        if (spec_conf_stop(j, g, q_sparse[j] ? &q_sd[j].pr : nullptr, q_rows[j])) {
+        if (spec_conf_stop(j, g, q_sparse[j] ? &q_sd[j].pr : nullptr, q_rows[j],
+                           msc_prev, qlp)) {
           g = j + 1;
           break;
         }
@@ -11926,7 +12101,9 @@ struct GpuModel {
         // ---- MTP round (ngram table missed): spec_loop_sample's round ----
         rp_lap(RP_TOP);
         int q = pos - 1;
-        int g = std::min({spec_conf() > 0 ? kSpecConfMax : gctl.cur,
+        int g = std::min({((msc_on && msc_cost_rule)
+                               ? msc_max_g(true)
+                               : (spec_conf() > 0 ? kSpecConfMax : gctl.cur)),
                           gen - (int)out.size(), maxctx - pos - 1});
         if (g < 1) break;  // context edge: no room for even one draft
         // Row budget + occupancy γ. A sampled round's γ shapes its RNG draws:
@@ -11948,6 +12125,7 @@ struct GpuModel {
         // GPU sampling prep (direction A), as in spec_loop_sample.
         std::vector<typename Sampler::SDist> q_sd(smg ? gd : 0);
         std::vector<char> q_sparse(gd, 0);
+        float msc_prev = 1.f;
         rp_lap(RP_PRE);
         // Draw draft j from its logits row. src: d_logits after the serial
         // mtp_step, a batched step's row of d_logits_b (C7), or nullptr when
@@ -11989,7 +12167,8 @@ struct GpuModel {
                 draft_sampler.draw_sparse(q_sd[j], &draft_lps[j], false);
             q_sparse[j] = 1;
           }
-          if (spec_conf_stop(j, g, q_sparse[j] ? &q_sd[j].pr : nullptr, q_rows[j])) {
+          if (spec_conf_stop(j, g, q_sparse[j] ? &q_sd[j].pr : nullptr, q_rows[j],
+                             msc_prev, draft_lps[j])) {
             g = j + 1;
             return false;
           }
