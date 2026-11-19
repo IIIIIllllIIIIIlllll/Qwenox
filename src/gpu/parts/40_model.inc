@@ -1835,6 +1835,9 @@ struct GpuModel {
         gr_scatter_norm = false;
       }
     }
+    pf_init();
+    hcf_init();
+    se_par_init();
     fprintf(stderr, "qwenox: state allocated (maxctx=%d)\n", maxctx);
   }
 
@@ -1857,6 +1860,69 @@ struct GpuModel {
     // Windows 下 d_Rhatbf16 来自 devarena bump 分配，不能单独 hipFree
     if (d_Rhatbf16) CK(hipFree(d_Rhatbf16));
 #endif
+  }
+
+  // ---- decode prefetch (QWENOX_DECODE_PF, default on; =0 off) -------------
+  // P=1 decode only (gdn()/qsa() via enq_layer). Fork after the layer's
+  // attention-side projections, join at the end of enq_layer so every graph
+  // capture closes. QWENOX_DECODE_PF_BLOCKS (default 16).
+  hipStream_t pf_st_ = nullptr;
+  hipEvent_t pf_fork_ev_ = nullptr, pf_join_ev_ = nullptr;
+  std::vector<DpfSet> pf_sets_;
+  unsigned* d_pf_sink_ = nullptr;
+  bool pf_pending_ = false;
+  int pf_blocks_ = 16;
+  void pf_init() {
+    if (env_zero("QWENOX_DECODE_PF")) return;
+    if (const char* e = getenv("QWENOX_DECODE_PF_BLOCKS")) pf_blocks_ = std::max(1, atoi(e));
+    pf_sets_.assign(g_cfg.layers, DpfSet{});
+    double tot = 0;
+    for (int l = 0; l < g_cfg.layers; l++) {
+      static const char* names[] = {
+          "layers.%d.linear_attn.out_proj.weight",
+          "layers.%d.self_attn.o_proj.weight",
+          "layers.%d.attn_hyper_connection.block_inject_weight.weight",
+          "layers.%d.mlp_hyper_connection.input_mix_weight_down.weight",
+          "layers.%d.mlp_hyper_connection.input_mix_weight_up.weight",
+          "layers.%d.mlp_hyper_connection.block_inject_weight.weight",
+          "layers.%d.mlp.gate.weight",
+          "layers.%d.mlp.shared_expert.gate_proj.weight",
+          "layers.%d.mlp.shared_expert.up_proj.weight",
+          "layers.%d.mlp.shared_expert.down_proj.weight",
+          "layers.%d.mlp.shared_expert_gate.weight"};
+      DpfSet& S = pf_sets_[l];
+      for (const char* f : names) {
+        char b[160];
+        snprintf(b, sizeof b, f, l);
+        const Tensor* t = ckpt.find(b);
+        if (!t || S.nr >= 12) continue;
+        const uint8_t* d = dev_ptr(*t);
+        if (!d || ((uintptr_t)d & 15) || t->data_size < 16) continue;
+        S.r[S.nr].p = (const uint4*)d;
+        S.r[S.nr].n = t->data_size / 16;
+        S.nr++;
+        tot += (double)t->data_size;
+      }
+    }
+    CK(hipStreamCreateWithFlags(&pf_st_, hipStreamNonBlocking));
+    CK(hipEventCreateWithFlags(&pf_fork_ev_, hipEventDisableTiming));
+    CK(hipEventCreateWithFlags(&pf_join_ev_, hipEventDisableTiming));
+    DALLOC(&d_pf_sink_, 64);
+    fprintf(stderr, "decode prefetch: on, %d blocks, %.2f MB/layer avg\n", pf_blocks_,
+            tot / g_cfg.layers / 1e6);
+  }
+  void pf_fork(int l) {
+    if (!pf_st_ || l < 0 || l >= (int)pf_sets_.size() || !pf_sets_[l].nr) return;
+    CK(hipEventRecord(pf_fork_ev_, g_str));
+    CK(hipStreamWaitEvent(pf_st_, pf_fork_ev_, 0));
+    k_decode_pf<<<pf_blocks_, 256, 0, pf_st_>>>(pf_sets_[l], d_pf_sink_);
+    CK(hipEventRecord(pf_join_ev_, pf_st_));
+    pf_pending_ = true;
+  }
+  void pf_join() {
+    if (!pf_pending_) return;
+    CK(hipStreamWaitEvent(g_str, pf_join_ev_, 0));
+    pf_pending_ = false;
   }
 
   // GR read: R -> Rhat -> t320 -> G -> x. prefix like
@@ -2520,6 +2586,7 @@ struct GpuModel {
     gemv(wview(ckpt.at(buf)), x, d_beta48 /*tmp: raw b*/);
     k_gdn_gates<<<1, 64, 0, g_str>>>(d_g48, d_beta48, d_Alog + (size_t)gi * 48,
                            d_dtbias + (size_t)gi * 48, d_g48, d_beta48, 48, 48);
+    pf_fork(l);  // decode prefetch: overlaps step/norm/out_proj
     k_gdn_step<<<48, 512, 0, g_str>>>(qp, kp, vp, d_g48, d_beta48,
                             d_S + (size_t)gi * 48 * 128 * 128, vp /*out in place*/,
                             128, 128, 48, 16);
@@ -2592,6 +2659,7 @@ struct GpuModel {
                                                      g_cfg.rope_theta, d_rdelta);
     k_rope<<<(2 * 32 + 127) / 128, 128, 0, g_str>>>(d_kb, 2, 256, 64, d_pos,
                                                     g_cfg.rope_theta, d_rdelta);
+    pf_fork(l);  // decode prefetch (QSA)
     // append to cache at *d_pos
     if (qsa_kv_q8) {
       auto* kc = d_kcq + (size_t)qi * kv_layer_rows * 16;
@@ -2942,13 +3010,65 @@ struct GpuModel {
     return true;
   }
 
+  // ---- shared expert || routed experts (QWENOX_SE_PAR, default on; =0 off) --
+  // P=1 decode only. The shared expert reads x alone; its result meets the
+  // routed sum in k_axpy_sg_out. Same kernels, private gate/up/hid buffers
+  // (the routed path uses d_guv/d_hid) -> bit-identical. No ht split-K
+  // scratch (g_ht_zs/g_ht_cnt) user runs on the main stream inside the window.
+  hipStream_t se_st_ = nullptr;
+  hipEvent_t se_fork_ev_ = nullptr, se_join_ev_ = nullptr;
+  float* d_se_guv = nullptr;
+  float* d_se_hid = nullptr;
+  float* d_se_ey = nullptr;  // moe_v2_1 uses d_ey as its x-rotation scratch
+  float* d_se_sg = nullptr;
+  void se_par_init() {
+    if (env_zero("QWENOX_SE_PAR")) return;
+    CK(hipStreamCreateWithFlags(&se_st_, hipStreamNonBlocking));
+    CK(hipEventCreateWithFlags(&se_fork_ev_, hipEventDisableTiming));
+    CK(hipEventCreateWithFlags(&se_join_ev_, hipEventDisableTiming));
+    DALLOC(&d_se_guv, 1280 * 4);
+    DALLOC(&d_se_hid, 640 * 4);
+    DALLOC(&d_se_ey, 2560 * 4);
+    DALLOC(&d_se_sg, 64);
+    fprintf(stderr, "shared expert: parallel stream (P=1 decode)\n");
+  }
+  void se_chain(int l, const float* x, float* guv, float* hid, float* ey, float* sg) {
+    char buf[128], ub[128];
+    snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.gate_proj.weight", l);
+    snprintf(ub, sizeof ub, "layers.%d.mlp.shared_expert.up_proj.weight", l);
+    se_gate_up(buf, ub, x, guv, guv + 640, 1, true);
+    k_silu_mul<<<(640 + 255) / 256, 256, 0, g_str>>>(guv, guv + 640, hid, 640);
+    snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.down_proj.weight", l);
+    gemv(wview(ckpt.at(buf)), hid, ey);
+    snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert_gate.weight", l);
+    gemv(wview(ckpt.at(buf)), x, sg);
+  }
   void moe(int l, const float* x, float* y) {
     char buf[128];
+    const bool se_par = se_st_ != nullptr && !dbg;
+    if (se_par) {
+      CK(hipEventRecord(se_fork_ev_, g_str));
+      CK(hipStreamWaitEvent(se_st_, se_fork_ev_, 0));
+      hipStream_t m = g_str;
+      g_str = se_st_;
+      se_chain(l, x, d_se_guv, d_se_hid, d_se_ey, d_se_sg);
+      CK(hipEventRecord(se_join_ev_, se_st_));
+      g_str = m;
+    }
     snprintf(buf, sizeof buf, "layers.%d.mlp.gate.weight", l);
     gemv(wview(ckpt.at(buf)), x, d_router);
     int k = g_cfg.topk;
-    k_router_topk<<<1, 512, 0, g_str>>>(d_router, d_topids, d_topw, g_cfg.experts, k,
-                                        vz_tap(l, false));
+    {
+      // Same switch as router_topk_b: the wave32 kernel is bit-identical and
+      // needs no block barriers (1 block of 512: ~10.5 us -> 1 wave).
+      static const bool w32 = !env_zero("QWENOX_ROUTER_W32");
+      if (w32 && g_cfg.experts == 512 && k == 10)
+        k_router_topk_w32<10><<<1, 32, 0, g_str>>>(d_router, d_topids, d_topw, 1,
+                                                   vz_tap(l, false));
+      else
+        k_router_topk<<<1, 512, 0, g_str>>>(d_router, d_topids, d_topw, g_cfg.experts, k,
+                                            vz_tap(l, false));
+    }
     if (l == g_cfg.layers - 1) vz_publish(1, false);
     if (dbg) {
       int hi[16];
@@ -2986,25 +3106,20 @@ struct GpuModel {
       moe_down1(k, dn, topids);
       }
     }
-    // shared expert
-    {
-      char ub[128];
-      snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.gate_proj.weight", l);
-      snprintf(ub, sizeof ub, "layers.%d.mlp.shared_expert.up_proj.weight", l);
-      se_gate_up(buf, ub, x, d_guv, d_guv + 640, 1, true);
-    }
-    k_silu_mul<<<(640 + 255) / 256, 256, 0, g_str>>>(d_guv, d_guv + 640, d_hid, 640);
-    snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.down_proj.weight", l);
-    gemv(wview(ckpt.at(buf)), d_hid, d_ey);
-    snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert_gate.weight", l);
-    gemv(wview(ckpt.at(buf)), x, d_sg);
+    // shared expert (on se_st_ when se_par: joined here)
+    float* const sey = se_par ? d_se_ey : d_ey;
+    float* const ssg = se_par ? d_se_sg : d_sg;
+    if (se_par)
+      CK(hipStreamWaitEvent(g_str, se_join_ev_, 0));
+    else
+      se_chain(l, x, d_guv, d_hid, d_ey, d_sg);
     // D2: write y directly instead of acc += ... followed by a 40 KiB D2D.
     static const bool axpy_out = !env_zero("QWENOX_AXPY_SG_OUT");
     if (axpy_out) {
-      k_axpy_sg_out<<<(2560 + 255) / 256, 256, 0, g_str>>>(d_moeacc, d_ey, d_sg, y,
+      k_axpy_sg_out<<<(2560 + 255) / 256, 256, 0, g_str>>>(d_moeacc, sey, ssg, y,
                                                            g_cfg.d, g_cfg.d);
     } else {
-      k_axpy_sg<<<(2560 + 255) / 256, 256, 0, g_str>>>(d_moeacc, d_ey, d_sg, g_cfg.d,
+      k_axpy_sg<<<(2560 + 255) / 256, 256, 0, g_str>>>(d_moeacc, sey, ssg, g_cfg.d,
                                                        g_cfg.d);
       CK(hipMemcpyAsync(y, d_moeacc, g_cfg.d * 4, hipMemcpyDeviceToDevice, g_str));
     }
@@ -3198,7 +3313,198 @@ struct GpuModel {
     k_repeat4<<<(2560 + 255) / 256, 256, 0, g_str>>>(d_emb, d_R, g_cfg.d);
     h_rms("gpu", -1, "emb", d_emb, g_cfg.d);
   }
+  // ---- HC chain fusion, P=1 decode (QWENOX_HC_FUSE, default on; =0 off) ---
+  // enq_layer/enq_final only. The norm of the NEXT HC read is folded into the
+  // preceding write (k_hcf_wn<true>) unless something touches R in between
+  // (PLE after layer 0, cvec -> fusion off). Rhat ping-pongs between d_Rhat
+  // (A) and d_RhatB (B); every step ends on A (the mixer read) as before.
+  bool hcf_on_ = false;
+  float* d_RhatB = nullptr;
+  float* hcf_part_ = nullptr;
+  int* hcf_cnt_ = nullptr;
+  float* hcf_rh_ = nullptr;
+  bool hcf_ready_ = false;
+  bool hcf_check(const char* prefix) {
+    char b[160];
+    const char* sfx[3] = {"block_inject_weight", "input_mix_weight_down", "input_mix_weight_up"};
+    const uint64_t rr[3] = {4, 320, 10240}, cc[3] = {10240, 10240, 320};
+    for (int k = 0; k < 3; k++) {
+      snprintf(b, sizeof b, "%s.%s.weight", prefix, sfx[k]);
+      const Tensor* t = ckpt.find(b);
+      if (!t || t->dtype != 24) return false;
+      const WView w = wview(*t);
+      if (w.rows != rr[k] || w.cols != cc[k]) return false;
+    }
+    return true;
+  }
+  void hcf_init() {
+    if (env_zero("QWENOX_HC_FUSE")) return;
+    if (g_cfg.d != 2560 || g_cfg.branches != 4) return;
+    if (dense_wmma_hc_on() && dense_wmma_p1_on()) return;  // P=1 HC on WMMA: not this math
+    if (const char* e = getenv("QWENOX_Q6G_SPLITK")) if (e[0] == '0' && e[1] == 0) return;
+    char p[128];
+    for (int l = 0; l < g_cfg.layers; l++) {
+      snprintf(p, sizeof p, "layers.%d.attn_hyper_connection", l);
+      if (!hcf_check(p)) return;
+      snprintf(p, sizeof p, "layers.%d.mlp_hyper_connection", l);
+      if (!hcf_check(p)) return;
+    }
+    if (!hcf_check("hyper_connection_mixer")) {
+      // the mixer has no inject: only down/up are used
+      char b[160];
+      snprintf(b, sizeof b, "hyper_connection_mixer.input_mix_weight_down.weight");
+      const Tensor* t = ckpt.find(b);
+      if (!t || t->dtype != 24) return;
+    }
+    DALLOC(&d_RhatB, 10240 * 4);
+    DALLOC(&hcf_part_, 16 * 320 * 4);
+    DALLOC(&hcf_cnt_, 64 * 4);
+    CK(hipMemset(hcf_cnt_, 0, 64 * 4));
+    hcf_rh_ = d_Rhat;
+    hcf_on_ = true;
+    fprintf(stderr, "HC fusion: on (P=1 decode, 3 launches per HC)\n");
+    if (getenv("QWENOX_HCF_CHECK")) hcf_selftest();
+  }
+  // QWENOX_HCF_CHECK=1: bitwise self-test of the fused HC chain against the
+  // unfused kernels on layer 0's mlp HC weights with random inputs.
+  void hcf_selftest() {
+    const char* pfx = "layers.0.mlp_hyper_connection";
+    const char* nxt = "layers.1.attn_hyper_connection";
+    char b[160];
+    snprintf(b, sizeof b, "%s.block_inject_weight.weight", pfx);
+    const WView inj = wview(ckpt.at(b));
+    snprintf(b, sizeof b, "%s.input_mix_weight_down.weight", nxt);
+    const WView dn = wview(ckpt.at(b));
+    snprintf(b, sizeof b, "%s.input_mix_weight_up.weight", nxt);
+    const WView up = wview(ckpt.at(b));
+    float* hw = ensure_hcnorm(nxt);
+    const int N = 10240;
+    std::vector<float> hR(N), hRh(N), hy(2560);
+    uint64_t z = 12345;
+    auto rnd = [&]() { z = z * 6364136223846793005ull + 1442695040888963407ull; return (float)((z >> 40) & 0xffff) / 65536.f - 0.5f; };
+    for (auto& v : hR) v = rnd() * 4.f;
+    for (auto& v : hRh) v = rnd() * 2.f;
+    for (auto& v : hy) v = rnd();
+    float *R1, *R2, *rh0, *y, *oA, *oB, *tA, *tB, *GA, *xA, *xB, *w4A, *w4B;
+    for (float** p : {&R1, &R2, &rh0, &oA, &oB, &GA}) CK(hipMalloc(p, N * 4));
+    for (float** p : {&y, &xA, &xB}) CK(hipMalloc(p, 2560 * 4));
+    for (float** p : {&tA, &tB}) CK(hipMalloc(p, 320 * 4));
+    for (float** p : {&w4A, &w4B}) CK(hipMalloc(p, 64));
+    CK(hipMemcpy(R1, hR.data(), N * 4, hipMemcpyHostToDevice));
+    CK(hipMemcpy(R2, hR.data(), N * 4, hipMemcpyHostToDevice));
+    CK(hipMemcpy(rh0, hRh.data(), N * 4, hipMemcpyHostToDevice));
+    CK(hipMemcpy(y, hy.data(), 2560 * 4, hipMemcpyHostToDevice));
+    // A: unfused
+    gemv(inj, rh0, w4A);
+    k_gr_write<<<(2560 + 255) / 256, 256, 0, g_str>>>(w4A, R1, y, 2560, 4);
+    k_rmsnorm_zc_grouped<<<4, 1024, 0, g_str>>>(R1, hw, oA, 2560, g_cfg.norm_eps, 4);
+    gemv_silu(dn, oA, tA);
+    gemv(up, tA, GA);
+    k_gr_combine<true><<<(2560 + 255) / 256, 256, 0, g_str>>>(GA, oA, xA, 2560, 4);
+    // B: fused
+    const int gps = 32;
+    k_hcf_wn<true><<<4, 1024, 0, g_str>>>(inj.data, (int)inj.cols, (int)inj.scale_stride, gps,
+                                          (int)((inj.cols / 64 + gps - 1) / gps), rh0, R2, y, hw, oB,
+                                          w4B, 2560, g_cfg.norm_eps);
+    k_hcf_down<<<dim3((unsigned)((dn.rows + 7) / 8), (unsigned)((dn.cols / 64 + gps - 1) / gps)), 256, 0,
+                 g_str>>>(dn.data, oB, hcf_part_, tB, (int)dn.rows, (int)dn.cols,
+                          (int)dn.scale_stride, gps, hcf_cnt_);
+    k_hcf_upc<<<2560 / 8, 256, 0, g_str>>>(up.data, tB, oB, xB, 2560, (int)up.cols,
+                                           (int)up.scale_stride);
+    CK(hipStreamSynchronize(g_str));
+    auto cmpv = [&](const char* nm, const float* a, const float* bb, int n) {
+      std::vector<float> ha(n), hb(n);
+      CK(hipMemcpy(ha.data(), a, n * 4, hipMemcpyDeviceToHost));
+      CK(hipMemcpy(hb.data(), bb, n * 4, hipMemcpyDeviceToHost));
+      int bad = 0, first = -1;
+      for (int i = 0; i < n; i++)
+        if (memcmp(&ha[i], &hb[i], 4)) { if (first < 0) first = i; bad++; }
+      if (bad)
+        fprintf(stderr, "hcf check %-5s: %d/%d differ, first %d: %.9g vs %.9g\n", nm, bad, n, first,
+                (double)ha[first], (double)hb[first]);
+      else
+        fprintf(stderr, "hcf check %-5s: bit-identical (%d)\n", nm, n);
+    };
+    cmpv("w4", w4A, w4B, 4);
+    cmpv("R", R1, R2, N);
+    cmpv("Rhat", oA, oB, N);
+    cmpv("t320", tA, tB, 320);
+    cmpv("x", xA, xB, 2560);
+    for (float* p : {R1, R2, rh0, oA, oB, GA, y, xA, xB, tA, tB, w4A, w4B}) CK(hipFree(p));
+  }
+  bool hcf_active() const { return hcf_on_ && !cvec_.on(); }
+  // standalone grouped norm of R into A (same launch as gr_read's first kernel)
+  void hcf_norm(const char* prefix) {
+    float* hw = ensure_hcnorm(prefix);
+    k_rmsnorm_zc_grouped<<<4, 1024, 0, g_str>>>(d_R, hw, d_Rhat, 2560, g_cfg.norm_eps, 4);
+    hcf_rh_ = d_Rhat;
+    hcf_ready_ = true;
+  }
+  // down + silu, up + combine on the current Rhat
+  void hcf_rest(const char* prefix, float* x_out) {
+    char b[160];
+    snprintf(b, sizeof b, "%s.input_mix_weight_down.weight", prefix);
+    const WView dn = wview(ckpt.at(b));
+    snprintf(b, sizeof b, "%s.input_mix_weight_up.weight", prefix);
+    const WView up = wview(ckpt.at(b));
+    const int gps = 32, ns = (int)((dn.cols / 64 + gps - 1) / gps);
+    k_hcf_down<<<dim3((unsigned)((dn.rows + 7) / 8), (unsigned)ns), 256, 0, g_str>>>(
+        dn.data, hcf_rh_, hcf_part_, d_t320, (int)dn.rows, (int)dn.cols, (int)dn.scale_stride,
+        gps, hcf_cnt_);
+    k_hcf_upc<<<2560 / 8, 256, 0, g_str>>>(up.data, d_t320, hcf_rh_, x_out, 2560, (int)up.cols,
+                                           (int)up.scale_stride);
+    hcf_ready_ = false;
+  }
+  // inject + write (+ norm with next_prefix's hc_norm into the other buffer)
+  void hcf_wn(const char* prefix, const float* y, const char* next_prefix) {
+    char b[160];
+    snprintf(b, sizeof b, "%s.block_inject_weight.weight", prefix);
+    const WView inj = wview(ckpt.at(b));
+    const int gps = 32, ns = (int)((inj.cols / 64 + gps - 1) / gps);
+    float* out = hcf_rh_ == d_Rhat ? d_RhatB : d_Rhat;
+    if (next_prefix) {
+      float* hw = ensure_hcnorm(next_prefix);
+      k_hcf_wn<true><<<4, 1024, 0, g_str>>>(inj.data, (int)inj.cols, (int)inj.scale_stride, gps,
+                                            ns, hcf_rh_, d_R, y, hw, out, d_w4, 2560,
+                                            g_cfg.norm_eps);
+      hcf_rh_ = out;
+      hcf_ready_ = true;
+    } else {
+      k_hcf_wn<false><<<4, 1024, 0, g_str>>>(inj.data, (int)inj.cols, (int)inj.scale_stride, gps,
+                                             ns, hcf_rh_, d_R, y, nullptr, nullptr, d_w4, 2560,
+                                             g_cfg.norm_eps);
+      hcf_ready_ = false;
+    }
+  }
+  void enq_layer_hcf(int l) {
+    char pa[96], pm[96], pn[96];
+    snprintf(pa, sizeof pa, "layers.%d.attn_hyper_connection", l);
+    snprintf(pm, sizeof pm, "layers.%d.mlp_hyper_connection", l);
+    if (l + 1 < g_cfg.layers) snprintf(pn, sizeof pn, "layers.%d.attn_hyper_connection", l + 1);
+    else snprintf(pn, sizeof pn, "hyper_connection_mixer");
+    auto t2 = tick();
+    if (!hcf_ready_) hcf_norm(pa);
+    hcf_rest(pa, d_x);
+    if (is_qsa(l))
+      qsa(l, l / 4, d_x, d_y);
+    else
+      gdn(l, l - (l + 1) / 4, d_x, d_y);
+    hcf_wn(pa, d_y, pm);
+    tock(2, t2);
+    auto t3 = tick();
+    hcf_rest(pm, d_x);
+    moe(l, d_x, d_y);
+    // PLE (ple_gpu, between layer 0 and 1) adds into R: no norm fold there
+    hcf_wn(pm, d_y, (l == 0 && ple_on) ? nullptr : pn);
+    pf_join();
+    tock(3, t3);
+  }
+
   void enq_layer(int l) {
+    if (hcf_active()) {
+      enq_layer_hcf(l);
+      return;
+    }
     char prefix[128];
     snprintf(prefix, sizeof prefix, "layers.%d.attn_hyper_connection", l);
     auto t2 = tick();
@@ -3220,10 +3526,17 @@ struct GpuModel {
     gr_write(prefix, d_y);
     // 控制向量 hook：decode 残差 d_R（f32，单行；进 decode graph 捕获）。
     cvec_.apply(l, d_R, 1, false, g_str);
+    pf_join();
     tock(3, t3);
   }
   void enq_final() {
-    gr_read("hyper_connection_mixer", d_x /*h*/);
+    if (hcf_active()) {
+      if (!hcf_ready_) hcf_norm("hyper_connection_mixer");
+      hcf_rest("hyper_connection_mixer", d_x);
+      hcf_rh_ = d_Rhat;
+    } else {
+      gr_read("hyper_connection_mixer", d_x /*h*/);
+    }
     gemv(wview(ckpt.at("lm_head.weight")), d_x, d_logits);
     if (viz::on()) {
       const VizTap t = vz_tap(g_cfg.layers, false, true);
@@ -10105,6 +10418,24 @@ struct GpuModel {
         out_vals[(size_t)r * k + j] = vals[ord[j]];
       }
     }
+    return true;
+  }
+
+  // sms_serial: one sampled serial decode token from d_logits through the
+  // GPU top-k path (draft-row semantics: round-shared corrections only).
+  // False -> caller takes the dense host path (top_k unset/>64, overflow,
+  // QWENOX_SMS_SERIAL=0). Same distribution; candidate order (value desc,
+  // id asc) differs from nth_element, as on the spec rows.
+  template <typename Sampler>
+  bool sms_sample_serial(Sampler& s, int* out, float* lp) {
+    static const bool off = env_zero("QWENOX_SMS_SERIAL");
+    if (off || !sms_gpu_active(s) || !sms_round_shared(s)) return false;
+    if (!sms_topk_rows(d_logits, g_cfg.vocab, 1, s.top_k, false,
+                       sms_out_ids.data(), sms_out_vals.data()))
+      return false;
+    typename Sampler::SDist sd;
+    sms_prep(s, 0, true, sd);
+    *out = s.draw_sparse(sd, lp, true);
     return true;
   }
 

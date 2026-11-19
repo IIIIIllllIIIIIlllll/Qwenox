@@ -1282,3 +1282,213 @@ __global__ __launch_bounds__(256) void k_q8g32_wmma(const int8_t* __restrict__ q
       out[(size_t)p * ys + r] = v;
   }
 }
+
+// ---- decode prefetch (QWENOX_DECODE_PF) -----------------------------------
+// Read-only sweep over up to 12 weight ranges on a side stream so the bytes
+// sit in MALL/L2 when the main chain reaches them. Results are XOR-folded and
+// only "stored" on an impossible value, so the loads cannot be dropped.
+struct DpfRange { const uint4* p; unsigned long long n; };
+struct DpfSet { DpfRange r[12]; int nr; };
+__global__ void __launch_bounds__(256) k_decode_pf(DpfSet s, unsigned* sink) {
+  unsigned acc = 0;
+  const unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;
+  for (int r = 0; r < s.nr; r++) {
+    const uint4* p = s.r[r].p;
+    const unsigned long long n = s.r[r].n;
+    for (unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+         i < n; i += stride) {
+      const uint4 v = p[i];
+      acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+  }
+  if (acc == 0x7f4a7c15u) atomicXor(sink, acc);
+}
+
+// ---- HC chain fusion for the P=1 decode step (QWENOX_HC_FUSE) --------------
+// Bit-identical to the unfused chain: every value is produced by the same
+// lane math and summed in the same order as k_q6g64_gemv_sk + k_q6g64_skred,
+// k_gr_write, k_rmsnorm_zc_grouped<<<4,1024>>>, k_silu_scale,
+// k_q6g64_gemv<1,float,8> and k_gr_combine<true>.
+namespace hcf {
+// k_q6g64_gemv_sk<1,float> lane body: row `row`, groups [g0, g1), lane li.
+__device__ __forceinline__ float sk_lane(const uint8_t* __restrict__ row, const float* __restrict__ x,
+                                         int C, int g0, int g1, int li) {
+  const int sub = li & 7, gq = li >> 3;
+  float acc = 0.f;
+  for (int g = g0 + gq; g < g1; g += 4) {
+    const uint32_t lw = *(const uint32_t*)(row + g * 32 + sub * 4);
+    const uint32_t hw = *(const uint32_t*)(row + C / 2 + g * 16 + (sub >> 1) * 4);
+    const uint32_t sb = *(const uint32_t*)(row + 3 * C / 4 + g * 4);
+    const float sc = __half2float(__ushort_as_half((unsigned short)(sb & 0xffffu)));
+    const float bi = __half2float(__ushort_as_half((unsigned short)(sb >> 16)));
+    float cf[8];
+#pragma unroll
+    for (int e = 0; e < 8; e++) {
+      const uint32_t lo = (lw >> (4 * e)) & 15u;
+      const uint32_t hi = (hw >> (2 * ((sub & 1) * 8 + e))) & 3u;
+      cf[e] = (float)(lo | (hi << 4));
+    }
+    float xv[8];
+    hv2::ldx8(x + g * 64 + sub * 8, xv);
+    float dx = 0.f, sx = 0.f;
+#pragma unroll
+    for (int e = 0; e < 8; e++) {
+      dx = fmaf(cf[e], xv[e], dx);
+      sx += xv[e];
+    }
+    // explicit form = what the backend emits for the unfused kernels
+    acc += fmaf(sc, dx, bi * sx);
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
+  return acc;
+}
+}  // namespace hcf
+
+// inject GEMV (4 x C) + gr_write + (kNorm) grouped zc rmsnorm. grid = branches
+// blocks of 1024 threads (block b owns branch b: w4[b] needs row b only, the
+// norm of group b needs R[b] only). rh_old is read whole by every block, so
+// rh_new must be a different buffer.
+template <bool kNorm>
+__global__ __launch_bounds__(1024) void k_hcf_wn(const uint8_t* __restrict__ wq, int C, int st,
+                                                 int gps, int ns, const float* __restrict__ rh_old,
+                                                 float* __restrict__ R, const float* __restrict__ y,
+                                                 const float* __restrict__ nw,
+                                                 float* __restrict__ rh_new, float* __restrict__ w4,
+                                                 int d, float eps) {
+  const int b = blockIdx.x, tid = threadIdx.x, wv = tid >> 5, li = tid & 31;
+  __shared__ float sp[32];
+  __shared__ float sm[1024];
+  if (wv < ns) {
+    const int g0 = wv * gps, g1 = min(C >> 6, g0 + gps);
+    const float a = hcf::sk_lane(wq + (size_t)b * st, rh_old, C, g0, g1, li);
+    if (li == 0) sp[wv] = a;
+  }
+  __syncthreads();
+  float w = sp[0];
+  for (int s = 1; s < ns; s++) w += sp[s];
+  if (tid == 0) w4[b] = w;
+  const float s2 = 2.f / (1.f + expf(-w * 0.25f));
+  float* Rb = R + (size_t)b * d;
+  float rv[4];
+  float ss = 0.f;
+#pragma unroll
+  for (int k = 0; k < 4; k++) {
+    const int i = tid + k * 1024;
+    if (i < d) {
+      float v = Rb[i];
+      v += s2 * y[i];
+      Rb[i] = v;
+      rv[k] = v;
+      ss += v * v;
+    }
+  }
+  if (!kNorm) return;
+  sm[tid] = ss;
+  __syncthreads();
+  for (int off = 512; off > 0; off >>= 1) {
+    if (tid < off) sm[tid] += sm[tid + off];
+    __syncthreads();
+  }
+  const float inv = rsqrtf(sm[0] / d + eps);
+  const float* wg = nw + (size_t)b * d;
+  float* og = rh_new + (size_t)b * d;
+#pragma unroll
+  for (int k = 0; k < 4; k++) {
+    const int i = tid + k * 1024;
+    if (i < d) og[i] = rv[k] * inv * (1.f + wg[i]);
+  }
+}
+
+// mix-down GEMV (R x C split-K, as k_q6g64_gemv_sk<1,float>) + the skred sum
+// (last-arriving K slice of each 8-row tile, slices in order) + silu(v/4).
+__global__ __launch_bounds__(256) void k_hcf_down(const uint8_t* __restrict__ wq,
+                                                  const float* __restrict__ x,
+                                                  float* __restrict__ part, float* __restrict__ t,
+                                                  int R, int C, int st, int gps,
+                                                  int* __restrict__ cnt) {
+  const int tid = threadIdx.x, li = tid & 31;
+  const int r = blockIdx.x * 8 + (tid >> 5);
+  const int s = blockIdx.y;
+  if (r < R) {
+    const int g0 = s * gps, g1 = min(C >> 6, g0 + gps);
+    const float a = hcf::sk_lane(wq + (size_t)r * st, x, C, g0, g1, li);
+    if (li == 0) part[(size_t)s * R + r] = a;
+  }
+  __shared__ int s_last;
+  __threadfence();
+  __syncthreads();
+  if (tid == 0) s_last = atomicAdd(cnt + blockIdx.x, 1) == (int)gridDim.y - 1;
+  __syncthreads();
+  if (!s_last) return;
+  __threadfence();
+  if (tid < 8) {
+    const int rr = blockIdx.x * 8 + tid;
+    if (rr < R) {
+      float v = __builtin_nontemporal_load(part + rr);
+      for (int k = 1; k < (int)gridDim.y; k++) v += __builtin_nontemporal_load(part + (size_t)k * R + rr);
+      const float xx = v * 0.25f;
+      t[rr] = xx / (1.f + expf(-xx));
+    }
+  }
+  if (tid == 0) atomicExch(cnt + blockIdx.x, 0);
+}
+
+// mix-up GEMV (branches*d rows x C, C < 1024, k_q6g64_gemv<1,float,8> lane
+// math) + sigmoid combine. Block = 8 output columns i for all 4 branches.
+__global__ __launch_bounds__(256) void k_hcf_upc(const uint8_t* __restrict__ wq,
+                                                 const float* __restrict__ t,
+                                                 const float* __restrict__ rh,
+                                                 float* __restrict__ xo, int d, int C, int st) {
+  constexpr int LPR = 8;
+  const int tid = threadIdx.x, rr = tid / LPR, li = tid % LPR;
+  const int b = rr >> 3, j = rr & 7;
+  const int r = b * d + blockIdx.x * 8 + j;
+  __shared__ float sG[32];
+  const uint8_t* row = wq + (size_t)r * st;
+  const int ng = C >> 6;
+  float acc = 0.f;
+  for (int g = li; g < ng; g += LPR) {
+    const uint4 l0 = *(const uint4*)(row + g * 32), l1 = *(const uint4*)(row + g * 32 + 16);
+    const uint4 hp = *(const uint4*)(row + C / 2 + g * 16);
+    const uint32_t sb = *(const uint32_t*)(row + 3 * C / 4 + g * 4);
+    const float sc = __half2float(__ushort_as_half((unsigned short)(sb & 0xffffu)));
+    const float bi = __half2float(__ushort_as_half((unsigned short)(sb >> 16)));
+    const uint32_t lw[8] = {l0.x, l0.y, l0.z, l0.w, l1.x, l1.y, l1.z, l1.w};
+    const uint32_t hw[4] = {hp.x, hp.y, hp.z, hp.w};
+    float dx = 0.f, sx = 0.f;
+#pragma unroll
+    for (int i8 = 0; i8 < 8; i8++) {
+      float cf[8];
+#pragma unroll
+      for (int e = 0; e < 8; e++) {
+        const uint32_t lo = (lw[i8] >> (4 * e)) & 15u;
+        const uint32_t hi = (hw[i8 >> 1] >> (2 * ((i8 & 1) * 8 + e))) & 3u;
+        cf[e] = (float)(lo | (hi << 4));
+      }
+      float xv[8];
+      hv2::ldx8(t + g * 64 + i8 * 8, xv);
+#pragma unroll
+      for (int e = 0; e < 8; e++) {
+        dx = fmaf(cf[e], xv[e], dx);
+        sx += xv[e];
+      }
+    }
+    // explicit form = what the backend emits for the unfused kernels
+    acc += fmaf(sc, dx, bi * sx);
+  }
+#pragma unroll
+  for (int off = LPR / 2; off > 0; off >>= 1) acc += __shfl_xor(acc, off, LPR);
+  if (li == 0) sG[rr] = acc;
+  __syncthreads();
+  if (tid < 8) {
+    const int i = blockIdx.x * 8 + tid;
+    float a = 0.f;
+    for (int bb = 0; bb < 4; bb++) {
+      float g = sG[bb * 8 + tid];
+      g = 1.f / (1.f + expf(-g));
+      a += g * rh[(size_t)bb * d + i];
+    }
+    xo[i] = a / 4;
+  }
+}

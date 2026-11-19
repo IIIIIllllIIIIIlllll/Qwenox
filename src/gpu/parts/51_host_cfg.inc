@@ -4272,8 +4272,12 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
             note_pause(hist.size(), fed);
           }
           if (g.sample) {
-            m.get_logits(lbuf);
-            cur = smp.sample(lbuf, &cur_lp);
+            // sms_serial: GPU corrections + top-k prefilter, host replays the
+            // filter chain on top_k candidates (same as the spec draft rows).
+            if (!m.sms_sample_serial(smp, &cur, &cur_lp)) {
+              m.get_logits(lbuf);
+              cur = smp.sample(lbuf, &cur_lp);
+            }
           } else if (repeat_greedy) {
             m.get_logits(lbuf);
             cur = smp.greedy(lbuf);
