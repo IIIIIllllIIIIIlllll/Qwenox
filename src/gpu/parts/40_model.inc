@@ -10827,15 +10827,17 @@ struct GpuModel {
     }();
     return v;
   }
-  // QWENOX_GREEDY_CONF=θ（greedy MTP 轮；默认 0 = 关，γ 由 GammaCtl/固定值
-  // 决定）：halogen MTP_GATE_P 风格的置信度门控。草稿链在每个 draft 后看
-  // 草稿头自己分布的 top-1 概率，跌破 θ 即在该草稿后收链（该草稿仍被
-  // 验证）。greedy 下逐位接受只取决于前缀，截断尾部 verify 行不改变输出，
-  // 只改变速度。0.90 是 halogen 的默认阈值，从这里起步。
+  // QWENOX_GREEDY_CONF=θ（greedy MTP 轮；默认 0.9，0 = 关）：halogen
+  // MTP_GATE_P 风格的置信度门控。草稿链在每个 draft 后看草稿头自己分布的
+  // top-1 概率，跌破 θ 即在该草稿后收链（该草稿仍被验证）。greedy 下逐位
+  // 接受只取决于前缀，截断尾部 verify 行不改变输出，只改变速度。
+  // 11-20 Linux（v2，chain，600 tok，γ4）：关 -> 0.9 代码 80.8 -> 86.1、散文
+  // 54.4 -> 65.5、8K 上下文 56.3 -> 65.4；θ 0.8 / 0.95、γ 5/6/7 都不更好。
+  // （11-09 Windows 测到"总速反降"是当时 verify 轮固定成本高，已过时。）
   static float greedy_conf() {
     static const float v = [] {
       const char* e = getenv("QWENOX_GREEDY_CONF");
-      return e ? std::max(0.f, std::min(1.f, (float)atof(e))) : 0.f;
+      return e ? std::max(0.f, std::min(1.f, (float)atof(e))) : 0.9f;
     }();
     return v;
   }

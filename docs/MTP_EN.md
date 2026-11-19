@@ -41,7 +41,7 @@ present to override the built-in default tables as a group (the defaults are
 reversed from upstream halogen 0.20.7's embedded profile and backstop the old
 `mtp.hgn`, same as upstream's fallback). The default gates match upstream:
 sampled rounds use `QWENOX_SAMPLED_GATE` (drawn-probability 0.95/0.98), greedy
-uses `QWENOX_GREEDY_CONF` (off by default); to use the calibration:
+uses `QWENOX_GREEDY_CONF` (default 0.9, 0 = off); to use the calibration:
 
 ```bash
 QWENOX_MTP_GATE_RULE=cost bash start_hgn.sh   # or sampled-only: QWENOX_SAMPLED_GATE=cost

@@ -39,7 +39,7 @@ temperature=0 是贪心对照，不保证提高接受率。随后用你日常的
 引擎在 MTP 初始化时读取；5 个张量齐备才整组覆盖内置默认表（默认表逆向自上游
 halogen 0.20.7 的内嵌 profile，旧 `mtp.hgn` 没有标定时用它兜底，与上游回退一致）。
 默认门与上游一致：采样走 `QWENOX_SAMPLED_GATE`（抽中概率 0.95/0.98），greedy 走
-`QWENOX_GREEDY_CONF`（默认关）；要使用标定：
+`QWENOX_GREEDY_CONF`（默认 0.9，0 = 关）；要使用标定：
 
 ```bash
 QWENOX_MTP_GATE_RULE=cost bash start_hgn.sh   # 或只对采样开启：QWENOX_SAMPLED_GATE=cost
