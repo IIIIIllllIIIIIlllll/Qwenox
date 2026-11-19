@@ -65,6 +65,9 @@ export QWENOX_GGUF_MTP=$D/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf          # G3.
 | `QWENOX_GGUF_PLE=<路径>` | 用独立 GGUF 里的 `per_layer_token_embd.weight`（BF16 或 IQ4_NL，如 engram 拆出文件）取代内置 PLE 表；行数与行序必须与模型配置一致。service.conf 里对应 `GGUF_PLE_FILE` |
 | `QWENOX_GGUF_DENSE_FILTER=a,b,...` | 调试用：只有名字包含其中某个子串的张量来自 GGUF（`!` 前缀表示取反），用于二分定位 |
 
+另：llama.cpp 控制向量（refusal projection / additive GGUF）与权重格式无关，hgn 和 GGUF 都能加，
+见 [CVEC.md](CVEC.md)（service.conf 的 `CVEC` / `CVEC_MODE` / `CVEC_SCALE` / `CVEC_LAYERS`）。
+
 ## 转换规则（gguf_map.h）
 
 - Q8_0 矩阵 → dtype 8 q8g32 planar（无损重排）；F32 矩阵 → bf16；F32 向量 → dtype 1 f32。

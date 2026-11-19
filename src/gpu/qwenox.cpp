@@ -174,6 +174,7 @@
 #include "parts/29_npu.inc"
 #include "parts/30_host_util.inc"
 #include "parts/31_vision.inc"
+#include "parts/33_cvec.inc"
 #include "parts/40a_dflash2_state.inc"
 #include "parts/40_model.inc"
 #include "parts/41_dflash2.inc"

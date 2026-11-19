@@ -151,6 +151,26 @@ input:disabled,select:disabled{opacity:.42}
 .frow.bad input[type=text]{border-color:rgba(255,122,122,.7)}
 .envtag{font-size:11px;color:var(--warn);border:1px solid var(--warn);border-radius:4px;padding:0 5px}
 .unit{color:var(--dim);font-size:12.5px}
+
+/* 双端区间滑条（控制向量层区间）：两条 range 叠在同一轨道上，只让拇指响应指针。
+   rail 左右各内缩 8px（= 一半拇指宽），fill 的百分比就与拇指中心严格对齐。 */
+.rng2{position:relative;width:min(420px,100%);height:26px;flex:1 1 260px;min-width:200px}
+.rng2 .rail{position:absolute;left:8px;right:8px;top:11px;height:4px;border-radius:2px;
+  background:var(--line2)}
+.rng2 .fill{position:absolute;top:0;bottom:0;border-radius:2px;background:var(--accent)}
+.rng2 input[type=range]{position:absolute;left:0;right:0;top:0;width:100%;height:26px;margin:0;
+  background:transparent;pointer-events:none;-webkit-appearance:none;appearance:none}
+.rng2 input[type=range]:focus{outline:none}
+.rng2 input[type=range]::-webkit-slider-runnable-track{background:transparent;height:26px}
+.rng2 input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;pointer-events:auto;
+  width:16px;height:16px;margin-top:5px;border-radius:50%;background:var(--accent);
+  border:2px solid #0b1020;box-shadow:0 0 0 1px var(--line2);cursor:pointer}
+.rng2 input[type=range]::-moz-range-track{background:transparent;height:26px}
+.rng2 input[type=range]::-moz-range-thumb{pointer-events:auto;width:14px;height:14px;
+  border-radius:50%;background:var(--accent);border:2px solid #0b1020;cursor:pointer}
+.rng2 input[type=range]:disabled::-webkit-slider-thumb{background:var(--faint);cursor:default}
+.rng2 input[type=range]:disabled::-moz-range-thumb{background:var(--faint);cursor:default}
+.rng2val{font:12.5px var(--mono);color:var(--dim);min-width:74px;text-align:right}
 .chips{display:flex;gap:4px;flex-wrap:wrap}
 .chip{border:1px solid var(--line2);background:rgba(16,22,40,.6);border-radius:5px;
   padding:3px 10px;font-size:12.5px;cursor:pointer}
@@ -323,7 +343,7 @@ zh:{
   pre_title:"启动前检查", pre_note:"按已保存的配置检查", pre_busy:"服务运行中，端口检查略过",
   pre_fail:"以下检查没通过：\n{list}\n\n仍要启动吗？",
   ck:{MODEL_FILE:"主模型",NGRAM_FILE:"n-gram 表",OVERLAY_FILE:"overlay",MTP_FILE:"MTP 草稿",
-      VISION_FILE:"视觉塔",GGUF_FILE:"GGUF 主模型",GGUF_MTP_FILE:"MTP 草稿",GGUF_VISION_FILE:"视觉塔",GGUF_PLE_FILE:"PLE 表",
+      VISION_FILE:"视觉塔",GGUF_FILE:"GGUF 主模型",GGUF_MTP_FILE:"MTP 草稿",GGUF_VISION_FILE:"视觉塔",GGUF_PLE_FILE:"PLE 表",CVEC:"控制向量",
       TOKENIZER_JSON:"tokenizer.json",api:"API 程序",engine:"引擎程序",kernel_db:"kernel 库",
       scripts:"启动脚本",eport:"引擎端口",aport:"API 端口"},
   ck_off:"未启用", ck_empty:"未填写", ck_free:"空闲", ck_busy:"被占用", ck_missing:"缺少",
@@ -357,6 +377,8 @@ zh:{
   // 校验
   v_int:"需要整数", v_range:"范围 {a}–{b}", v_req:"必填", v_port:"不能和引擎端口相同",
   v_par:"并发大于 1 需要开启分页 KV", v_pool:"有效 KV 池超过上限（q8 为 1M，其他 512K）",
+  v_cvec_mode:"控制向量模式只允许 project 或 add", v_cvec_scale:"控制向量 scale 必须是大于 0 的小数",
+  v_cvec_layers:"层区间必须是 \"起 止\"，1≤起≤止≤47",
   v_ip:"需要 IPv4 地址", v_aff:"需要非零整数掩码（如 0xFFFF）",
   // 字段补充
   yarn:"超过 256K，自动开启 YaRN", pool_auto:"0 = 一条最大上下文",
@@ -395,7 +417,7 @@ en:{
   pre_title:"Pre-flight", pre_note:"checks the saved config", pre_busy:"service running; port check skipped",
   pre_fail:"These checks failed:\n{list}\n\nStart anyway?",
   ck:{MODEL_FILE:"main model",NGRAM_FILE:"n-gram table",OVERLAY_FILE:"overlay",MTP_FILE:"MTP draft",
-      VISION_FILE:"vision tower",GGUF_FILE:"GGUF model",GGUF_MTP_FILE:"MTP draft",GGUF_VISION_FILE:"vision tower",GGUF_PLE_FILE:"PLE table",
+      VISION_FILE:"vision tower",GGUF_FILE:"GGUF model",GGUF_MTP_FILE:"MTP draft",GGUF_VISION_FILE:"vision tower",GGUF_PLE_FILE:"PLE table",CVEC:"control vector",
       TOKENIZER_JSON:"tokenizer.json",api:"API binary",engine:"engine binary",kernel_db:"kernel db",
       scripts:"launch scripts",eport:"engine port",aport:"API port"},
   ck_off:"disabled", ck_empty:"empty", ck_free:"free", ck_busy:"in use", ck_missing:"missing",
@@ -425,6 +447,8 @@ en:{
   fb_empty:"(empty or filtered out)",
   v_int:"Integer required", v_range:"Range {a}–{b}", v_req:"Required", v_port:"Must differ from engine port",
   v_par:"Concurrency > 1 needs paged KV", v_pool:"Effective KV pool exceeds the cap (1M for q8, 512K otherwise)",
+  v_cvec_mode:"CVEC mode must be project or add", v_cvec_scale:"CVEC scale must be a number > 0",
+  v_cvec_layers:"CVEC layer range must be \"lo hi\" with 1 <= lo <= hi <= 47",
   v_ip:"IPv4 address required", v_aff:"Non-zero integer mask required (e.g. 0xFFFF)",
   yarn:"Above 256K — YaRN turns on automatically", pool_auto:"0 = one max context",
   aff_unset:"(unset)", aff_custom:"Custom mask…", aff_ph:"mask, e.g. 0xFFFF",
@@ -483,6 +507,18 @@ const FIELDS = [
   {k:"KVSNAP_DIR", tab:"i", grp:"cache", type:"dir", nameZh:"SSD 缓存目录", nameEn:"SSD cache dir",
    helpZh:"留空 = data/kvsnap", helpEn:"Empty = data/kvsnap"},
   // ---- 推理：选项 ----
+  // 控制向量（docs/CVEC.md）：模型资产，与权重版本无关，三种格式都显示。
+  {k:"CVEC", tab:"w", wv:["v1","v2","gguf"], type:"file", opt:1, ext:[".gguf"],
+   nameZh:"控制向量", nameEn:"Control vector",
+   helpZh:"llama.cpp 控制向量 GGUF（refusal projection）；关闭 = 不启用", helpEn:"llama.cpp control-vector GGUF (refusal projection); off = disabled"},
+  {k:"CVEC_MODE", tab:"w", wv:["v1","v2","gguf"], type:"select", nameZh:"控制向量模式", nameEn:"CVEC mode",
+   helpZh:"project 投影消融（默认）；add 加法引导", helpEn:"project = ablation (default); add = steering",
+   opts:[["project","project（投影）","project (ablation)"],["add","add（加法）","add (steering)"]]},
+  {k:"CVEC_SCALE", tab:"w", wv:["v1","v2","gguf"], type:"text", nameZh:"控制向量 scale", nameEn:"CVEC scale",
+   helpZh:"project 用 1.0；add 用 0.05–0.15", helpEn:"1.0 for project; 0.05-0.15 for add"},
+  {k:"CVEC_LAYERS", tab:"w", wv:["v1","v2","gguf"], type:"range", min:1, max:47,
+   nameZh:"控制向量层区间", nameEn:"CVEC layer range",
+   helpZh:"双端拖动；1–47，默认 4 44（参考配置）", helpEn:"Drag both ends; 1-47, default 4 44 (reference)"},
   {k:"MOE_A4", tab:"i", grp:"misc", type:"select", nameZh:"prefill 4-bit 加速", nameEn:"Prefill 4-bit act",
    helpZh:"仅 hgn v2；快约 9%，精度略降", helpEn:"hgn v2 only; ~9% faster, slightly less precise",
    opts:[["0","关闭","Off"],["1","gate/up","gate/up"],["2","down","down"],["3","两者","Both"]]},
@@ -520,10 +556,12 @@ const RANGES = {ENGINE_PORT:[1,65535], API_PORT:[1,65535], MAX_CONTEXT:[1024,104
   KVSNAP_MAX_GB:[0,65536], MAX_IMAGES:[1,256], REQLOG_LEVEL:[0,9], MEMORY_CAP_GB:[1,2048],
   MIN_AVAILABLE_GB:[1,4096], START_TIMEOUT:[30,86400], STALL_TIMEOUT:[5,3600]};
 // 方案收哪些键（与后端 kProfileKeys 一致；网络/请求日志属本机，不进方案）
+// 控制向量（CVEC*）与权重版本无关，三种格式都纳入方案。
+const PF_CVEC = ["CVEC","CVEC_MODE","CVEC_SCALE","CVEC_LAYERS"];
 const PF_WKEYS = {
-  v1:["MODEL_FILE","OVERLAY_FILE","MTP_FILE","VISION_FILE","TOKENIZER_DIR"],
-  v2:["MODEL_FILE","NGRAM_FILE","MTP_FILE","VISION_FILE","TOKENIZER_DIR"],
-  gguf:["GGUF_FILE","GGUF_MTP_FILE","GGUF_VISION_FILE","GGUF_PLE_FILE","TOKENIZER_DIR"],
+  v1:["MODEL_FILE","OVERLAY_FILE","MTP_FILE","VISION_FILE","TOKENIZER_DIR",...PF_CVEC],
+  v2:["MODEL_FILE","NGRAM_FILE","MTP_FILE","VISION_FILE","TOKENIZER_DIR",...PF_CVEC],
+  gguf:["GGUF_FILE","GGUF_MTP_FILE","GGUF_VISION_FILE","GGUF_PLE_FILE","TOKENIZER_DIR",...PF_CVEC],
 };
 const PF_IKEYS = FIELDS.filter(f => f.tab === "i").map(f => f.k);
 const ACTIVE = ["spawning","waiting_engine","waiting_api","running","stopping"];
@@ -636,6 +674,10 @@ function validate(d){
       if (Number.isNaN(n)){ err[f.k] = t("v_int"); continue; }
       const r = RANGES[f.k];
       if (r && (n < r[0] || n > r[1])) err[f.k] = t("v_range", {a:r[0], b:r[1]});
+    } else if (f.type === "range"){
+      const p = String(v).trim().split(/[\s,]+/).map(Number);
+      if (p.length !== 2 || !(p[0] >= f.min && p[1] >= p[0] && p[1] <= f.max))
+        err[f.k] = t("v_cvec_layers");
     } else if ((f.type === "file" || f.type === "dir") && f.req && !v){
       err[f.k] = t("v_req");
     } else if (f.k === "API_HOST" || f.k === "ENGINE_HOST"){
@@ -651,6 +693,13 @@ function validate(d){
   const poolMax = eff(d, "KV_TYPE") === "q8" ? 1048576 : 524288;
   if (!err.MAX_CONTEXT && !err.KV_POOL_TOKENS && Math.max(n("MAX_CONTEXT"), n("KV_POOL_TOKENS")) > poolMax)
     err[n("MAX_CONTEXT") > poolMax ? "MAX_CONTEXT" : "KV_POOL_TOKENS"] = t("v_pool");
+  // 控制向量（CVEC，见 docs/CVEC.md）：只有启用时才校验模式/scale/层区间。
+  if (eff(d, "CVEC")) {
+    const mode = eff(d, "CVEC_MODE");
+    if (mode !== "project" && mode !== "add") err.CVEC_MODE = t("v_cvec_mode");
+    const cs = parseFloat(eff(d, "CVEC_SCALE"));
+    if (!(cs > 0) || !Number.isFinite(cs)) err.CVEC_SCALE = t("v_cvec_scale");
+  }
   return err;
 }
 
@@ -822,7 +871,50 @@ function mkRow(f){
     disabled:env, placeholder:(S.cfg.defaults && S.cfg.defaults[k]) || "",
     oninput:ev => setVal(k, ev.target.value)});
 
-  if (f.type === "check"){
+  if (f.type === "range"){
+    // 双端滑条：值仍以 "lo hi" 字符串落盘/校验（与引擎、启动器 CLI 一致）。
+    const mn = f.min, mx = f.max;
+    const parse = v => {
+      const p = String(v ?? "").trim().split(/[\s,]+/).map(Number);
+      let lo = p[0], hi = p[1];
+      if (!(lo >= mn && lo <= mx)) lo = 4;
+      if (!(hi >= mn && hi <= mx)) hi = 44;
+      if (lo > hi) { const t = lo; lo = hi; hi = t; }
+      return [lo, hi];
+    };
+    const [lo0, hi0] = parse(d.v[k]);
+    const pct = x => ((x - mn) / (mx - mn)) * 100;
+    const wrap = el("div", {class:"rng2"});
+    const rail = el("div", {class:"rail"});
+    const fill = el("div", {class:"fill"});
+    const inLo = el("input", {type:"range", min:mn, max:mx, step:1, value:lo0, disabled:env});
+    const inHi = el("input", {type:"range", min:mn, max:mx, step:1, value:hi0, disabled:env});
+    const val = el("span", {class:"rng2val"});
+    const paint = (lo, hi) => {
+      fill.style.left = pct(lo) + "%";
+      fill.style.width = (pct(hi) - pct(lo)) + "%";
+      val.textContent = lo + " – " + hi;
+      // 低端过中线后置顶，保证两端在重叠区间内都还能抓到
+      const loFront = pct(lo) > 50;
+      inLo.style.zIndex = loFront ? 3 : 2;
+      inHi.style.zIndex = loFront ? 2 : 3;
+    };
+    const commit = (lo, hi) => { paint(lo, hi); setVal(k, lo + " " + hi); };
+    inLo.addEventListener("input", () => {           // 拖动中：clamp 低端不越过高端
+      const lo = Math.min(+inLo.value, +inHi.value);
+      inLo.value = lo; paint(lo, +inHi.value);
+    });
+    inHi.addEventListener("input", () => {
+      const hi = Math.max(+inHi.value, +inLo.value);
+      inHi.value = hi; paint(+inLo.value, hi);
+    });
+    inLo.addEventListener("change", () => commit(+inLo.value, +inHi.value));
+    inHi.addEventListener("change", () => commit(+inLo.value, +inHi.value));
+    rail.append(fill);
+    wrap.append(rail, inLo, inHi);
+    line.append(wrap, val);
+    paint(lo0, hi0);  // 首帧只画，不写回（避免把默认值当成用户改动）
+  } else if (f.type === "check"){
     line.append(mkSwitch(d.v[k] === "1", env, on => setVal(k, on ? "1" : "0")));
   } else if (f.type === "select"){
     const s = el("select", {disabled:env, onchange:ev => setVal(k, ev.target.value)},

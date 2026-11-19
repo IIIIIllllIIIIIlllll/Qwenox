@@ -32,6 +32,77 @@ temperature=0 is a greedy control and is not guaranteed to raise the acceptance 
 
 This implementation has no separate draft_temperature or tunable acceptance threshold: greedy mode verifies whether tokens match, and sampling mode performs rejection sampling by p/q. QWENOX_MTP_NORM/HAGG are legacy structure-debug switches; keep their default values.
 
+## r2's mtp.spec_cost calibration (cost gate)
+
+`qwen38-flash-next-drafter-r2.hgn` carries five f32 tensors beside the 31
+`mtp.*` tensors: `mtp.spec_cost.cal_g[50]` / `abar_g[8]` / `cal_s[50]` /
+`abar_s[8]` / `t[2]`. The engine reads them at MTP init; all five must be
+present to override the built-in default tables as a group (the defaults are
+reversed from upstream halogen 0.20.7's embedded profile and backstop the old
+`mtp.hgn`, same as upstream's fallback). The default gates match upstream:
+sampled rounds use `QWENOX_SAMPLED_GATE` (drawn-probability 0.95/0.98), greedy
+uses `QWENOX_GREEDY_CONF` (off by default); to use the calibration:
+
+```bash
+QWENOX_MTP_GATE_RULE=cost bash start_hgn.sh   # or sampled-only: QWENOX_SAMPLED_GATE=cost
+```
+
+The gate formula matches the upstream original (reversed from flash_serve on
+2026-11-19; n = chain length after folding in draft n's calibrated acceptance,
+prev accumulates from 1):
+
+- greedy: draft n first looks up `cal_g` by its top-1 confidence bin,
+  `prev *= cal_g[bin]`; for n≥2, trim to n-1 when
+  `prev·Tg < T(n+1)-T(n)`; for n≤6, stop at n when
+  `prev·abar_g[n+1]·Tg < T(n+2)-T(n+1)+Hg`; capped at 7.
+- sampled: bin by the **drawn token's** probability (not top-1) into `cal_s`,
+  single check `prev·abar_s[n+1]·Ts < T(n+2)-T(n+1)+Hs` stops at n.
+
+`T(1..8)` and `Hg/Hs` are the engine's built-in per-row verify profile;
+`t = {Tg, Ts}` comes from the head file (the fallback is 14.0 ms). Greedy
+output stays bit-identical and sampled output keeps the exact
+rejection-sampling distribution; only the draft length changes. Startup logs
+`mtp: spec cost from the head file (...)` or `from built-in defaults (...)`;
+a partial tensor set falls back to the defaults.
+
+`QWENOX_SAMPLED_GATE=t1,t2` is the default sampled-gate flavor (default
+**0.95,0.98**, matching upstream halogen): it applies to the **drawn token's**
+probability, t1 for the first draft and t2 afterwards. Setting `0` disables it
+and falls back to `QWENOX_SPEC_CONF`'s top-1 flavor (default 0.9); when both
+are set, SAMPLED_GATE wins.
+
+`QWENOX_SPEC_COST_SCALE` defaults to **1.0** (= the upstream formula). It is a
+Qwenox-only plain multiplier on the cost side (smaller = deeper drafts): the
+built-in T/H profile is fitted on halogen's engine, so tune it if this
+machine's round/rollback costs differ (see the local A/B below). On
+low-confidence or synthetic tokens (for example qsa-oracle) cost can be slower
+from rollbacks; raise the scale or leave the cost rule off there.
+
+Local A/B (2026-11-19, same binary, same 3072-token code-generation prompt,
+default sampling, JOINT on; median of 3):
+
+| Config | tok/s | commit/round | MTP per-draft acc |
+| --- | --- | --- | --- |
+| old head + top-1 0.9 gate (`SAMPLED_GATE=0`) | 68.8 | 6.1 | 0.81 |
+| r2 + upstream gate (default 0.95,0.98) | 67.0 | 5.4 | 0.83 |
+| old head + upstream gate | 64.5 | 5.6 | 0.82 |
+| r2 + top-1 0.9 gate (`SAMPLED_GATE=0`) | 64.5 | 5.4 | 0.82 |
+| r2 + cost (scale 0.5) | 64.1 | 5.4 | 0.78 |
+| r2 + cost (scale 1.0) | 52.9 | 3.6 | 0.59 |
+| old head + cost (scale 1.0, built-in tables) | 50.8 | 3.5 | 0.61 |
+
+How to read this: the built-in T/H profile is fitted on upstream's engine; at
+scale 1.0 the static chain cap is only 2 (the `max_g` in the startup log),
+which over-trims on this machine whose marginal per-row cost is much lower;
+scale 0.5 catches up with the top-1 gate. On gate flavors: top-1 0.9 extends
+chains by confidence, and the old head is systematically overconfident (at
+top-1≈0.9 its true acceptance is 0.64 vs r2's 0.85), which pays off on
+high-acceptance code. The upstream drawn-probability gate trims exactly the
+drafts that drew an improbable token (those bound to be rejected), so r2's
+honest calibration flips the result: +3.9% over the old head (67.0 vs 64.5),
+reproducing upstream's claimed gain — which is why the default gate now
+follows upstream.
+
 ## Reading the Logs
 
 ```bash

@@ -196,6 +196,7 @@ const std::pair<const char*, const char*> kDefaults[] = {
     {"ROPE_FACTOR", "1"}, {"QSA_INDEXER_BUDGET", "0"},
     {"KVSNAP_MAX_GB", "20"}, {"KVSNAP_DIR", ""}, {"RCKPT_MAX", "8"},
     {"MTP_GAMMA", "0"}, {"MOE_A4", "0"}, {"MAX_IMAGES", "32"},
+    {"CVEC", ""}, {"CVEC_MODE", "project"}, {"CVEC_SCALE", "1.0"}, {"CVEC_LAYERS", "4 44"},
     {"VIZ", "0"}, {"AFFINITY", ""}, {"PLE_URING", "1"},
     {"MEMORY_CAP_GB", "86"}, {"MIN_AVAILABLE_GB", "100"},
     {"START_TIMEOUT", "360"}, {"STALL_TIMEOUT", "60"},
@@ -1272,6 +1273,7 @@ const char* kProfileKeys[] = {
     "CONC_PREFILL_CHUNK", "QSA_INDEXER_BUDGET", "KVSNAP_MAX_GB", "KVSNAP_DIR",
     "MOE_A4", "MAX_IMAGES", "VIZ", "AFFINITY", "PLE_URING", "MEMORY_CAP_GB",
     "MIN_AVAILABLE_GB", "START_TIMEOUT", "STALL_TIMEOUT",
+    "CVEC", "CVEC_MODE", "CVEC_SCALE", "CVEC_LAYERS",
 };
 
 bool is_profile_key(const std::string& key) {
@@ -1580,7 +1582,7 @@ void handle_config_get(const http::Request&, http::Response* r, http::Stream*) {
         const char* file_keys[] = {"MODEL_FILE",  "NGRAM_FILE",      "OVERLAY_FILE",
                                    "MTP_FILE",    "VISION_FILE",     "GGUF_FILE",
                                    "GGUF_MTP_FILE", "GGUF_VISION_FILE", "GGUF_PLE_FILE",
-                                   "KVSNAP_DIR"};
+                                   "CVEC", "KVSNAP_DIR"};
         for (const char* key : file_keys) {
             const std::string p = resolved(g_conf, key);
             json f;
@@ -1648,6 +1650,20 @@ bool extra_validate(const svcconf::Conf& conf, std::string* err) {
     if (kvt != "bf16" && kvt != "fp16" && kvt != "q8") {
         *err = "KV_TYPE must be bf16, fp16 or q8";
         return false;
+    }
+    // 控制向量（CVEC，见 docs/CVEC.md）：非空文件时才校验模式/scale/层区间。
+    if (!svcconf::cfg_optional(conf, "CVEC", "").empty()) {
+        const std::string cm = svcconf::cfg(conf, "CVEC_MODE", "project");
+        if (cm != "project" && cm != "add") {
+            *err = "CVEC_MODE must be project or add";
+            return false;
+        }
+        double cs = 0;
+        if (!svcconf::parse_double(svcconf::cfg(conf, "CVEC_SCALE", "1.0"), &cs) || cs <= 0) {
+            *err = "CVEC_SCALE must be a number > 0";
+            return false;
+        }
+        // CVEC_LAYERS 的区间校验在 svcconf::validate_conf 里（同一 POST 已先调用）。
     }
     if (!int_range("MTP_GAMMA", "0", 0, 8)) return false;
     if (!int_range("MOE_A4", "0", 0, 3)) return false;

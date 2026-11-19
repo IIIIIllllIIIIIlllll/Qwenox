@@ -424,6 +424,7 @@ the tray icon → "Export diagnostics…". On Linux the start script collects th
 - [YARN-512K.md](docs/YARN-512K.md) / [YARN-512K-RESULTS.md](docs/YARN-512K-RESULTS.md) — YaRN 512K and measurements
 - [MTP_EN.md](docs/MTP_EN.md) / [NGRAM_EN.md](docs/NGRAM_EN.md) — speculative decoding
 - [KLD.md](docs/KLD.md) — quality testing (same method as unsloth / llama.cpp)
+- [CVEC.md](docs/CVEC.md) — control vectors (refusal projection / additive), loading and semantics (in Chinese)
 - [BENCHMARK_EN.md](docs/BENCHMARK_EN.md) — benchmark tools
 - [bench/README.md](bench/README.md) — task-level evaluation (long-context code-needle A/B, in Chinese)
 - [PORTING-WINDOWS_EN.md](docs/PORTING-WINDOWS_EN.md) — Windows port and measurements

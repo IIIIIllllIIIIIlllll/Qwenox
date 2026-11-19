@@ -353,6 +353,13 @@ int main(int argc, char** argv) {
       return 2;
     }
   }
+  // 控制向量（33_cvec.inc）：在加载 60 GiB 权重之前先校验参数与文件。
+  try {
+    Cvec::precheck();
+  } catch (const std::exception& e) {
+    fprintf(stderr, "qwenox: cvec: %s\n", e.what());
+    return 2;
+  }
   if (!rope_config_valid(g_cfg.rope)) {
     fprintf(stderr, "invalid YaRN config: factor>=1, original_ctx>0, beta_fast>=beta_slow>0, "
                     "attention_scale>=0\n");

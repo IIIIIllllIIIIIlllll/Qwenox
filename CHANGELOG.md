@@ -2,6 +2,37 @@
 
 版本号记在根目录 `VERSION` 文件里，编译时写进程序。查看当前版本有三种方式：托盘菜单第一行、控制台总览页"版本"、`GET /health` 返回的 `version` 字段。引擎本身可以运行 `qwenox-engine-win.exe --version`。
 
+## 未发布
+
+### 新功能
+
+- **drafter r2 的 `mtp.spec_cost` 标定与 cost 门控**：读取 r2 sidecar 新增的 5 个
+  f32 张量（`cal_g/abar_g/cal_s/abar_s/t`；5 个齐备才整组生效，否则回退内置默认表——
+  默认表逆向自上游 halogen 0.20.7 的内嵌 profile，旧 `mtp.hgn` 也走它，与上游回退
+  一致）。`QWENOX_MTP_GATE_RULE=cost`（或仅采样 `QWENOX_SAMPLED_GATE=cost`）启用
+  逐深度代价门控，公式按上游原式实现（2026-11-19 逆向自 flash_serve）：greedy 逐位
+  并入 `cal_g[bin(top-1)]`，n≥2 时 `prev·Tg < T(n+1)-T(n)` 砍末位、n≤6 时
+  `prev·abar_g[n+1]·Tg < T(n+2)-T(n+1)+Hg` 停链；采样按**抽中 token** 的概率分箱查
+  `cal_s` 单判定停链；7 封顶。greedy 输出逐位不变，采样仍为精确拒绝采样。
+  新增 `QWENOX_SAMPLED_GATE=t1,t2`（作用于**抽中 token** 的概率，t1 管第一个草稿、
+  t2 管后续），**采样默认门对齐上游为 0.95,0.98**（原为 `QWENOX_SPEC_CONF` 的
+  top-1 0.9 口径；显式 `QWENOX_SAMPLED_GATE=0` 退回旧行为）。本机 A/B：上游门下
+  r2 67.0 vs 旧头 64.5 tok/s（+3.9%，复现上游宣称），r2 也超过旧口径下的自己
+  （64.5）。
+  `QWENOX_SPEC_COST_SCALE`（默认 1.0 = 上游原式）为成本侧纯倍率。注意内置 T/H
+  profile 拟合自上游引擎：本机 scale 1.0 时静态链上限只有 2，反而比默认门慢 ~20%，
+  本机 A/B 与调参建议见 [MTP.md](docs/MTP.md)。
+- **控制向量（CVEC）**：引擎可直接加载 llama.cpp 控制向量 GGUF（如
+  `Qwen3.8-Flash-Next-refusal-projection.gguf`），在每层 HC 残差上做投影消融
+  （`h -= s·(h·v)·v`，默认）或加法引导（`h += s·v`），不改权重；参数为
+  `CVEC` / `CVEC_MODE` / `CVEC_SCALE` / `CVEC_LAYERS`（默认 `4 44`），另有
+  `QWENOX_CVEC_DIR` / `QWENOX_CVEC_PROBE`。语义与 Cudila/llama.cpp 的 cvec-hooks 分支对齐：
+  project 加载时单位化并把原范数并入 scale、张量 `direction.K` 用于第 K 层、闭区间、MTP/DFlash2
+  草稿头不另加向量。接入 service.conf、Linux/Windows 启动器、三处设置界面与 API 控制台；
+  prefill 的投影折进已有的“HC 写回 + norm”融合 kernel（写与 norm 之间一次块内 dot，
+  不增加残差流量），因此融合写保持开启，8K prefill 实测在噪声内（1183 vs 1176 tok/s）；
+  快照指纹混入向量内容。见 [CVEC.md](docs/CVEC.md)，内核回归在 `bash build_win.sh test`。
+
 ## v0.1.2 — 2026-11-12
 
 ### 新功能

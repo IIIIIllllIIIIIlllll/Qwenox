@@ -378,6 +378,7 @@ MTP 开、视觉塔开、prefill chunk 8192）：
 - [YARN-512K.md](docs/YARN-512K.md) / [YARN-512K-RESULTS.md](docs/YARN-512K-RESULTS.md) — YaRN 512K 与实测
 - [MTP.md](docs/MTP.md) / [NGRAM.md](docs/NGRAM.md) — 投机解码
 - [KLD.md](docs/KLD.md) — 质量测试（与 unsloth / llama.cpp 同口径）
+- [CVEC.md](docs/CVEC.md) — 控制向量（refusal projection / additive）的加载与应用
 - [BENCHMARK.md](docs/BENCHMARK.md) — 性能测试工具
 - [bench/README.md](bench/README.md) — 任务级评测（长上下文代码捞针 A/B）
 - [PORTING-WINDOWS.md](docs/PORTING-WINDOWS.md) — Windows 移植与实测

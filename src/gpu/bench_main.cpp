@@ -328,6 +328,11 @@ static void configure_runtime(const BenchConfig& config) {
   else unset_env_value("QWENOX_PLE_URING");
   // MOE_A4=1–3：prefill MoE 4-bit 激活位掩码（0/未设 = 关，与引擎侧语义一致）
   set_if_configured("QWENOX_MOE_A4", "MOE_A4");
+  // 控制向量（CVEC，见 docs/CVEC.md）：空 = 关闭。
+  set_if_configured("QWENOX_CVEC", "CVEC");
+  set_if_configured("QWENOX_CVEC_MODE", "CVEC_MODE");
+  set_if_configured("QWENOX_CVEC_SCALE", "CVEC_SCALE");
+  set_if_configured("QWENOX_CVEC_LAYERS", "CVEC_LAYERS");
   set_if_configured("QWENOX_ROPE_FACTOR", "ROPE_FACTOR");
   set_if_configured("QWENOX_ROPE_ORIGINAL_CTX", "ROPE_ORIGINAL_CTX");
   set_if_configured("QWENOX_ROPE_BETA_FAST", "ROPE_BETA_FAST");
