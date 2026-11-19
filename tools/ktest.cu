@@ -416,6 +416,8 @@ int main() {
   test_kv_q8();
   test_kv_fp16();
   test_cvec_apply();
+  test_cvec_fused();
+  test_cvec_fingerprint();
   // ---- 1. k_rmsnorm_zc_grouped batched wrap (grid = 4*P, ngroups = 4) ----
   {
     const int P = 3, G = 4, N = 2560;

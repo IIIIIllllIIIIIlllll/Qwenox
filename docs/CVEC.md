@@ -65,14 +65,17 @@ add:      h ← h + s·v            (s = scale，v 保持原样)
 - 投影内核每层每个 (token, 分支) 一个 block：两级归约求 `h·v`，再统一回写；残差是 bf16
   （`QWENOX_GR_BF16`，启动器默认开）时按 bf16 舍入。参考实现是 f32 残差，所以 bf16 下
   post cos 不会精确为 0（通常 1e-3 量级），不影响功能。
-- 融合写保持开启：prefill 的 mlp 残差写与下一层 norm 是同一个 kernel
-  （`k_gr_scatter_norm_*`），投影被折进该 kernel，插在“写回 bf16 残差”与“求平方和/
-  norm”之间（每 token 每分支一次块内 dot，不增加任何残差流量）。只在显式开启
-  `QWENOX_HC_FUSE_WRITE`（把写回再折进 moe reduce，默认关）时才需要关掉那一路。
-- 开销：decode 每层每 token 多一次 4×2560 的读+写（约 80 KB），实测 29.3 → 29.4 tok/s
+- project 保持融合写开启：prefill 的 mlp 残差写与下一层 norm 是同一个 kernel
+  （`k_gr_scatter_norm_*`），投影插在“写回 bf16 残差”与“求平方和/norm”之间。
+  每 token 每分支一次块内 dot，不增加残差流量。
+- add 使用独立的写回 → `k_cvec_apply` → norm 路径。启动时关闭 project 专用的
+  scatter+norm 融合，避免 prefill/投机验证执行投影公式，并保持与独立路径一致。
+  `QWENOX_HC_FUSE_WRITE`（把写回折进 moe reduce，默认关）在所有 CVEC 模式下都关闭。
+- 开销（project 的既有测量）：decode 每层每 token 多一次 4×2560 的读+写（约 80 KB），实测 29.3 → 29.4 tok/s
   （在噪声内）。prefill 8K 实测 1187/1183/1226（关）vs 1146/1176/1230 tok/s（开），
-  在噪声内。显存额外约 0.5 MB（47×2560 f32）。
-- 启用后 SSD/RAM 快照指纹会混入模式、scale、层区间与向量内容哈希：开/关切换或换向量文件后
+  在噪声内。显存额外约 0.5 MB（47×2560 f32）。add 的独立路径增加 kernel 调用，
+  尚未对其吞吐量作专门复测。
+- 启用后 SSD/RAM 快照指纹会混入模式、scale、层区间、向量内容及各层有效 scale 的哈希：开/关切换或换向量文件后
   旧快照不会被恢复（KV/GDN 状态与残差投影不兼容）。关闭时指纹与之前完全一致。
 
 ## 验证
@@ -85,8 +88,12 @@ add:      h ← h + s·v            (s = scale，v 保持原样)
   再用 `REF=logs/stock.kld` 带向量跑一次，记录 mean/p99 KL（参考实现自报 0.186，重尾）。
 - 速度与输出：`tools/cvec_eval.py --base http://127.0.0.1:8731` 抓短生成的 decode tok/s、
   输出前 80 字与 JSON，用于开/关对比。
-- 内核回归：`bash build.sh test` / `bash build_win.sh test` 包含 f32/bf16 × add/project
-  的逐元素与正交性检查。
+- 回归测试：`bash build.sh test` / `bash build_win.sh test` 包含：
+  - f32/bf16 × add/project 的逐元素与正交性检查。
+  - 六种融合写回/norm 变体的 project/关闭对照；覆盖 1、3、4、5、9 token，
+    同时与独立 CPU 公式比对残差和 norm 输出，包含 T=4 的尾批。
+  - 实际加载两个同方向、不同范数的 GGUF，检查有效 scale、指纹隔离和关闭时的零指纹。
+  - 两套 shell 启动链路的导出代码：开启时保留显式 DIR/PROBE、未配置时保持未设，关闭时清理。
 
 ## 注意
 

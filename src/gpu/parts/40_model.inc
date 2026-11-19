@@ -1721,10 +1721,16 @@ struct GpuModel {
       exit(1);
     }
     if (cvec_.on()) {
-      // 融合写（scatter+norm）保持开启：投影折进 kernel，在写与 norm 之间施加。
-      // 唯一例外是 moe reduce 里的写回融合（B2-1，默认关），它没有可插入的位置。
-      fprintf(stderr, "cvec: projection folded into the fused HC write+norm kernel%s\n",
-              gr_scatter_norm ? "" : " (fused write is off)");
+      // The fused scatter+norm kernels implement projection only. Add must
+      // keep the standalone write -> cvec_.apply -> read order for prefill
+      // and speculative verification, matching ordinary decode.
+      if (!cvec_.project()) {
+        gr_scatter_norm = false;
+        fprintf(stderr, "cvec: add uses standalone HC write+apply (projection-only fusion disabled)\n");
+      } else {
+        fprintf(stderr, "cvec: projection folded into the fused HC write+norm kernel%s\n",
+                gr_scatter_norm ? "" : " (fused write is off)");
+      }
       if (cvec_.probe_on() && gr_scatter_norm) {
         // 诊断用：融合 kernel 里没有 host 可读的中间值，probe 走独立投影 kernel。
         fprintf(stderr, "cvec: probe disables the fused write (diagnostic)\n");

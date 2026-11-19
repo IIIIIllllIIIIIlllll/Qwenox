@@ -140,11 +140,12 @@ serve_run() {
   # （放在 --check 之前：--check 会打印这些变量，tools/a5_verify.sh 等据此复现生产环境）
   export QWENOX_KV_TYPE="$KV_TYPE"
   # 控制向量（CVEC）：留空时清掉外部残留，其余参数只在开启时导出。
-  unset QWENOX_CVEC QWENOX_CVEC_MODE QWENOX_CVEC_SCALE QWENOX_CVEC_LAYERS \
-        QWENOX_CVEC_DIR QWENOX_CVEC_PROBE
+  unset QWENOX_CVEC QWENOX_CVEC_MODE QWENOX_CVEC_SCALE QWENOX_CVEC_LAYERS
   if [[ -n "$CVEC" ]]; then
     export QWENOX_CVEC="$CVEC" QWENOX_CVEC_MODE="$CVEC_MODE" \
            QWENOX_CVEC_SCALE="$CVEC_SCALE" QWENOX_CVEC_LAYERS="$CVEC_LAYERS"
+  else
+    unset QWENOX_CVEC_DIR QWENOX_CVEC_PROBE
   fi
   export QWENOX_QSA_KV_BF16=1 QWENOX_QSA_WMMA=1 QWENOX_QSA_WMMA_BTV=1
   # 自写 WMMA dense GEMM（Phase 3g）：8K +2%、32K +3%，对拍 8049 token 仅尾部分歧 4 个。

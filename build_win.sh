@@ -575,6 +575,7 @@ build_settings_tui() {
 }
 
 build_test() {
+    python tools/cvec_config_test.py --bash "$BASH"
     python tools/kv_admission_test.py --cxx "$TR/lib/llvm/bin/clang++.exe"
     python tools/kv_page_test.py --cxx "$TR/lib/llvm/bin/clang++.exe"
     echo "[编译] build/ktest-win.exe"

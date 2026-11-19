@@ -9,6 +9,166 @@ static float cvec_bf16_round(float f) {
   return r;
 }
 
+template <class T> static std::vector<T> cvec_get(const T* p, size_t n);
+
+// Exercise the production fused write+norm paths, including the small verify
+// batches and a partial T=4 block. Compare residuals AND the following norm
+// with an independent host formula; testing k_cvec_apply alone misses these.
+static void test_cvec_fused() {
+  const int n = 2560, br = 4;
+  for (int mode = 1; mode < 3; ++mode) {  // project, disabled; add uses standalone apply
+    const bool project = mode == 1;
+    for (int variant = 0; variant < 6; ++variant) {
+      const bool bf16 = variant < 4;
+      double max_r = 0, max_norm = 0;
+      for (int P : {1, 3, 4, 5, 9}) {
+        const size_t count = (size_t)P * br * n;
+        std::vector<float> input(count), y((size_t)P * n), w((size_t)br * n), v(n);
+        for (float& x : input) x = bf16 ? cvec_bf16_round(frand() * 2.f) : frand() * 2.f;
+        for (float& x : y) x = frand() * .25f;
+        for (float& x : w) x = frand() * .125f;
+        double norm_v = 0;
+        for (float& x : v) { x = frand() * .2f; norm_v += (double)x * x; }
+        if (project) for (float& x : v) x = (float)(x / sqrt(norm_v));
+        const float scale = project ? 1.375f : .1f;
+        std::vector<float> ref(count), ref_norm(count);
+        for (int row = 0; row < P * br; ++row) {
+          const size_t base = (size_t)row * n;
+          double dot = 0;
+          for (int j = 0; j < n; ++j) {
+            float x = input[base+j] + y[(size_t)(row/br)*n+j];
+            ref[base+j] = bf16 ? cvec_bf16_round(x) : x;
+            dot += (double)ref[base+j] * v[j];
+          }
+          double ss = 0;
+          for (int j = 0; j < n; ++j) {
+            float x = ref[base+j];
+            if (mode != 2) x = (float)(x + (project ? -scale * dot : scale) * v[j]);
+            ref[base+j] = bf16 ? cvec_bf16_round(x) : x;
+            ss += (double)ref[base+j] * ref[base+j];
+          }
+          const double inv = 1. / sqrt(ss/n + 1e-6f);
+          for (int j = 0; j < n; ++j) {
+            const float x = (float)(ref[base+j] * inv * (1.f+w[(size_t)(row%br)*n+j]));
+            ref_norm[base+j] = bf16 ? cvec_bf16_round(x) : x;
+          }
+        }
+        float* dv = dup(v), *dy = dup(y), *dw = dup(w);
+        float* dw4 = dup(std::vector<float>((size_t)P*br, 0.f));  // inject == 1 exactly
+        float* dout = dup(std::vector<float>((size_t)P*br*br, 0.f));
+        uint16_t* dwi = dup(std::vector<uint16_t>((size_t)br*br*n, 0));
+        uint16_t* dr16 = dup(std::vector<uint16_t>(count, 0));
+        uint16_t* dh16 = dup(std::vector<uint16_t>(count, 0));
+        float* dr = dup(input), *dh = dup(std::vector<float>(count, 0.f));
+        const float* dir = mode == 2 ? nullptr : dv;
+        if (bf16) {
+          std::vector<uint16_t> bits(count);
+          for (size_t i = 0; i < count; ++i) bits[i] = bf16_bits(input[i]);
+          TCK(hipMemcpy(dr16, bits.data(), count*2, hipMemcpyHostToDevice));
+          if (variant == 0)
+            k_gr_scatter_norm_b_hc_bf16<<<P*br, 256>>>(dw4, dr16, dy, dw, dh16, n, br, P, 1e-6f, dir, scale);
+          else if (variant == 1)
+            k_gr_scatter_norm_b_hc_bf16_f4<<<P, 256>>>(dw4, dr16, dy, dw, dh16, n, br, P, 1e-6f, dir, scale);
+          else if (variant == 2)
+            k_gr_scatter_norm_inj_bf16<1><<<P*br, 256>>>(dw4, nullptr, dr16, dy, dw, dh16, dwi, dout, n, P, 1e-6f, nullptr, dir, scale);
+          else
+            k_gr_scatter_norm_inj_bf16<4><<<br*((P+3)/4), 256>>>(dw4, nullptr, dr16, dy, dw, dh16, dwi, dout, n, P, 1e-6f, nullptr, dir, scale);
+        } else if (variant == 4)
+          k_gr_scatter_norm_b<<<P*br, 1024>>>(dw4, dr, dy, dw, dh, n, br, P, 1e-6f, nullptr, dir, scale);
+        else
+          k_gr_scatter_norm_b<true><<<P*br, 1024>>>(dw4, dr, dy, dw, dh, n, br, P, 1e-6f, dh16, dir, scale);
+        TCK(hipGetLastError());
+        auto got = dget(dr, count), got_norm = dget(dh, count);
+        if (bf16) {
+          auto r = cvec_get(dr16, count), h = cvec_get(dh16, count);
+          for (size_t i = 0; i < count; ++i) {
+            uint32_t a = (uint32_t)r[i] << 16, b = (uint32_t)h[i] << 16;
+            memcpy(&got[i], &a, 4); memcpy(&got_norm[i], &b, 4);
+          }
+        }
+        const double tol = bf16 ? 4./128 : 4e-6;
+        for (size_t i = 0; i < count; ++i) {
+          if (!std::isfinite(got[i]) || !std::isfinite(got_norm[i])) {
+            max_r = max_norm = HUGE_VAL;
+            continue;
+          }
+          max_r = std::max(max_r, fabs((double)got[i]-ref[i])/(tol*std::max(1., fabs((double)ref[i]))));
+          max_norm = std::max(max_norm, fabs((double)got_norm[i]-ref_norm[i])/(tol*std::max(1., fabs((double)ref_norm[i]))));
+        }
+        TCK(hipFree(dv)); TCK(hipFree(dy)); TCK(hipFree(dw)); TCK(hipFree(dw4));
+        TCK(hipFree(dout)); TCK(hipFree(dwi)); TCK(hipFree(dr16)); TCK(hipFree(dh16));
+        TCK(hipFree(dr)); TCK(hipFree(dh));
+      }
+      char label[64];
+      const char* mode_name = mode == 2 ? "off" : project ? "project" : "add";
+      snprintf(label, sizeof label, "cvec_fused_%s_%d", mode_name, variant);
+      check(label, std::max(max_r,max_norm), 1.);
+    }
+  }
+}
+
+struct CvecTestEnv {
+  std::vector<std::pair<std::string, std::string>> values;
+  std::vector<bool> present;
+  CvecTestEnv() {
+    for (const char* key : {"QWENOX_CVEC", "QWENOX_CVEC_MODE", "QWENOX_CVEC_SCALE",
+                            "QWENOX_CVEC_LAYERS", "QWENOX_CVEC_DIR", "QWENOX_CVEC_PROBE"}) {
+      const char* v = getenv(key);
+      values.emplace_back(key, v ? v : ""); present.push_back(v != nullptr);
+    }
+  }
+  static void set(const char* key, const char* value) {
+#ifdef _WIN32
+    _putenv_s(key, value ? value : "");
+#else
+    if (value) setenv(key, value, 1); else unsetenv(key);
+#endif
+  }
+  ~CvecTestEnv() {
+    for (size_t i = 0; i < values.size(); ++i)
+      set(values[i].first.c_str(), present[i] ? values[i].second.c_str() : nullptr);
+  }
+};
+
+// Load real GGUFs so normalization and effective scale are exercised together
+// with the fingerprint, rather than populating the Cvec fields by hand.
+static void test_cvec_fingerprint() {
+  CvecTestEnv env;
+  const auto dir = std::filesystem::temp_directory_path() /
+      ("qwenox-cvec-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+  std::filesystem::create_directory(dir);
+  const auto a_path = dir / "unit.gguf", b_path = dir / "double.gguf";
+  auto write_gguf = [&](const std::filesystem::path& path, float magnitude) {
+    std::ofstream f(path, std::ios::binary);
+    auto u32 = [&](uint32_t v) { f.write((const char*)&v, 4); };
+    auto u64 = [&](uint64_t v) { f.write((const char*)&v, 8); };
+    auto str = [&](const char* v) { u64(strlen(v)); f.write(v, strlen(v)); };
+    u32(0x46554747); u32(3); u64(1); u64(1);
+    str("general.architecture"); u32(8); str("controlvector");
+    str("direction.4"); u32(1); u64(g_cfg.d); u32(gguf::F32); u64(0);
+    while ((uint64_t)f.tellp() % 32) f.put(0);
+    std::vector<float> raw(g_cfg.d, 0.f); raw[0] = magnitude;
+    f.write((const char*)raw.data(), raw.size()*sizeof(float));
+    if (!f) throw std::runtime_error("cvec test: cannot write GGUF fixture");
+  };
+  write_gguf(a_path, 1.f); write_gguf(b_path, 2.f);
+  CvecTestEnv::set("QWENOX_CVEC_MODE", "project");
+  CvecTestEnv::set("QWENOX_CVEC_SCALE", "1");
+  CvecTestEnv::set("QWENOX_CVEC_LAYERS", "4 4");
+  CvecTestEnv::set("QWENOX_CVEC_DIR", "per-layer");
+  CvecTestEnv::set("QWENOX_CVEC_PROBE", nullptr);
+  CvecTestEnv::set("QWENOX_CVEC", a_path.string().c_str());
+  Cvec a; a.load();
+  CvecTestEnv::set("QWENOX_CVEC", b_path.string().c_str());
+  Cvec b; b.load();
+  check("cvec_fingerprint_norm", a.fingerprint() == b.fingerprint() ? 1. : 0., 0.);
+  check("cvec_effective_scale", fabs(a.s(4)-1.f) + fabs(b.s(4)-2.f), 0.);
+  Cvec disabled;
+  check("cvec_fingerprint_off", disabled.fingerprint() == 0 ? 0. : 1., 0.);
+  a.release(); b.release();
+  std::filesystem::remove(a_path); std::filesystem::remove(b_path); std::filesystem::remove(dir);
+}
+
 template <class T>
 static std::vector<T> cvec_get(const T* p, size_t n) {
   std::vector<T> v(n);

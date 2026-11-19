@@ -83,7 +83,6 @@ struct Cvec {
   std::vector<float> host_u_; // [n_layer][n_embd]：单位向量（probe 的 cos 用）
   std::vector<float> host_s_; // [n_layer]
   float* d_v_ = nullptr;      // [n_layer][n_embd]
-  float* d_s_ = nullptr;      // [n_layer]
   int probe_ = -1;            // QWENOX_CVEC_PROBE 层号
   int probe_shown_ = 0;       // 已报告的批次数（最多 2）
   float* d_probe_ = nullptr;  // [2][branches][n_embd] 前/后残差（f32）
@@ -94,7 +93,7 @@ struct Cvec {
   bool project() const { return mode_ == 1; }
   bool in_range(int l) const { return on_ && l >= lo_ && l <= hi_; }
   const float* dir(int l) const { return d_v_ + (size_t)l * g_cfg.d; }
-  float s(int l) const { return d_s_[l]; }
+  float s(int l) const { return host_s_[l]; }  // kernel scalar arguments are read on host
   bool probe_on() const { return probe_ >= 0; }
 
   static const char* layer_suffix() { return ".mlp_hyper_connection"; }
@@ -244,10 +243,7 @@ struct Cvec {
     }
     on_ = true;
     CK(hipMalloc((void**)&d_v_, (size_t)n_layer * n * sizeof(float)));
-    CK(hipMalloc((void**)&d_s_, (size_t)n_layer * sizeof(float)));
     CK(hipMemcpy(d_v_, host_.data(), (size_t)n_layer * n * sizeof(float),
-                 hipMemcpyHostToDevice));
-    CK(hipMemcpy(d_s_, host_s_.data(), (size_t)n_layer * sizeof(float),
                  hipMemcpyHostToDevice));
     fprintf(stderr,
             "qwenox: cvec %s: mode=%s dir=%s layers=%d..%d scale=%g, %d/%d directions "
@@ -363,13 +359,15 @@ struct Cvec {
     add((uint64_t)(single_ + 1));
     uint64_t hv = 1469598103934665603ULL;
     for (float f : host_) hv = (hv ^ bits(f)) * 1099511628211ULL;
+    // Project normalizes host_; its original norm survives in the effective
+    // per-layer scale. Hash both so differently scaled vectors cannot share KV.
+    for (float s : host_s_) hv = (hv ^ bits(s)) * 1099511628211ULL;
     add(hv);
     return h;
   }
 
   void release() {
     if (d_v_) { (void)hipFree(d_v_); d_v_ = nullptr; }
-    if (d_s_) { (void)hipFree(d_s_); d_s_ = nullptr; }
     if (d_probe_) { (void)hipFree(d_probe_); d_probe_ = nullptr; }
   }
 };
