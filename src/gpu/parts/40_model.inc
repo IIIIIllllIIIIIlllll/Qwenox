@@ -601,6 +601,9 @@ struct GpuModel {
   int* d_topidsb;
   float* d_topwb;
   int* d_slot_order = nullptr;  // verify MoE 槽序（k_moe_sort_slots，按专家排序）
+  int* d_pair_a = nullptr;      // QWENOX_MOE_GRP：同专家配对的槽 a / 槽 b / 组数
+  int* d_pair_b = nullptr;
+  int* d_ngrp = nullptr;
   int moe_dump_base_ = -1;      // QWENOX_MOE_TOPIDS_DUMP：记录用的当前 chunk base
   float *d_guvb, *d_hidb, *d_moeaccb, *d_eyb, *d_sgb;
   float* d_eb;              // [maxctx, 2560] PLE embeddings
@@ -1186,6 +1189,9 @@ struct GpuModel {
       DALLOC(&d_topidsb, BP * 16 * 4);
       DALLOC(&d_topwb, BP * 16 * 4);
       DALLOC(&d_slot_order, 256 * 4);  // k_moe_sort_slots 输出（P*k ≤ 256）
+      DALLOC(&d_pair_a, 256 * 4);      // k_moe_pair_slots 输出（同上限）
+      DALLOC(&d_pair_b, 256 * 4);
+      DALLOC(&d_ngrp, 4);
       // Fused down reuses the otherwise idle gate/up workspace for pair outputs.
       // B1：v2+w4b pairs 全 f16（guvb_f16_env，与 30_host_util 估算同步）后按
       // f16 尺寸分配，省一半；任一回退 env 在位则保持 f32 全尺寸。
@@ -6086,6 +6092,20 @@ struct GpuModel {
       }
       // v3 kernels: 2 rows per warp -> halved warp counts
       uint64_t pairs = (uint64_t)P * k * g_cfg.moe_mid;
+      // QWENOX_MOE_GRP: verify rows that routed to the same expert share one
+      // weight pass + one dequant (k_q4cp_gemv_gg2), bit-exact per slot. Unlike
+      // MOE_SORT (a pure warp permutation, 09-28: +0.3%) this removes groups
+      // from the grid, which is where halogen's 1600-vs-2000 blocks come from.
+      static const bool moe_grp =
+          getenv("QWENOX_MOE_GRP") != nullptr && !env_zero("QWENOX_MOE_GRP");
+      if (moe_grp && P >= 2 && P * k <= 256 && !slot_order) {
+        k_moe_pair_slots<<<1, 64, 0, g_str>>>(topidsb, P, k, 16, d_pair_a,
+                                              d_pair_b, d_ngrp);
+        k_q4cp_gemv_gg2<0><<<(unsigned)((pairs + 15) / 16), 512, 0, g_str>>>(
+            gu.data + 64, gu.data + 64 + gu.rows * gu.cols / 2, (const float*)gu.data,
+            d_xb, d_guvb, topidsb, (uint64_t)2 * g_cfg.moe_mid, gu.cols,
+            gu.scale_stride, (uint64_t)g_cfg.d, 16, k, d_pair_a, d_pair_b, d_ngrp);
+      } else
       k_q4cp_gemv_gg<0><<<(unsigned)((pairs + 15) / 16), 512, 0, g_str>>>(
           gu.data + 64, gu.data + 64 + gu.rows * gu.cols / 2, (const float*)gu.data,
           d_xb, d_guvb, topidsb, (uint64_t)2 * g_cfg.moe_mid, gu.cols,
@@ -6840,6 +6860,21 @@ struct GpuModel {
       if (!direct_down) CK(hipMemsetAsync(acc, 0, (size_t)P * d * 4, g_str));
       v2_rot(d_xb, d, d_eyb, d, gu.suh, nullptr, d, P);  // d_eyb: free until the shared expert
       const uint64_t pairs = (uint64_t)P * k * mid;
+      // QWENOX_MOE_GRP: verify rows that routed to the same expert share one
+      // weight pass and one dequant (k_q4cp_gemv_gg2), bit-exact per slot.
+      // Dequant (codebook lookup + shift) costs ~3x the dot products, so the
+      // duplicate experts of a P-row verify are pure waste: at P=5 our grid is
+      // 2000 blocks where halogen's equivalent is 1600, exactly the dup ratio.
+      // MOE_SORT only permutes warps (09-28: +0.3%); this removes groups.
+      static const bool moe_grp_v2 =
+          getenv("QWENOX_MOE_GRP") != nullptr && !env_zero("QWENOX_MOE_GRP");
+      if (moe_grp_v2 && P >= 2 && P * k <= 256) {
+        k_moe_pair_slots<<<1, 64, 0, g_str>>>(d_topidsb, P, k, 16, d_pair_a, d_pair_b,
+                                              d_ngrp);
+        k_q4cp_gemv_gg2<2><<<(unsigned)((pairs + 15) / 16), 512, 0, g_str>>>(
+            cg.codes, cg.scales, cg.cb, d_eyb, d_guvb, d_topidsb, (uint64_t)2 * mid,
+            gu.cols, gu.scale_stride, (uint64_t)d, 16, k, d_pair_a, d_pair_b, d_ngrp);
+      } else
       k_q4cp_gemv_gg<2><<<(unsigned)((pairs + 15) / 16), 512, 0, g_str>>>(
           cg.codes, cg.scales, cg.cb, d_eyb, d_guvb, d_topidsb, (uint64_t)2 * mid, gu.cols,
           gu.scale_stride, P * k, (uint64_t)d, 16, k, nullptr);
@@ -12910,6 +12945,7 @@ struct GpuModel {
   X(d_w4b) X(d_qkvb) X(d_zb) X(d_g48b) X(d_beta48b) X(d_qgb) X(d_qsb)        \
   X(d_gsb) X(d_kbb) X(d_vbb) X(d_ropecs) X(d_attnb) X(d_routerb)             \
   X(d_topidsb) X(d_topwb) X(d_slot_order) X(d_guvb) X(d_hidb) X(d_moeaccb)   \
+  X(d_pair_a) X(d_pair_b) X(d_ngrp)                                          \
   X(d_eyb) X(d_sgb) X(d_eb) X(d_xbf16) X(d_xbf16b) X(d_tokidx) X(d_pweight)  \
   X(d_pairids) X(d_convb) X(d_keysb) X(d_plevb) X(d_qnb) X(d_Ub) X(d_Unb)    \
   X(d_convoutb) X(d_tokarr) X(d_img_inj) X(d_iproj) X(d_iq) X(d_iqh) X(d_iselected)   \
@@ -12960,6 +12996,9 @@ struct GpuModel {
     QWENOX_WS_DUP(d_topidsb, B * 16 * 4);
     QWENOX_WS_DUP(d_topwb, B * 16 * 4);
     QWENOX_WS_DUP(d_slot_order, 256 * 4);
+    QWENOX_WS_DUP(d_pair_a, 256 * 4);
+    QWENOX_WS_DUP(d_pair_b, 256 * 4);
+    QWENOX_WS_DUP(d_ngrp, 4);
     QWENOX_WS_DUP(d_guvb, B * g_cfg.topk * (moe_deterministic ? 2560 : 1280) * 4);
     QWENOX_WS_DUP(d_hidb, B * g_cfg.topk * 640 * 4);
     QWENOX_WS_DUP(d_moeaccb, B * 2560 * 4);

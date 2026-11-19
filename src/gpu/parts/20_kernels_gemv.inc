@@ -1790,6 +1790,166 @@ __global__ void k_q4cp_gemv_gg(const uint8_t* __restrict__ codes,
   }
 }
 
+// --- pair slots that picked the same expert --------------------------------
+// Sorts the P*kpt (token, expert) slots by expert id (bitonic, padded to the
+// next power of two) and walks the sorted run pairing neighbours that share an
+// expert. pa[g]/pb[g] are the slot ids of group g (pb < 0 = lone slot); *ngrp
+// is the live group count. Every slot lands in exactly one group, so the gg2
+// kernel still writes all P*kpt outputs. Two slots of one group always come
+// from different tokens (a token's top-k experts are distinct).
+__global__ void k_moe_pair_slots(const int* __restrict__ ids, int P, int k,
+                                 int id_stride, int* __restrict__ pa,
+                                 int* __restrict__ pb, int* __restrict__ ngrp) {
+  __shared__ unsigned keys[256];
+  const int n = P * k, t = threadIdx.x;
+  int m = 1;
+  while (m < n) m <<= 1;
+  for (int i = t; i < m; i += blockDim.x) {
+    unsigned key = 0xFFFFFFFFu;
+    if (i < n)
+      key = ((unsigned)ids[(i / k) * id_stride + (i % k)] << 8) | (unsigned)i;
+    keys[i] = key;
+  }
+  __syncthreads();
+  for (int size = 2; size <= m; size <<= 1)
+    for (int stride = size >> 1; stride > 0; stride >>= 1) {
+      for (int i = t; i < m; i += blockDim.x) {
+        int j = i ^ stride;
+        if (j > i) {
+          bool up = (i & size) == 0;
+          unsigned a = keys[i], b = keys[j];
+          if ((a > b) == up) {
+            keys[i] = b;
+            keys[j] = a;
+          }
+        }
+      }
+      __syncthreads();
+    }
+  if (t == 0) {
+    int g = 0;
+    for (int i = 0; i < n;) {
+      unsigned ka = keys[i];
+      if (i + 1 < n && (keys[i + 1] >> 8) == (ka >> 8)) {
+        pa[g] = (int)(ka & 0xFFu);
+        pb[g] = (int)(keys[i + 1] & 0xFFu);
+        i += 2;
+      } else {
+        pa[g] = (int)(ka & 0xFFu);
+        pb[g] = -1;
+        i += 1;
+      }
+      g++;
+    }
+    *ngrp = g;
+  }
+}
+
+// --- paired expert GEMV: one weight pass serves one or two slots -----------
+// Bit-exact with k_q4cp_gemv_gg per slot (identical loop nest, fma order and
+// reduction); the pair only shares the weight load, the scale and the codebook
+// lookups. x is read per slot inside the i loop to keep the register footprint
+// close to the single-slot kernel. The grid stays sized for the worst case
+// (P*kpt groups) so it can live in a captured decode graph; warps above *ngrp
+// exit immediately, which is where the saving comes from.
+template <int GSH = 0>
+__global__ void k_q4cp_gemv_gg2(const uint8_t* __restrict__ codes,
+                                const uint8_t* __restrict__ scales,
+                                const float* __restrict__ cb,
+                                const float* __restrict__ x, float* __restrict__ y,
+                                const int* __restrict__ ids, uint64_t rows_per,
+                                uint64_t cols, uint64_t scale_stride,
+                                uint64_t x_stride, int id_stride, int kpt,
+                                const int* __restrict__ pa,
+                                const int* __restrict__ pb,
+                                const int* __restrict__ ngrp) {
+  __shared__ float cbf[16];
+  if (threadIdx.x < 16) cbf[threadIdx.x] = cb[threadIdx.x];
+  __syncthreads();
+  uint64_t pairs_per_slot = (rows_per + 1) / 2;
+  uint64_t gw = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
+  int grp = (int)(gw / pairs_per_slot);
+  if (grp >= *ngrp) return;
+  const int sa = pa[grp], sb = pb[grp];
+  const bool has_b = sb >= 0;
+  const int toka = sa / kpt, ea = sa - toka * kpt;
+  const uint64_t rp = gw % pairs_per_slot;
+  const uint64_t row0 = (uint64_t)ids[toka * id_stride + ea] * rows_per + rp * 2;
+  const int lane = threadIdx.x % warpSize;
+  const uint8_t* rc0 = codes + row0 * (cols / 2);
+  const uint8_t* rs0 = scales + row0 * scale_stride;
+  const bool has1 = rp * 2 + 1 < rows_per;
+  const uint8_t* rc1 = codes + (row0 + 1) * (cols / 2);
+  const uint8_t* rs1 = scales + (row0 + 1) * scale_stride;
+  const float* xta = x + (size_t)toka * x_stride;
+  const float* xtb = has_b ? x + (size_t)(sb / kpt) * x_stride : xta;
+  float acc0a = 0.f, acc1a = 0.f, acc0b = 0.f, acc1b = 0.f;
+  for (uint64_t g = lane; g < cols / 32; g += warpSize) {
+    uint4 pk0 = *(const uint4*)(rc0 + g * 16);
+    float s0 = __half2float(*(const __half*)(rs0 + (g >> GSH) * 2));
+    uint4 pk1 = make_uint4(0, 0, 0, 0);
+    float s1 = 0.f;
+    if (has1) {
+      pk1 = *(const uint4*)(rc1 + g * 16);
+      s1 = __half2float(*(const __half*)(rs1 + (g >> GSH) * 2));
+    }
+    const float* xga = xta + g * 32;
+    const float* xgb = xtb + g * 32;
+    uint32_t w0[4] = {pk0.x, pk0.y, pk0.z, pk0.w};
+    uint32_t w1[4] = {pk1.x, pk1.y, pk1.z, pk1.w};
+    float a0a = 0.f, a1a = 0.f, a0b = 0.f, a1b = 0.f;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      float xa[8], xb[8];
+      {
+        float4 t0 = *(const float4*)(xga + i * 8);
+        float4 t1 = *(const float4*)(xga + i * 8 + 4);
+        xa[0] = t0.x; xa[1] = t0.y; xa[2] = t0.z; xa[3] = t0.w;
+        xa[4] = t1.x; xa[5] = t1.y; xa[6] = t1.z; xa[7] = t1.w;
+      }
+      if (has_b) {
+        float4 t0 = *(const float4*)(xgb + i * 8);
+        float4 t1 = *(const float4*)(xgb + i * 8 + 4);
+        xb[0] = t0.x; xb[1] = t0.y; xb[2] = t0.z; xb[3] = t0.w;
+        xb[4] = t1.x; xb[5] = t1.y; xb[6] = t1.z; xb[7] = t1.w;
+      }
+      uint32_t v0 = w0[i], v1 = w1[i];
+#pragma unroll
+      for (int j = 0; j < 8; j++) {
+        const float c0 = cbf[v0 & 0xf], c1 = cbf[v1 & 0xf];
+        a0a += c0 * xa[j];
+        a1a += c1 * xa[j];
+        if (has_b) {
+          a0b += c0 * xb[j];
+          a1b += c1 * xb[j];
+        }
+        v0 >>= 4;
+        v1 >>= 4;
+      }
+    }
+    acc0a += a0a * s0;
+    acc1a += a1a * s1;
+    acc0b += a0b * s0;
+    acc1b += a1b * s1;
+  }
+  for (int off = warpSize / 2; off > 0; off >>= 1) {
+    acc0a += __shfl_down_sync(~0ull, acc0a, off);
+    acc1a += __shfl_down_sync(~0ull, acc1a, off);
+    acc0b += __shfl_down_sync(~0ull, acc0b, off);
+    acc1b += __shfl_down_sync(~0ull, acc1b, off);
+  }
+  if (lane == 0) {
+    uint64_t oa = (uint64_t)sa * rows_per + rp * 2;
+    y[oa] = acc0a;
+    if (has1) y[oa + 1] = acc1a;
+    if (has_b) {
+      uint64_t ob = (uint64_t)sb * rows_per + rp * 2;
+      y[ob] = acc0b;
+      if (has1) y[ob + 1] = acc1b;
+    }
+  }
+}
+
 // --- grouped silu(gate)*up: guv (nslots, 2*mid) -> hid (nslots, mid) --------
 __global__ void k_silu_mul_g(const float* __restrict__ guv, float* __restrict__ hid,
                              int mid, int nslots) {
