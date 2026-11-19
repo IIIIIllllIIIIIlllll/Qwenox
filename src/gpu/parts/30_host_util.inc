@@ -1286,6 +1286,16 @@ static bool dense_wmma_hc_on() {
   }();
   return v;
 }
+// QWENOX_DENSE_WMMA_P1=1: use the WMMA dense kernels for the P = 1 decode step
+// too (pre-11-20 behaviour). Default off -- see the comment at the dtype 16
+// branch of gemv(). Only affects P = 1; verify rows are unchanged either way.
+static bool dense_wmma_p1_on() {
+  static const bool v = [] {
+    const char* e = getenv("QWENOX_DENSE_WMMA_P1");
+    return e && !(e[0] == '0' && e[1] == 0);
+  }();
+  return v;
+}
 // Pair launch: two ht weights with the same K reading the same x (shared
 // expert gate + up) in one k_ht_wmma grid; split-K from the combined shape.
 // Row-invariant like ht_wmma (shape-only config), but NOT bit-identical to two
@@ -1921,12 +1931,23 @@ static void gemv(const WView& w, const float* x, float* y, uint64_t row_off = 0,
     else
       q8g32_gemv_small<32, 256>(q, s, x, y, rows, w.cols, g_str);
   } else if (w.dtype == 16) {
-    if (dense_wmma_on())
+    // This entry is the P = 1 path (AR decode forward / MTP draft step). A
+    // single row is bandwidth-bound, so the WMMA tile idles 15/16 of its lanes
+    // while still paying for x^ staging in LDS and the lower occupancy:
+    // measured (Linux, v2, serial drafter, 600-tok code) 33.9 tok/s on
+    // k_ht_wmma vs 36.2 on k_ht_gemv, +6.8% (HC alone +3.5%). The P >= 2
+    // verify rows keep WMMA -- disabling it there costs 19% (77.6 -> 63.0) --
+    // which is why QWENOX_DENSE_WMMA=0 is the wrong lever: it hits both.
+    // halogen's dense decode kernel likewise contains no WMMA at all.
+    // Same split dtype 8 and the GGUF dense path already make below.
+    // QWENOX_DENSE_WMMA_P1=1 restores WMMA here.
+    if (dense_wmma_on() && dense_wmma_p1_on())
       ht_wmma(w, x, false, w.cols, y, 0, 1, row_off, rows);
     else
       ht_gemv(w, x, false, 0, y, 0, 1, row_off, rows);
   } else if (w.dtype == 24) {
-    if (!(dense_wmma_hc_on() && q6g64_wmma(w, x, false, w.cols, y, 0, 1, row_off, rows)))
+    if (!(dense_wmma_hc_on() && dense_wmma_p1_on() &&
+          q6g64_wmma(w, x, false, w.cols, y, 0, 1, row_off, rows)))
       q6g64_gemv(w, x, false, 0, y, 0, 1, row_off, rows);
   } else if (ggd_dtype(w.dtype)) {
     // P = 1 decode/draft stays on the bandwidth-tuned GEMV (k_ggd_wmma at
