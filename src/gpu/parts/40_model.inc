@@ -530,6 +530,8 @@ struct GpuModel {
   float *d_ple_nk, *d_ple_nq, *d_ple_nc;  // 10240 each
   float* d_logits;
   float* d_logits_b = nullptr;  // [65][vocab] speculative verify lm_head scratch
+  // 控制向量（refusal projection，33_cvec.inc）：默认关闭，零开销。
+  Cvec cvec_;
   int* d_argmax;
   float* d_hnorm_mixer;  // 10240
 
@@ -1710,11 +1712,34 @@ struct GpuModel {
     }
     df2_init();  // no-op unless QWENOX_DFLASH2 is set
     dense_shadow_init();  // no-op unless QWENOX_DENSE_SHADOW=1
+    // 控制向量（33_cvec.inc）：启动期固定；必须在 build_graphs 之前加载。
+    // 配置/文件错误直接退出（不静默降级），与其它启动期致命错误一致。
+    try {
+      cvec_.load();
+    } catch (const std::exception& e) {
+      fprintf(stderr, "qwenox: cvec: %s\n", e.what());
+      exit(1);
+    }
+    if (cvec_.on()) {
+      // 融合写（scatter+norm）保持开启：投影折进 kernel，在写与 norm 之间施加。
+      // 唯一例外是 moe reduce 里的写回融合（B2-1，默认关），它没有可插入的位置。
+      fprintf(stderr, "cvec: projection folded into the fused HC write+norm kernel%s\n",
+              gr_scatter_norm ? "" : " (fused write is off)");
+      if (cvec_.probe_on() && gr_scatter_norm) {
+        // 诊断用：融合 kernel 里没有 host 可读的中间值，probe 走独立投影 kernel。
+        fprintf(stderr, "cvec: probe disables the fused write (diagnostic)\n");
+        gr_scatter_norm = false;
+      }
+    }
     fprintf(stderr, "qwenox: state allocated (maxctx=%d)\n", maxctx);
   }
 
   ~GpuModel() {
     ple_drop_all();  // no joinable PLE worker may outlive the model
+    if (cvec_.on()) {
+      CK(hipDeviceSynchronize());  // no cvec kernel may still read the vectors
+      cvec_.release();
+    }
     if (dense_shadow_host_) {
       CK(hipDeviceSynchronize());  // no GEMM may still read the shadow
       CK(hipHostFree(dense_shadow_host_));
@@ -3089,6 +3114,8 @@ struct GpuModel {
     h_rms("gpu", l, "mlp-x", d_x, 2560);
     h_rms("gpu", l, "mlp-y", d_y, 2560);
     gr_write(prefix, d_y);
+    // 控制向量 hook：decode 残差 d_R（f32，单行；进 decode graph 捕获）。
+    cvec_.apply(l, d_R, 1, false, g_str);
     tock(3, t3);
   }
   void enq_final() {
@@ -3961,6 +3988,10 @@ struct GpuModel {
       k_gr_write_b<<<(P * 2560 + 255) / 256, 256, 0, g_str>>>(
           d_w4b, d_Rb, d_yb, g_cfg.d, g_cfg.branches, P);
     df2_hc_capture(prefix, P);
+    // 控制向量 hook：mlp 侧写入之后（DF2 tap 已抓取，草稿头保持未投影语义；
+    // 目标模型的验证仍由投影后的残差完成）。
+    if (const int cl = Cvec::mlp_prefix_layer(prefix); cl >= 0)
+      cvec_.apply(cl, d_Rb, P, gr_bf16, g_str);
   }
 
   void gr_write_read_b(const std::string& write_prefix,
@@ -3978,6 +4009,12 @@ struct GpuModel {
            gr_bf16 ? d_Rhatbf16 : nullptr);
     }
     float* hw = ensure_hcnorm(read_prefix);
+    // 控制向量（33_cvec.inc）：mlp 站的融合写在这里，投影折进 kernel（写与 norm
+    // 之间），所以融合写可以保持开启。attn 站不投影。
+    const int cvec_l = Cvec::mlp_prefix_layer(write_prefix);
+    const bool cvec_p = cvec_.in_range(cvec_l);
+    const float* cdir = cvec_p ? cvec_.dir(cvec_l) : nullptr;
+    const float csc = cvec_p ? cvec_.s(cvec_l) : 0.f;
     const uint16_t* wn = inj_fuse_on() ? inj_wbf16(read_prefix) : nullptr;
     if (!wn && write_done)  // R is already post-write; a writing scatter would double-apply
       throw std::runtime_error("gr_write_read_b: fused HC write but read site can't fuse");
@@ -4001,7 +4038,10 @@ struct GpuModel {
       static const bool scat_t1 = !env_zero("QWENOX_SCAT_T1");
       // v2 (coalesced + pipelined): kernel −5% only (this op is at ~190 GB/s,
       // bandwidth-bound) and not bit-identical -> opt-in QWENOX_GR_SCAT_V2=1.
-      static const bool scat_v2 = getenv("QWENOX_GR_SCAT_V2") && !env_zero("QWENOX_GR_SCAT_V2");
+      // cvec 时走基础 kernel（v2 没有投影折入），开启 v2 也不影响正确性以外的功能。
+      static const bool scat_v2_flag =
+          getenv("QWENOX_GR_SCAT_V2") && !env_zero("QWENOX_GR_SCAT_V2");
+      const bool scat_v2 = scat_v2_flag && !cvec_p;
       static const bool scat_t8 = getenv("QWENOX_GR_SCAT_T8") != nullptr;
       if (scat_v2 && scat_t8 && g_cfg.d == 2560 && P > 8) {
         if (write_done)
@@ -4024,34 +4064,34 @@ struct GpuModel {
       } else if (scat_t1 && P <= 8 && !write_done)
         k_gr_scatter_norm_inj_bf16<1><<<4 * P, 256, 0, g_str>>>(
             pfull, pin, (uint16_t*)d_Rb, y, hw, rh, wn, d_injp[nxt],
-            g_cfg.d, P, g_cfg.norm_eps, sc);
+            g_cfg.d, P, g_cfg.norm_eps, sc, cdir, csc);
       else if (write_done)
         k_gr_scatter_norm_inj_bf16<4, false><<<4 * ((P + 3) / 4), 256, 0, g_str>>>(
             nullptr, nullptr, (uint16_t*)d_Rb, nullptr, hw, rh, wn,
-            d_injp[nxt], g_cfg.d, P, g_cfg.norm_eps, sc);
+            d_injp[nxt], g_cfg.d, P, g_cfg.norm_eps, sc, cdir, csc);
       else
         k_gr_scatter_norm_inj_bf16<4><<<4 * ((P + 3) / 4), 256, 0, g_str>>>(
             pfull, pin, (uint16_t*)d_Rb, y, hw, rh, wn, d_injp[nxt],
-            g_cfg.d, P, g_cfg.norm_eps, sc);
+            g_cfg.d, P, g_cfg.norm_eps, sc, cdir, csc);
       injp_cur = nxt;
       injp_for = read_prefix;
     } else if (gr_bf16)
       if (gr_scat4 && g_cfg.d <= 2560)
         k_gr_scatter_norm_b_hc_bf16_f4<<<P, 256, 0, g_str>>>(
             d_w4b, (uint16_t*)d_Rb, d_yb, hw, d_Rhatbf16, g_cfg.d,
-            g_cfg.branches, P, g_cfg.norm_eps);
+            g_cfg.branches, P, g_cfg.norm_eps, cdir, csc);
       else
         k_gr_scatter_norm_b_hc_bf16<<<4 * P, 256, 0, g_str>>>(
             d_w4b, (uint16_t*)d_Rb, d_yb, hw, d_Rhatbf16, g_cfg.d,
-            g_cfg.branches, P, g_cfg.norm_eps);
+            g_cfg.branches, P, g_cfg.norm_eps, cdir, csc);
     else if (prefill_fused)
       k_gr_scatter_norm_b<true><<<4 * P, 1024, 0, g_str>>>(
           d_w4b, d_Rb, d_yb, hw, d_Rhatb, g_cfg.d, g_cfg.branches, P,
-          g_cfg.norm_eps, d_Rhatbf16);
+          g_cfg.norm_eps, d_Rhatbf16, cdir, csc);
     else
       k_gr_scatter_norm_b<<<4 * P, 1024, 0, g_str>>>(
           d_w4b, d_Rb, d_yb, hw, d_Rhatb, g_cfg.d, g_cfg.branches, P,
-          g_cfg.norm_eps);
+          g_cfg.norm_eps, nullptr, cdir, csc);
     if (!wn) injp_cur = -1;
     if (xf16_src == d_Rhatb) xf16_src = nullptr;
     gr_mix_b(read_prefix, P, hw, wn && hc_norhat(P));
@@ -7447,7 +7487,8 @@ struct GpuModel {
     // recomputed bit-identically by the normal write path.
     static const bool hcw_env =
         getenv("QWENOX_HC_FUSE_WRITE") != nullptr && !env_zero("QWENOX_HC_FUSE_WRITE");
-    const bool can_hcw = hcw_env && !dbg && gr_bf16 &&
+    // cvec：融合写回会绕过投影 hook，必须走普通 gr_write_b（见 33_cvec.inc）。
+    const bool can_hcw = hcw_env && !cvec_.on() && !dbg && gr_bf16 &&
                          (flush_mlp || (gr_scatter_norm && inj_fuse_on()));
     bool hcw = false;
     stm("moe", [&] { moe_b(l, P); });
@@ -8274,6 +8315,10 @@ struct GpuModel {
     int id = -1;
     if (final && prog_total > 0) prog_wait(P);
     if (final) CK(hipMemcpy(&id, d_argmax, 4, hipMemcpyDeviceToHost));
+    if (final && cvec_.probe_on()) {  // 诊断：投影 hook 的 host 端读回（非捕获路径）
+      CK(hipStreamSynchronize(g_str));
+      cvec_.probe_report();
+    }
     phase("argmax_d2h", TP);
     KP("end");
     if (g_kprof_on) g_kprof_ring.flush(base, P, quiet);
@@ -12296,6 +12341,8 @@ struct GpuModel {
   void build_graphs() {
     viz::ensure(bound_);  // QWENOX_VIZ: the ring pointer is baked into the graphs
     if (dbg || perf || getenv("QWENOX_NOGRAPH")) return;
+    // cvec probe 要在 host 端读投影前/后残差：捕获图里不跑 host 代码，直接禁用。
+    if (cvec_.probe_on()) return;
     // pre-populate lazy caches (hipMalloc/hipMemcpy are illegal during capture)
     for (int l = 0; l < g_cfg.layers; l++) {
       char p[128];
@@ -12384,6 +12431,7 @@ struct GpuModel {
     if (getenv("QWENOX_VCT_CHECK") || getenv("QWENOX_ATTN_HASH") ||
         getenv("QWENOX_VCT_TAILZERO"))
       return false;
+    if (cvec_.probe_on()) return false;  // probe 读回只走 eager 路径
     // D1b mid-chunk GPU lending is not part of the graphs (production has
     // moe_lt on, which already makes the yield a no-op).
     if (ws_ok_ && borrow_query_fn && !moe_lt && P > conc_rmax_) return false;
@@ -13311,6 +13359,7 @@ struct GpuModel {
       int id;
       auto sync0 = std::chrono::steady_clock::now();
       CK(hipMemcpy(&id, d_argmax, 4, hipMemcpyDeviceToHost));
+      if (cvec_.probe_on()) cvec_.probe_report();
       double sync_ms =
           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - sync0)
               .count();
@@ -13352,6 +13401,7 @@ struct GpuModel {
             .count();
     auto sync0 = std::chrono::steady_clock::now();
     CK(hipMemcpy(&id, d_argmax, 4, hipMemcpyDeviceToHost));
+    if (cvec_.probe_on()) cvec_.probe_report();
     double sync_ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - sync0)
             .count();

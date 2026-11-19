@@ -1659,6 +1659,9 @@ static uint64_t fingerprint(const GpuModel& m) {
                      bits(g_cfg.rope.attention_factor)})
     add(v);
   if (m.qsa_kv_q8) add(0x4b56513847333201ULL);  // Q8 group32 schema v1
+  // 控制向量（33_cvec.inc）：只在开启时混入，保留关闭状态的既有指纹；参数或向量
+  // 文件变化后旧快照不会被恢复（残差受投影影响，KV/GDN 状态不可混用）。
+  if (uint64_t cf = m.cvec_.fingerprint()) add(cf);
   // GGUF native dense weights (not the q8g32 requant): different numerics,
   // so snapshots of the two layouts never mix. Other setups keep their hash.
   if (g_gguf_dense && gguf_map::g_native_dense) add(0x4e41544956453031ULL);

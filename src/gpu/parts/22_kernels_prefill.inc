@@ -518,6 +518,36 @@ __global__ void k_gr_write_b_hc_bf16(const float* __restrict__ w4,
   }
 }
 
+// 控制向量投影（33_cvec.inc）在融合写+norm kernel 里的块内 dot：values[j] 是本线程
+// 持有的列 c = lane + j*stride，dir 是该层的单位方向。返回全块可见的 dot；sm 需
+// >= 32 个 float，返回后可复用（内部首尾各一道屏障）。
+__device__ inline float cvec_block_dot(const float* __restrict__ dir,
+                                       const float* values, int J, int stride, int d,
+                                       int lane, float* sm) {
+  __syncthreads();  // 上一轮读 sm 的线程已读完
+  float s = 0.f;
+#pragma unroll
+  for (int j = 0; j < J; j++) {
+    const int c = lane + j * stride;
+    if (c < d) s += values[j] * dir[c];
+  }
+#pragma unroll
+  for (int o = 16; o; o >>= 1) s += __shfl_xor(s, o, 32);
+  const int nw = (int)(blockDim.x >> 5);
+  if ((lane & 31) == 0) sm[lane >> 5] = s;
+  __syncthreads();
+  if (lane < 32) {
+    float t = lane < nw ? sm[lane] : 0.f;
+#pragma unroll
+    for (int o = 16; o; o >>= 1) t += __shfl_xor(t, o, 32);
+    if (lane == 0) sm[0] = t;
+  }
+  __syncthreads();
+  const float r = sm[0];
+  __syncthreads();
+  return r;
+}
+
 // [gr-injfuse-begin]  (sed-extracted by tools/injfuse_proto.cu — needs f2bf/bf2f)
 // BF16 residual state and BF16 normalized output. The rounded residual is
 // accumulated into the norm (scatter/store-before-norm order), halving HC
@@ -525,7 +555,8 @@ __global__ void k_gr_write_b_hc_bf16(const float* __restrict__ w4,
 __global__ void k_gr_scatter_norm_b_hc_bf16(
     const float* __restrict__ w4, uint16_t* __restrict__ R,
     const float* __restrict__ y, const float* __restrict__ w,
-    uint16_t* __restrict__ Rhat, int d, int branches, int P, float eps) {
+    uint16_t* __restrict__ Rhat, int d, int branches, int P, float eps,
+    const float* __restrict__ cdir = nullptr, float cs = 0.f) {
   int group = blockIdx.x;
   if (group >= P * branches) return;
   int t = group / branches;
@@ -554,6 +585,20 @@ __global__ void k_gr_scatter_norm_b_hc_bf16(
       ss += rounded * rounded;
     }
     values[j] = rounded;
+  }
+  if (cdir) {  // 控制向量：写与 norm 之间投影（重算 ss）
+    const float cd = cvec_block_dot(cdir, values, 10, 256, d, lane, sm) * cs;
+    ss = 0.f;
+#pragma unroll
+    for (int j = 0; j < 10; j++) {
+      const int c = lane + j * 256;
+      if (c < d) {
+        const uint16_t r16 = f2bf(values[j] - cd * cdir[c]);
+        Rg[c] = r16;
+        values[j] = bf2f(r16);
+        ss += values[j] * values[j];
+      }
+    }
   }
   sm[lane] = ss;
   __syncthreads();
@@ -606,7 +651,8 @@ __global__ void __launch_bounds__(256) k_gr_scatter_norm_inj_bf16(
     uint16_t* __restrict__ R, const float* __restrict__ y,
     const float* __restrict__ w, uint16_t* __restrict__ Rhat,
     const uint16_t* __restrict__ winj, float* __restrict__ pout, int d, int P,
-    float eps, float* __restrict__ sc = nullptr) {
+    float eps, float* __restrict__ sc = nullptr,
+    const float* __restrict__ cdir = nullptr, float cs = 0.f) {
   const int b = blockIdx.x & 3;
   const int t0 = (blockIdx.x >> 2) * T;
   const int lane = threadIdx.x;
@@ -656,6 +702,20 @@ __global__ void __launch_bounds__(256) k_gr_scatter_norm_inj_bf16(
         ss += rounded * rounded;
       }
       values[j] = rounded;
+    }
+    if (cdir) {  // 控制向量：写与 norm 之间投影（重算 ss；Write=false 也适用）
+      const float cd = cvec_block_dot(cdir, values, 10, 256, d, lane, sm) * cs;
+      ss = 0.f;
+#pragma unroll
+      for (int j = 0; j < 10; j++) {
+        const int c = lane + j * 256;
+        if (c < d) {
+          const uint16_t r16 = f2bf(values[j] - cd * cdir[c]);
+          Rg[c] = r16;
+          values[j] = bf2f(r16);
+          ss += values[j] * values[j];
+        }
+      }
     }
     sm[lane] = ss;
     __syncthreads();
@@ -829,7 +889,8 @@ __global__ void __launch_bounds__(256) k_gr_scatter_norm_inj_bf16_v2(
 __global__ void k_gr_scatter_norm_b_hc_bf16_f4(
     const float* __restrict__ w4, uint16_t* __restrict__ R,
     const float* __restrict__ y, const float* __restrict__ w,
-    uint16_t* __restrict__ Rhat, int d, int branches, int P, float eps) {
+    uint16_t* __restrict__ Rhat, int d, int branches, int P, float eps,
+    const float* __restrict__ cdir = nullptr, float cs = 0.f) {
   int t = blockIdx.x;
   if (t >= P) return;
   int lane = threadIdx.x;
@@ -860,6 +921,20 @@ __global__ void k_gr_scatter_norm_b_hc_bf16_f4(
       }
       values[j] = rounded;
     }
+    if (cdir) {  // 控制向量：写与 norm 之间投影（重算 ss）
+      const float cd = cvec_block_dot(cdir, values, 10, 256, d, lane, sm) * cs;
+      ss = 0.f;
+#pragma unroll
+      for (int j = 0; j < 10; j++) {
+        const int c = lane + j * 256;
+        if (c < d) {
+          const uint16_t r16 = f2bf(values[j] - cd * cdir[c]);
+          Rg[c] = r16;
+          values[j] = bf2f(r16);
+          ss += values[j] * values[j];
+        }
+      }
+    }
     sm[lane] = ss;
     __syncthreads();
     for (int off = 128; off > 0; off >>= 1) {
@@ -885,7 +960,9 @@ __global__ void k_gr_scatter_norm_b(const float* __restrict__ w4,
                                     const float* __restrict__ w,
                                     float* __restrict__ Rhat, int d,
                                     int branches, int P, float eps,
-                                    uint16_t* __restrict__ bf16 = nullptr) {
+                                    uint16_t* __restrict__ bf16 = nullptr,
+                                    const float* __restrict__ cdir = nullptr,
+                                    float cs = 0.f) {
   int group = blockIdx.x;
   if (group >= P * branches) return;
   int t = group / branches;
@@ -911,6 +988,21 @@ __global__ void k_gr_scatter_norm_b(const float* __restrict__ w4,
       Rg[c] = value;
       values[j] = value;
       ss += value * value;
+    }
+  }
+  if (cdir) {  // 控制向量：写与 norm 之间投影（fp32 残差，重算 ss）
+    const int stride = (int)blockDim.x;
+    const float cd = cvec_block_dot(cdir, values, 3, stride, d, lane, sm) * cs;
+    ss = 0.f;
+#pragma unroll
+    for (int j = 0; j < 3; j++) {
+      const int c = lane + j * stride;
+      if (c < d) {
+        const float v = values[j] - cd * cdir[c];
+        Rg[c] = v;
+        values[j] = v;
+        ss += v * v;
+      }
     }
   }
   sm[lane] = ss;
