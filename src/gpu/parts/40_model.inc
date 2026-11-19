@@ -3993,11 +3993,12 @@ struct GpuModel {
     else
       k_gr_write_b<<<(P * 2560 + 255) / 256, 256, 0, g_str>>>(
           d_w4b, d_Rb, d_yb, g_cfg.d, g_cfg.branches, P);
-    df2_hc_capture(prefix, P);
-    // 控制向量 hook：mlp 侧写入之后（DF2 tap 已抓取，草稿头保持未投影语义；
-    // 目标模型的验证仍由投影后的残差完成）。
+    // 控制向量 hook：mlp 侧写入之后。DF2 tap 在投影之后抓取，与融合写路径
+    // （gr_write_read_b 的 kernel 内投影、末尾 capture）保持一致：草稿头的
+    // 上下文与目标模型实际续算的残差同源。
     if (const int cl = Cvec::mlp_prefix_layer(prefix); cl >= 0)
       cvec_.apply(cl, d_Rb, P, gr_bf16, g_str);
+    df2_hc_capture(prefix, P);
   }
 
   void gr_write_read_b(const std::string& write_prefix,

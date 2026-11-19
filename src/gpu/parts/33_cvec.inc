@@ -50,20 +50,22 @@ __global__ void k_cvec_apply(void* __restrict__ resid, const float* __restrict__
   uint16_t* hbase = (uint16_t*)resid + base;
   float* fbase = (float*)resid + base;
   auto load1 = [&](int c) { return BF16 ? bf2f(hbase[c]) : fbase[c]; };
-  float dot = 0.f;
-  for (int c = tid; c < n; c += blockDim.x) dot += load1(c) * v[c];
-#pragma unroll
-  for (int o = 16; o; o >>= 1) dot += __shfl_xor(dot, o, 32);
   __shared__ float red[32];
-  if ((tid & 31) == 0) red[tid >> 5] = dot;
-  __syncthreads();
-  if (tid < 32) {
-    float x = tid < (blockDim.x >> 5) ? red[tid] : 0.f;
+  if constexpr (PROJECT) {  // add 不需要 dot：省掉一遍残差读与归约
+    float dot = 0.f;
+    for (int c = tid; c < n; c += blockDim.x) dot += load1(c) * v[c];
 #pragma unroll
-    for (int o = 16; o; o >>= 1) x += __shfl_xor(x, o, 32);
-    if (tid == 0) red[0] = x;
+    for (int o = 16; o; o >>= 1) dot += __shfl_xor(dot, o, 32);
+    if ((tid & 31) == 0) red[tid >> 5] = dot;
+    __syncthreads();
+    if (tid < 32) {
+      float x = tid < (blockDim.x >> 5) ? red[tid] : 0.f;
+#pragma unroll
+      for (int o = 16; o; o >>= 1) x += __shfl_xor(x, o, 32);
+      if (tid == 0) red[0] = x;
+    }
+    __syncthreads();
   }
-  __syncthreads();
   const float b = PROJECT ? -s * red[0] : s;
   for (int c = tid; c < n; c += blockDim.x) {
     const float y = load1(c) + b * v[c];
