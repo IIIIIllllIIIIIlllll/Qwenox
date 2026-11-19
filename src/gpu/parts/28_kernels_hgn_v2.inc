@@ -1492,3 +1492,164 @@ __global__ __launch_bounds__(256) void k_hcf_upc(const uint8_t* __restrict__ wq,
     xo[i] = a / 4;
   }
 }
+
+// ---- MoE pre/post fusion for the P=1 decode step (QWENOX_MOE_PP) -----------
+// k_moe_pre: grid 64 x 512 (16 waves). Wave w of block b: router row b*8+w/2
+// ... same row->wave map as k_bf16_gemv<<<64, 512>>> (one wave per row, 16
+// rows per block); blocks 0..4 additionally rotate 4 of the 20 x blocks
+// (k_v2_rot<float,false>, pre=suh). The last-arriving block runs the
+// k_router_topk_w32<10> body on wave 0.
+__global__ __launch_bounds__(512) void k_moe_pre(const uint16_t* __restrict__ rw,
+                                                 const float* __restrict__ x, int cols,
+                                                 float* __restrict__ logits,
+                                                 const float* __restrict__ suh,
+                                                 float* __restrict__ xr, int n,
+                                                 int* __restrict__ ids, float* __restrict__ ws,
+                                                 int* __restrict__ cnt, VizTap vt) {
+  const int lane = threadIdx.x & 31, wv = threadIdx.x >> 5;
+  {
+    const uint64_t row = (uint64_t)blockIdx.x * 16 + wv;
+    if (row < 512) {  // grid 32 x 16 waves = the 512 router rows
+    const uint16_t* r = rw + row * cols;
+    float acc = 0.f;
+    for (uint64_t c = lane * 8; c < (uint64_t)cols; c += 32 * 8) {
+      uint4 pk = *(const uint4*)(r + c);
+      float4 xa = *(const float4*)(x + c);
+      float4 xb = *(const float4*)(x + c + 4);
+      const uint16_t* h = (const uint16_t*)&pk;
+      float xv[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+#pragma unroll
+      for (int j = 0; j < 8; j++) {
+        uint32_t u = (uint32_t)h[j] << 16;
+        float wf;
+        memcpy(&wf, &u, 4);
+        acc += wf * xv[j];
+      }
+    }
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down(acc, off, 32);
+    if (lane == 0) logits[row] = acc;
+    }
+  }
+  {
+    const int nb = n >> 7;
+    const int gw = blockIdx.x * 16 + wv;
+    if (gw < nb) {
+      const int b = gw;
+      float v[4];
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        const int i = j * 32 + lane;
+        v[j] = x[b * 128 + i] * suh[b * 128 + i];
+      }
+      hv2::fwht128(v[0], v[1], v[2], v[3], lane);
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        const int i = b * 128 + j * 32 + lane;
+        xr[i] = v[j] * hv2::kRs128 * 1.f;
+      }
+    }
+  }
+  __shared__ int s_last;
+  __threadfence();
+  __syncthreads();
+  if (threadIdx.x == 0) s_last = atomicAdd(cnt, 1) == (int)gridDim.x - 1;
+  __syncthreads();
+  if (!s_last) return;
+  __threadfence();
+  if (wv != 0) return;
+  if (lane == 0) atomicExch(cnt, 0);
+  constexpr int k = 10;
+  float v[16], p[16];
+#pragma unroll
+  for (int j = 0; j < 16; j++) v[j] = __builtin_nontemporal_load(logits + lane + 32 * j);
+  float mx = v[0];
+#pragma unroll
+  for (int j = 1; j < 16; j++) mx = fmaxf(mx, v[j]);
+#pragma unroll
+  for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor(mx, o, 32));
+#pragma unroll
+  for (int j = 0; j < 16; j++) p[j] = expf(v[j] - mx);
+  float a[16];
+#pragma unroll
+  for (int j = 0; j < 16; j++) a[j] = p[j];
+#pragma unroll
+  for (int j = 0; j < 8; j++) a[j] += a[j + 8];
+#pragma unroll
+  for (int j = 0; j < 4; j++) a[j] += a[j + 4];
+#pragma unroll
+  for (int j = 0; j < 2; j++) a[j] += a[j + 2];
+  a[0] += a[1];
+  float s = a[0];
+#pragma unroll
+  for (int o = 16; o; o >>= 1) s += __shfl_down(s, o, 32);
+  s = __shfl(s, 0, 32);
+  const float inv_se = 1.f / s;
+#pragma unroll
+  for (int j = 0; j < 16; j++) p[j] *= inv_se;
+  float vz_ent = 0.f;
+  if (vt.ring) {
+    float e = 0.f;
+#pragma unroll
+    for (int j = 0; j < 16; j++)
+      if (p[j] > 0.f) e -= p[j] * __logf(p[j]);
+#pragma unroll
+    for (int o = 16; o; o >>= 1) e += __shfl_xor(e, o, 32);
+    vz_ent = e;
+  }
+  float raw[k];
+#pragma unroll
+  for (int r = 0; r < k; r++) {
+    float bv = p[0];
+    int bi = lane;
+#pragma unroll
+    for (int j = 1; j < 16; j++)
+      if (p[j] > bv) { bv = p[j]; bi = lane + 32 * j; }
+#pragma unroll
+    for (int o = 16; o; o >>= 1) {
+      const float ov = __shfl_xor(bv, o, 32);
+      const int oi = __shfl_xor(bi, o, 32);
+      if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+    }
+    raw[r] = bv;
+    if (lane == 0) ids[r] = bi;
+    if ((bi & 31) == lane) {
+#pragma unroll
+      for (int j = 0; j < 16; j++)
+        if (j == (bi >> 5)) p[j] = -1e30f;
+    }
+  }
+  if (lane == 0) {
+    float sw = 0.f;
+#pragma unroll
+    for (int j = 0; j < k; j++) sw += raw[j];
+#pragma unroll
+    for (int j = 0; j < k; j++) ws[j] = raw[j] / sw;
+    if (vt.ring) viz::store_route(vt, 0, ids, ws, k, sw, vz_ent);
+  }
+}
+
+// k_moe_post: out[i] = rot_out(acc, svh)[i] + sigmoid(sg) * ey[i]. One wave per
+// 128 block (k_v2_rot<float,false> post=svh, pre=null), then the
+// k_axpy_sg_out expression on the rotated value.
+__global__ __launch_bounds__(256) void k_moe_post(const float* __restrict__ acc,
+                                                  const float* __restrict__ svh,
+                                                  const float* __restrict__ ey,
+                                                  const float* __restrict__ sg,
+                                                  float* __restrict__ out, int n) {
+  const int lane = threadIdx.x & 31;
+  const int b = blockIdx.x * 8 + (threadIdx.x >> 5);
+  if (b >= (n >> 7)) return;
+  float v[4];
+#pragma unroll
+  for (int j = 0; j < 4; j++) v[j] = acc[b * 128 + j * 32 + lane] * 1.f;
+  hv2::fwht128(v[0], v[1], v[2], v[3], lane);
+  const float s = 1.f / (1.f + expf(-sg[0]));
+#pragma unroll
+  for (int j = 0; j < 4; j++) {
+    const int i = b * 128 + j * 32 + lane;
+    // no contraction across the two original kernels' store boundary
+    float o = __fmul_rn(__fmul_rn(v[j], hv2::kRs128), svh[i]);
+    o = fmaf(s, ey[i], o);
+    out[i] = o;
+  }
+}

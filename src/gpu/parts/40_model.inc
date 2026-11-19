@@ -1838,6 +1838,7 @@ struct GpuModel {
     pf_init();
     hcf_init();
     se_par_init();
+    moepp_init();
     gdnf_init();
     fprintf(stderr, "qwenox: state allocated (maxctx=%d)\n", maxctx);
   }
@@ -2839,19 +2840,22 @@ struct GpuModel {
   //   rot_in(down.suh)) -> down (rotated, weighted sum over experts) ->
   //   rot_out(acc, down.svh). svh is shared by all experts of a layer, so the
   //   output rotation runs once on the weighted sum.
-  void moe_v2_1(int k, const WView& gu, const WView& dn, const float* x, const int* topids) {
+  void moe_v2_1(int k, const WView& gu, const WView& dn, const float* x, const int* topids,
+                bool pp = false) {
     const int d = g_cfg.d, mid = g_cfg.moe_mid;
     if (!moe_down_direct(k, dn)) CK(hipMemsetAsync(d_moeacc, 0, d * 4, g_str));
-    v2_rot(x, 0, d_ey, 0, gu.suh, nullptr, d, 1);  // d_ey: free until the shared expert
+    // pp: k_moe_pre already wrote the rotated x to d_moe_xr
+    float* const xr = pp ? d_moe_xr : d_ey;
+    if (!pp) v2_rot(x, 0, d_ey, 0, gu.suh, nullptr, d, 1);  // d_ey: free until the shared expert
     const XCodes c = xcodes(gu);
     const uint64_t pairs = (uint64_t)k * mid;
     k_q4cp_gemv_gg<2><<<(unsigned)((pairs + 15) / 16), 512, 0, g_str>>>(
-        c.codes, c.scales, c.cb, d_ey, d_guv, topids, (uint64_t)2 * mid, gu.cols,
+        c.codes, c.scales, c.cb, xr, d_guv, topids, (uint64_t)2 * mid, gu.cols,
         gu.scale_stride, k, 0 /*x_stride*/, 16 /*id_stride*/, k);
     k_i4r_mid<float, false><<<k, 2 * mid / 128 * 32, 0, g_str>>>(d_guv, 2 * mid, d_hid, mid,
                                                                  gu.svh, dn.suh, mid);
     moe_down1(k, dn, topids);
-    v2_rot(d_moeacc, 0, d_moeacc, 0, nullptr, dn.svh, d, 1);
+    if (!pp) v2_rot(d_moeacc, 0, d_moeacc, 0, nullptr, dn.svh, d, 1);  // pp: in k_moe_post
   }
   // GGUF routed experts g (trunk layer g_ggx[l] or the MTP layer g_ggx_mtp;
   // needs gg_on() for the scratch buffers): x f32 [P][d] with top-k
@@ -3088,6 +3092,87 @@ struct GpuModel {
     return true;
   }
 
+  // ---- MoE pre/post fusion (QWENOX_MOE_PP, default on; =0 off) ------------
+  bool moepp_on_ = false;
+  int* moepp_cnt_ = nullptr;
+  float* d_moe_xr = nullptr;
+  bool moepp_ok(int l, const WView& rtw, int k) const {
+    if (!moepp_on_ || dbg || k != 10 || rtw.dtype != 0 || rtw.rows != 512 || rtw.cols % 256 ||
+        g_cfg.d % 128 || g_cfg.d / 128 > 64 * 16)
+      return false;
+    if (gg_on() || !moe_down_direct(k, wview(ckpt.at(lname(l, "mlp.experts.down_proj.weight")))))
+      return false;
+    const Tensor* t = ckpt.find(lname(l, "mlp.experts.gate_up_proj.weight"));
+    return t && t->dtype == 23 && env_router_w32();
+  }
+  static bool env_router_w32() {
+    static const bool w = !env_zero("QWENOX_ROUTER_W32");
+    return w;
+  }
+  static std::string lname(int l, const char* sfx) {
+    char b[160];
+    snprintf(b, sizeof b, "layers.%d.%s", l, sfx);
+    return b;
+  }
+  void moepp_init() {
+    if (env_zero("QWENOX_MOE_PP")) return;
+    DALLOC(&moepp_cnt_, 64);
+    CK(hipMemset(moepp_cnt_, 0, 64));
+    DALLOC(&d_moe_xr, (size_t)g_cfg.d * 4);
+    moepp_on_ = true;
+    fprintf(stderr, "MoE pre/post fusion: on (P=1 decode)\n");
+    if (getenv("QWENOX_MOEPP_CHECK")) moepp_selftest();
+  }
+  void moepp_selftest() {
+    const int l = 0;
+    const WView rtw = wview(ckpt.at(lname(l, "mlp.gate.weight")));
+    if (!moepp_ok(l, rtw, g_cfg.topk)) { fprintf(stderr, "moepp check: not eligible\n"); return; }
+    const WView gu = wview(ckpt.at(lname(l, "mlp.experts.gate_up_proj.weight")));
+    const WView dn = wview(ckpt.at(lname(l, "mlp.experts.down_proj.weight")));
+    const int d = g_cfg.d;
+    std::vector<float> hx(d), ha(d), he(d);
+    uint64_t z = 4242;
+    auto rnd = [&]() { z = z * 6364136223846793005ull + 1442695040888963407ull; return (float)((z >> 40) & 0xffff) / 65536.f - 0.5f; };
+    for (auto& v : hx) v = rnd() * 2.f;
+    for (auto& v : ha) v = rnd();
+    for (auto& v : he) v = rnd();
+    float hs = 0.37f;
+    float *x, *lg1, *xr1, *xr2, *w1, *w2, *acc, *ey, *sg, *o1, *o2, *tmp;
+    int *i1, *i2;
+    for (float** p : {&x, &xr1, &xr2, &acc, &ey, &o1, &o2, &tmp}) CK(hipMalloc(p, d * 4));
+    CK(hipMalloc(&lg1, 512 * 4));
+    for (float** p : {&w1, &w2, &sg}) CK(hipMalloc(p, 64));
+    for (int** p : {&i1, &i2}) CK(hipMalloc(p, 64));
+    CK(hipMemcpy(x, hx.data(), d * 4, hipMemcpyHostToDevice));
+    CK(hipMemcpy(acc, ha.data(), d * 4, hipMemcpyHostToDevice));
+    CK(hipMemcpy(ey, he.data(), d * 4, hipMemcpyHostToDevice));
+    CK(hipMemcpy(sg, &hs, 4, hipMemcpyHostToDevice));
+    gemv(rtw, x, lg1);
+    k_router_topk_w32<10><<<1, 32, 0, g_str>>>(lg1, i1, w1, 1, VizTap{});
+    v2_rot(x, 0, xr1, 0, gu.suh, nullptr, d, 1);
+    CK(hipMemcpy(tmp, acc, d * 4, hipMemcpyDeviceToDevice));
+    v2_rot(tmp, 0, tmp, 0, nullptr, dn.svh, d, 1);
+    k_axpy_sg_out<<<(d + 255) / 256, 256, 0, g_str>>>(tmp, ey, sg, o1, d, d);
+    k_moe_pre<<<32, 512, 0, g_str>>>((const uint16_t*)rtw.data, x, (int)rtw.cols, d_router, gu.suh,
+                                     xr2, d, i2, w2, moepp_cnt_, VizTap{});
+    k_moe_post<<<(d / 128 + 7) / 8, 256, 0, g_str>>>(acc, dn.svh, ey, sg, o2, d);
+    CK(hipStreamSynchronize(g_str));
+    auto cmpb = [&](const char* nm, const void* A, const void* B, int n) {
+      std::vector<uint32_t> a(n), b(n);
+      CK(hipMemcpy(a.data(), A, n * 4, hipMemcpyDeviceToHost));
+      CK(hipMemcpy(b.data(), B, n * 4, hipMemcpyDeviceToHost));
+      int bad = 0;
+      for (int i = 0; i < n; i++) bad += a[i] != b[i];
+      fprintf(stderr, "moepp check %-5s: %s (%d/%d differ)\n", nm, bad ? "DIFF" : "bit-identical", bad, n);
+    };
+    cmpb("logit", lg1, d_router, 512);
+    cmpb("ids", i1, i2, 10);
+    cmpb("w", w1, w2, 10);
+    cmpb("xrot", xr1, xr2, d);
+    cmpb("out", o1, o2, d);
+    for (float* p : {x, lg1, xr1, xr2, w1, w2, acc, ey, sg, o1, o2, tmp}) CK(hipFree(p));
+    for (int* p : {i1, i2}) CK(hipFree(p));
+  }
   // ---- shared expert || routed experts (QWENOX_SE_PAR, default on; =0 off) --
   // P=1 decode only. The shared expert reads x alone; its result meets the
   // routed sum in k_axpy_sg_out. Same kernels, private gate/up/hid buffers
@@ -3134,9 +3219,20 @@ struct GpuModel {
       g_str = m;
     }
     snprintf(buf, sizeof buf, "layers.%d.mlp.gate.weight", l);
-    gemv(wview(ckpt.at(buf)), x, d_router);
+    const WView rtw = wview(ckpt.at(buf));
     int k = g_cfg.topk;
-    {
+    // MOE_PP: router + x rotation + top-k in one launch; moe_v2_1 then skips
+    // its own rotation and moe() the output rotation + axpy.
+    const bool pp = moepp_ok(l, rtw, k);
+    if (pp) {
+      snprintf(buf, sizeof buf, "layers.%d.mlp.experts.gate_up_proj.weight", l);
+      const WView gu0 = wview(ckpt.at(buf));
+      k_moe_pre<<<32, 512, 0, g_str>>>((const uint16_t*)rtw.data, x, (int)rtw.cols, d_router,
+                                       gu0.suh, d_moe_xr, g_cfg.d, d_topids, d_topw, moepp_cnt_,
+                                       vz_tap(l, false));
+    } else
+      gemv(rtw, x, d_router);
+    if (!pp) {
       // Same switch as router_topk_b: the wave32 kernel is bit-identical and
       // needs no block barriers (1 block of 512: ~10.5 us -> 1 wave).
       static const bool w32 = !env_zero("QWENOX_ROUTER_W32");
@@ -3166,7 +3262,7 @@ struct GpuModel {
       snprintf(buf, sizeof buf, "layers.%d.mlp.experts.down_proj.weight", l);
       WView dn = wview(ckpt.at(buf));
       if (gu.dtype == 23) {
-        moe_v2_1(k, gu, dn, x, d_topids);
+        moe_v2_1(k, gu, dn, x, d_topids, pp);
       } else {
       if (!moe_down_direct(k, dn)) CK(hipMemsetAsync(d_moeacc, 0, g_cfg.d * 4, g_str));
       const int* topids = d_topids;  // 直读:ids 即专家号,免 D2H 同步
@@ -3193,7 +3289,11 @@ struct GpuModel {
       se_chain(l, x, d_guv, d_hid, d_ey, d_sg);
     // D2: write y directly instead of acc += ... followed by a 40 KiB D2D.
     static const bool axpy_out = !env_zero("QWENOX_AXPY_SG_OUT");
-    if (axpy_out) {
+    if (pp) {
+      snprintf(buf, sizeof buf, "layers.%d.mlp.experts.down_proj.weight", l);
+      k_moe_post<<<(g_cfg.d / 128 + 7) / 8, 256, 0, g_str>>>(
+          d_moeacc, wview(ckpt.at(buf)).svh, sey, ssg, y, g_cfg.d);
+    } else if (axpy_out) {
       k_axpy_sg_out<<<(2560 + 255) / 256, 256, 0, g_str>>>(d_moeacc, sey, ssg, y,
                                                            g_cfg.d, g_cfg.d);
     } else {
