@@ -10540,7 +10540,11 @@ struct GpuModel {
       const int s = full;
       full = a >= g;
       if (!adapt || g < cur) return;  // tail round cut short by gen/ctx
-      for (int j = 0; j <= a && j < g; j++) {
+      // 无偏更新：本轮提出的每个深度都计一个样本（接受与否按 j < a）。旧实现只
+      // 更新到第一个被拒的深度（j <= a），更深的草稿永远拿不到样本、停在乐观先验
+      // 0.8，而实测深深度接受率只有约 0.52 —— 模型系统性高估，控制器因此把链
+      // 选得偏长，多跑验证行。改成按「提出」计数后，估计器无偏。
+      for (int j = 0; j < g; j++) {
         n[s][j] += 1.f;
         p[s][j] += std::max(alpha, 1.f / n[s][j]) * ((j < a ? 1.f : 0.f) - p[s][j]);
       }
