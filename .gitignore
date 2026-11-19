@@ -15,10 +15,16 @@ qwenox-settings
 qwenox-settings.exe
 dist/
 service.conf.bak
+service.conf.bak-*
+service.conf.*-bak
+*.exe.bak-*
 __pycache__/
 data/kvsnap
 data/ppbench/
 data/launcher-profiles.json
+data/api-overrides.json
+data/api-presets.json
+data/*.json.tmp
 data/kld/
 data/*.bin
 .rocprofv3
