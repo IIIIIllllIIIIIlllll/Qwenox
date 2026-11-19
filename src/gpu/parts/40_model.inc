@@ -1838,6 +1838,7 @@ struct GpuModel {
     pf_init();
     hcf_init();
     se_par_init();
+    gdnf_init();
     fprintf(stderr, "qwenox: state allocated (maxctx=%d)\n", maxctx);
   }
 
@@ -2561,6 +2562,72 @@ struct GpuModel {
     dump_rope_cs(base, P);
   }
 
+  // ---- GDN front fusion (QWENOX_GDN_PRE, default on; =0 off) --------------
+  bool gdnf_on_ = false;
+  int* gdnf_cnt_ = nullptr;
+  bool gdnf_ok(const WView& a, const WView& b) const {
+    return gdnf_on_ && a.dtype == 5 && b.dtype == 5 && a.rows == 48 && b.rows == 48 &&
+           a.cols == b.cols && a.cols % 32 == 0;
+  }
+  void gdnf_init() {
+    if (env_zero("QWENOX_GDN_PRE")) return;
+    DALLOC(&gdnf_cnt_, 64);
+    CK(hipMemset(gdnf_cnt_, 0, 64));
+    gdnf_on_ = true;
+    fprintf(stderr, "GDN front fusion: on (P=1 decode)\n");
+    if (getenv("QWENOX_GDNF_CHECK")) gdnf_selftest();
+  }
+  void gdnf_selftest() {
+    const int l = 0, gi = 0;
+    char buf[128];
+    snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_a.weight", l);
+    const WView aw = wview(ckpt.at(buf));
+    snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_b.weight", l);
+    const WView bw = wview(ckpt.at(buf));
+    if (!gdnf_ok(aw, bw)) { fprintf(stderr, "gdnf check: shapes not eligible\n"); return; }
+    const float* cw = d_convw + (size_t)gi * 10240 * 4;
+    std::vector<float> hq(10240), hs(3 * 10240), hx(2560);
+    uint64_t z = 777;
+    auto rnd = [&]() { z = z * 6364136223846793005ull + 1442695040888963407ull; return (float)((z >> 40) & 0xffff) / 65536.f - 0.5f; };
+    for (auto& v : hq) v = rnd() * 3.f;
+    for (auto& v : hs) v = rnd() * 3.f;
+    for (auto& v : hx) v = rnd();
+    float *q1, *q2, *s1, *s2, *x, *a1, *a2, *b1, *b2;
+    for (float** p : {&q1, &q2}) CK(hipMalloc(p, 10240 * 4));
+    for (float** p : {&s1, &s2}) CK(hipMalloc(p, 3 * 10240 * 4));
+    for (float** p : {&a1, &a2, &b1, &b2}) CK(hipMalloc(p, 64 * 4));
+    CK(hipMalloc(&x, 2560 * 4));
+    CK(hipMemcpy(q1, hq.data(), 10240 * 4, hipMemcpyHostToDevice));
+    CK(hipMemcpy(q2, hq.data(), 10240 * 4, hipMemcpyHostToDevice));
+    CK(hipMemcpy(s1, hs.data(), 3 * 10240 * 4, hipMemcpyHostToDevice));
+    CK(hipMemcpy(s2, hs.data(), 3 * 10240 * 4, hipMemcpyHostToDevice));
+    CK(hipMemcpy(x, hx.data(), 2560 * 4, hipMemcpyHostToDevice));
+    k_gdn_conv<<<(10240 + 255) / 256, 256, 0, g_str>>>(q1, cw, s1, q1, 10240);
+    k_l2norm_qk<<<16, 128, 0, g_str>>>(q1, q1 + 2048, 128, 1.f / sqrtf(128.f));
+    gemv(aw, x, a1);
+    gemv(bw, x, b1);
+    k_gdn_gates<<<1, 64, 0, g_str>>>(a1, b1, d_Alog, d_dtbias, a1, b1, 48, 48);
+    k_gdnf_pre<<<32, 512, 0, g_str>>>(
+        q2, cw, s2, 1.f / sqrtf(128.f), aw.data + 64, aw.data + 64 + aw.rows * aw.cols / 2,
+        (const float*)aw.data, aw.scale_stride, bw.data + 64, bw.data + 64 + bw.rows * bw.cols / 2,
+        (const float*)bw.data, bw.scale_stride, x, (int)aw.cols, a2, b2, d_Alog, d_dtbias, gdnf_cnt_);
+    CK(hipStreamSynchronize(g_str));
+    auto cmpv = [&](const char* nm, const float* A, const float* B, int n) {
+      std::vector<float> ha(n), hb(n);
+      CK(hipMemcpy(ha.data(), A, n * 4, hipMemcpyDeviceToHost));
+      CK(hipMemcpy(hb.data(), B, n * 4, hipMemcpyDeviceToHost));
+      int bad = 0, first = -1;
+      for (int i = 0; i < n; i++)
+        if (memcmp(&ha[i], &hb[i], 4)) { if (first < 0) first = i; bad++; }
+      if (bad) fprintf(stderr, "gdnf check %-6s: %d/%d differ, first %d: %.9g vs %.9g\n", nm, bad, n, first, (double)ha[first], (double)hb[first]);
+      else fprintf(stderr, "gdnf check %-6s: bit-identical (%d)\n", nm, n);
+    };
+    cmpv("qkv", q1, q2, 10240);
+    cmpv("state", s1, s2, 3 * 10240);
+    cmpv("g", a1, a2, 48);
+    cmpv("beta", b1, b2, 48);
+    for (float* p : {q1, q2, s1, s2, x, a1, a2, b1, b2}) CK(hipFree(p));
+  }
   void gdn(int l, int gi, const float* x, float* y) {
     char buf[128];
     snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_qkv.weight", l);
@@ -2573,19 +2640,30 @@ struct GpuModel {
     // conv + silu (state per layer)
     float* convst = d_convst + (size_t)gi * 3 * 10240;
     const float* cw = d_convw + (size_t)gi * 10240 * 4;
-    k_gdn_conv<<<(10240 + 255) / 256, 256, 0, g_str>>>(d_qkv, cw, convst, d_qkv, 10240);
-    // note: in-place (cur==out) is safe: read cur[ch] before write out[ch]
     // split: q [0,2048) k [2048,4096) v [4096,10240)
     float* qp = d_qkv;
     float* kp = d_qkv + 2048;
     float* vp = d_qkv + 4096;
-    k_l2norm_qk<<<16, 128, 0, g_str>>>(qp, kp, 128, 1.f / sqrtf(128.f));
     snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_a.weight", l);
-    gemv(wview(ckpt.at(buf)), x, d_g48 /*tmp*/);
+    const WView aw = wview(ckpt.at(buf));
     snprintf(buf, sizeof buf, "layers.%d.linear_attn.in_proj_b.weight", l);
-    gemv(wview(ckpt.at(buf)), x, d_beta48 /*tmp: raw b*/);
+    const WView bw = wview(ckpt.at(buf));
+    if (gdnf_ok(aw, bw)) {
+      // conv + l2norm + a/b + gates in one launch (bit-identical, see k_gdnf_pre)
+      k_gdnf_pre<<<32, 512, 0, g_str>>>(
+          d_qkv, cw, convst, 1.f / sqrtf(128.f), aw.data + 64, aw.data + 64 + aw.rows * aw.cols / 2,
+          (const float*)aw.data, aw.scale_stride, bw.data + 64, bw.data + 64 + bw.rows * bw.cols / 2,
+          (const float*)bw.data, bw.scale_stride, x, (int)aw.cols, d_g48, d_beta48,
+          d_Alog + (size_t)gi * 48, d_dtbias + (size_t)gi * 48, gdnf_cnt_);
+    } else {
+    k_gdn_conv<<<(10240 + 255) / 256, 256, 0, g_str>>>(d_qkv, cw, convst, d_qkv, 10240);
+    // note: in-place (cur==out) is safe: read cur[ch] before write out[ch]
+    k_l2norm_qk<<<16, 128, 0, g_str>>>(qp, kp, 128, 1.f / sqrtf(128.f));
+    gemv(aw, x, d_g48 /*tmp*/);
+    gemv(bw, x, d_beta48 /*tmp: raw b*/);
     k_gdn_gates<<<1, 64, 0, g_str>>>(d_g48, d_beta48, d_Alog + (size_t)gi * 48,
                            d_dtbias + (size_t)gi * 48, d_g48, d_beta48, 48, 48);
+    }
     pf_fork(l);  // decode prefetch: overlaps step/norm/out_proj
     k_gdn_step<<<48, 512, 0, g_str>>>(qp, kp, vp, d_g48, d_beta48,
                             d_S + (size_t)gi * 48 * 128 * 128, vp /*out in place*/,

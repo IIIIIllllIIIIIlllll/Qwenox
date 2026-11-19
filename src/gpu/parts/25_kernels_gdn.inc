@@ -1975,3 +1975,142 @@ __global__ void __launch_bounds__(GDN_NT_STRIP)
   PH_ACC(10, tk);
 }
 
+// ---- GDN front fusion for the P=1 decode step (QWENOX_GDN_PRE) -------------
+// grid 32 x 512: blocks 0..15 = q/k head h (conv of q[h], k[h] + l2norm, the
+// k_l2norm_qk 128-tree on threads < 128), 16..27 = 512 v channels each (conv),
+// 28..31 = in_proj_a rows 0..31 / 32..47, in_proj_b rows 0..31 / 32..47 (the
+// k_q4cp_gemv warp math); the last of those 4 to arrive runs k_gdn_gates.
+// Explicit fmaf chains reproduce the backend's contraction of the originals.
+__device__ __forceinline__ float gdnf_conv(const float* __restrict__ cur, const float* __restrict__ cw,
+                                           float* __restrict__ st, int qkv, int ch) {
+  const float s0 = st[ch], s1 = st[qkv + ch], s2 = st[2 * qkv + ch], c = cur[ch];
+  // k_gdn_conv compiles to fma(c3,cur, fma(c2,s2, fma(c0,s0, c1*s1)))
+  const float a = fmaf(cw[ch * 4 + 3], c, fmaf(cw[ch * 4 + 2], s2, fmaf(cw[ch * 4 + 0], s0, cw[ch * 4 + 1] * s1)));
+  st[ch] = s1;
+  st[qkv + ch] = s2;
+  st[2 * qkv + ch] = c;
+  const float sg = 1.f / (1.f + expf(-a));
+  return a * sg;
+}
+__global__ __launch_bounds__(512) void k_gdnf_pre(
+    float* __restrict__ qkv, const float* __restrict__ cw, float* __restrict__ convst, float qscale,
+    const uint8_t* __restrict__ ac, const uint8_t* __restrict__ as_, const float* __restrict__ acb,
+    uint64_t a_ss, const uint8_t* __restrict__ bc, const uint8_t* __restrict__ bs,
+    const float* __restrict__ bcb, uint64_t b_ss, const float* __restrict__ x, int cols,
+    float* __restrict__ ga, float* __restrict__ gb, const float* __restrict__ A_log,
+    const float* __restrict__ dt_bias, int* __restrict__ cnt) {
+  const int bid = blockIdx.x, t = threadIdx.x;
+  constexpr int NQKV = 10240;
+  if (bid < 16) {
+    __shared__ float sm[128];
+    const int h = bid;
+    float v = 0.f, kv = 0.f;
+    if (t < 128) {
+      v = gdnf_conv(qkv, cw, convst, NQKV, h * 128 + t);
+      kv = gdnf_conv(qkv, cw, convst, NQKV, 2048 + h * 128 + t);
+      sm[t] = v * v;
+    }
+    __syncthreads();
+    for (int off = 64; off > 0; off >>= 1) {
+      if (t < off) sm[t] += sm[t + off];
+      __syncthreads();
+    }
+    const float iq = rsqrtf(sm[0] + 1e-6f);
+    __syncthreads();
+    if (t < 128) sm[t] = kv * kv;
+    __syncthreads();
+    for (int off = 64; off > 0; off >>= 1) {
+      if (t < off) sm[t] += sm[t + off];
+      __syncthreads();
+    }
+    const float ik = rsqrtf(sm[0] + 1e-6f);
+    if (t < 128) {
+      qkv[h * 128 + t] = v * iq * qscale;
+      qkv[2048 + h * 128 + t] = kv * ik;
+    }
+    return;
+  }
+  if (bid < 28) {
+    const int ch = 4096 + (bid - 16) * 512 + t;
+    qkv[ch] = gdnf_conv(qkv, cw, convst, NQKV, ch);
+    return;
+  }
+  // in_proj_a / in_proj_b, 48 rows each: k_q4cp_gemv (512 threads, 2 rows/warp)
+  const int gb_ = bid - 28;  // 0,1 -> a ; 2,3 -> b
+  const bool isb = gb_ >= 2;
+  const uint8_t* codes = isb ? bc : ac;
+  const uint8_t* scales = isb ? bs : as_;
+  const float* cb = isb ? bcb : acb;
+  const uint64_t ss = isb ? b_ss : a_ss;
+  float* y = isb ? gb : ga;
+  const uint64_t rows = 48;
+  __shared__ float cbf[16];
+  if (t < 16) cbf[t] = cb[t];
+  __syncthreads();
+  const uint64_t groups_per_row = (uint64_t)cols / 32;
+  const uint64_t row0 = ((uint64_t)(gb_ & 1) * 16 + t / 32) * 2;
+  const int lane = t % 32;
+  if (row0 < rows) {
+    const uint8_t* rc0 = codes + row0 * (cols / 2);
+    const uint8_t* rs0 = scales + row0 * ss;
+    const bool has1 = row0 + 1 < rows;
+    const uint8_t* rc1 = codes + (row0 + 1) * (cols / 2);
+    const uint8_t* rs1 = scales + (row0 + 1) * ss;
+    float acc0 = 0.f, acc1 = 0.f;
+    for (uint64_t g = lane; g < groups_per_row; g += 32) {
+      uint4 pk0 = *(const uint4*)(rc0 + g * 16);
+      float s0 = __half2float(*(const __half*)(rs0 + g * 2));
+      uint4 pk1 = make_uint4(0, 0, 0, 0);
+      float s1 = 0.f;
+      if (has1) {
+        pk1 = *(const uint4*)(rc1 + g * 16);
+        s1 = __half2float(*(const __half*)(rs1 + g * 2));
+      }
+      const float* xg = x + g * 32;
+      float xv[32];
+#pragma unroll
+      for (int i = 0; i < 8; i++) {
+        float4 q = *(const float4*)(xg + i * 4);
+        xv[i * 4] = q.x; xv[i * 4 + 1] = q.y; xv[i * 4 + 2] = q.z; xv[i * 4 + 3] = q.w;
+      }
+      uint32_t w0[4] = {pk0.x, pk0.y, pk0.z, pk0.w};
+      uint32_t w1[4] = {pk1.x, pk1.y, pk1.z, pk1.w};
+      float a0 = 0.f, a1 = 0.f;
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        uint32_t v0 = w0[i], v1 = w1[i];
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+          a0 = fmaf(cbf[v0 & 0xf], xv[i * 8 + j], a0);
+          a1 = fmaf(cbf[v1 & 0xf], xv[i * 8 + j], a1);
+          v0 >>= 4; v1 >>= 4;
+        }
+      }
+      acc0 = fmaf(a0, s0, acc0);
+      acc1 = fmaf(a1, s1, acc1);
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+      acc0 += __shfl_down(acc0, off, 32);
+      acc1 += __shfl_down(acc1, off, 32);
+    }
+    if (lane == 0) {
+      y[row0] = acc0;
+      if (has1) y[row0 + 1] = acc1;
+    }
+  }
+  __shared__ int s_last;
+  __threadfence();
+  __syncthreads();
+  if (t == 0) s_last = atomicAdd(cnt, 1) == 3;
+  __syncthreads();
+  if (!s_last) return;
+  __threadfence();
+  if (t < 48) {
+    const float av = __builtin_nontemporal_load(ga + t), bv = __builtin_nontemporal_load(gb + t);
+    float sp = av + dt_bias[t];
+    sp = sp > 20.f ? sp : log1pf(expf(sp));
+    ga[t] = -expf(A_log[t]) * sp;
+    gb[t] = 1.f / (1.f + expf(-bv));
+  }
+  if (t == 0) atomicExch(cnt, 0);
+}
