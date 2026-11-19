@@ -61,6 +61,9 @@
 #include <objbase.h>    // CoInitializeEx / CoCreateInstance（KV 快照目录选择框）
 #include <shobjidl.h>   // IFileOpenDialog + FOS_PICKFOLDERS
 #include <set>
+#include <map>
+#include <cmath>
+#include <algorithm>
 
 namespace {
 
@@ -150,7 +153,8 @@ using svcconf::is_optional_file_key;
 int page_of_key(const std::string& k) {
     if (k == "MAX_CONTEXT" || k == "PARALLEL" || k == "KV_POOL_TOKENS" || k == "KV_PAGED" ||
         k == "PREFILL_CHUNK" || k == "ROPE_FACTOR" || k == "KVSNAP_MAX_GB" ||
-        k == "KVSNAP_DIR" || k == "QSA_INDEXER_BUDGET" || k == "AFFINITY")
+        k == "KVSNAP_DIR" || k == "QSA_INDEXER_BUDGET" || k == "AFFINITY" ||
+        k == "KV_TYPE")
         return 1;
     if (k == "ENGINE_HOST" || k == "ENGINE_PORT" || k == "API_HOST" || k == "API_PORT")
         return 2;
@@ -394,6 +398,9 @@ struct PanelVals {
     std::string moe_a4 = "0";  // MOE_A4：0 关，1–3 开（只对 V2 生效）
     std::string qsa_indexer_budget = "0";  // 0 = 2048；4096 = 扩大 QSA 检索预算
     std::string kv_type = "bf16";  // KV_TYPE：bf16（默认）/ fp16 / q8（省显存）
+    std::string cvec;              // CVEC：控制向量 GGUF（空 = 关闭）
+    bool no_cvec = false;          // 不勾"不启用"时 no_cvec = cvec.empty()
+    std::string cvec_mode = "project", cvec_scale = "1.0", cvec_layers = "4 44";
     std::string affinity;
     std::string max_images;    // MAX_IMAGES：单请求图片数上限（1–256），重启生效
     bool viz = false;          // VIZ：运行时可视化（GET /viz），重启生效
@@ -436,6 +443,11 @@ PanelVals panel_vals_from_conf() {
     v.prefill_chunk = cfg("PREFILL_CHUNK", "0");
     v.qsa_indexer_budget = cfg("QSA_INDEXER_BUDGET", "0");
     v.kv_type = cfg("KV_TYPE", "bf16");
+    v.cvec = cfg_optional("CVEC", "");
+    v.no_cvec = v.cvec.empty();
+    v.cvec_mode = cfg("CVEC_MODE", "project");
+    v.cvec_scale = cfg("CVEC_SCALE", "1.0");
+    v.cvec_layers = cfg("CVEC_LAYERS", "4 44");
     v.rope_factor = cfg("ROPE_FACTOR", "1");
     v.rope_original = cfg("ROPE_ORIGINAL_CTX", "262144");
     v.kvsnap_max_gb = cfg("KVSNAP_MAX_GB", "20");
@@ -493,6 +505,10 @@ std::map<std::string, std::string> panel_vals_to_conf(const PanelVals& v) {
     m["PREFILL_CHUNK"] = v.prefill_chunk;
     m["QSA_INDEXER_BUDGET"] = v.qsa_indexer_budget;
     m["KV_TYPE"] = v.kv_type;
+    m["CVEC"] = v.no_cvec ? "" : v.cvec;
+    m["CVEC_MODE"] = v.cvec_mode;
+    m["CVEC_SCALE"] = v.cvec_scale;
+    m["CVEC_LAYERS"] = v.cvec_layers;
     m["ROPE_FACTOR"] = v.rope_factor;
     m["KVSNAP_MAX_GB"] = v.kvsnap_max_gb;
     std::string kdir = v.kvsnap_dir;
@@ -663,6 +679,44 @@ void check_weights_page(CheckLines& c, const PanelVals& v) {
                    TR("tokenizer：找不到 ", "tokenizer: missing ") + v.tok + "\\tokenizer.json");
     else
         check_line(c, kLvPass, TR("tokenizer：", "tokenizer: ") + v.tok + "\\tokenizer.json");
+    // 控制向量（CVEC，见 docs/CVEC.md）：文件 + 模式/scale/层区间。
+    if (v.no_cvec || v.cvec.empty()) {
+        check_line(c, kLvPass, TR("控制向量：不使用", "Control vector: not used"));
+    } else if (!file_exists(v.cvec)) {
+        check_line(c, kLvFail,
+                   TR("控制向量：找不到 ", "Control vector: not found: ") + v.cvec +
+                       TR("（不用时可勾选“不使用”）", " (tick \"off\" to disable)"));
+    } else {
+        check_line(c, kLvPass, TR("控制向量：", "Control vector: ") + v.cvec);
+        if (v.cvec_mode != "project" && v.cvec_mode != "add")
+            check_line(c, kLvFail,
+                       TR("CVEC_MODE 只允许 project 或 add", "CVEC_MODE must be project or add"));
+        else if (v.cvec_mode == "add")
+            check_line(c, kLvWarn,
+                       TR("add 模式：配合 -refusal-additive.gguf、层 16 32、scale 0.05–0.15；"
+                          "加法文件不要用 scale 1.0",
+                          "add mode: use with -refusal-additive.gguf, layers 16 32, scale "
+                          "0.05-0.15; never load the additive file at scale 1.0"));
+        double cscale = 0;
+        if (!svcconf::parse_double(v.cvec_scale, &cscale) || cscale <= 0)
+            check_line(c, kLvFail, TR("CVEC_SCALE 必须为正小数", "CVEC_SCALE must be a number > 0"));
+        const std::string cl = v.cvec_layers;
+        const size_t sp = cl.find_first_of(" ,");
+        long clo = -1, chi = -1;
+        bool cok = sp != std::string::npos &&
+                   svcconf::parse_int(svcconf::trim(cl.substr(0, sp)), &clo) &&
+                   svcconf::parse_int(svcconf::trim(cl.substr(sp + 1)), &chi) && clo >= 1 &&
+                   chi >= clo && chi <= 47;
+        if (!cok)
+            check_line(c, kLvFail,
+                       TR("CVEC_LAYERS 必须为 \"<起> <止>\"，1<=起<=止<=47",
+                          "CVEC_LAYERS must be \"<lo> <hi>\" with 1 <= lo <= hi <= 47"));
+        if (cok && (clo > 4 || chi < 44) && v.cvec_mode == "project")
+            check_line(c, kLvHint,
+                       TR("参考配置为层 4 44；当前区间比它窄，去除效果可能变弱",
+                          "The reference configuration uses layers 4 44; a narrower range may "
+                          "weaken the effect"));
+    }
 }
 
 // 第 2 页：推理设置（上下文/并发/YaRN）的数值校验（与启动流程同一套规则）。
@@ -1176,6 +1230,10 @@ AllChecks panel_checks(const PanelVals& v, bool service_running) {
         int page;             // 1 推理 / 2 端口
     } kPanelOnlyEnv[] = {
         {"MAX_IMAGES", "QWENOX_API_MAX_IMAGES", 1},
+        {"CVEC", "QWENOX_CVEC", 0},
+        {"CVEC_MODE", "QWENOX_CVEC_MODE", 0},
+        {"CVEC_SCALE", "QWENOX_CVEC_SCALE", 0},
+        {"CVEC_LAYERS", "QWENOX_CVEC_LAYERS", 0},
         {"VIZ", "VIZ", 2},
         {"REQLOG", "QWENOX_REQLOG", 2},
         {"REQLOG_DIR", "QWENOX_REQLOG_DIR", 2},
@@ -1217,6 +1275,7 @@ enum PanelId : int {
     kEdOut1, kEdOut2, kEdOut3, kEdReport, kEdSummary, kBtnLang,
     kCkMoeA4, kCkQsaBudget,
     kEdMaxImages, kCkViz, kCkReqlog, kEdReqlogDir, kBrReqlogDir, kEdReqlogLevel,
+    kEdCvec, kBrCvec, kOffCvec, kCbCvecMode, kEdCvecScale, kEdCvecLayers,
 };
 
 struct FileRow {
@@ -1235,6 +1294,9 @@ struct PanelCtl {
     HWND yarn = nullptr;  // "YaRN 长上下文扩展" 勾选框（ROPE_FACTOR 自动推导，无编辑行）
     HWND qsa_budget = nullptr;
     HWND kv_type = nullptr;  // KV_TYPE 下拉框（bf16 / q8 / fp16）
+    FileRow row_cvec;        // CVEC：控制向量 GGUF（空 = 关闭，见 docs/CVEC.md）
+    HWND cvec_lab = nullptr;
+    HWND cvec_mode = nullptr, cvec_scale = nullptr, cvec_layers = nullptr;
     HWND kvsnap = nullptr;
     HWND kvsnap_dir = nullptr, kvsnap_dir_br = nullptr;
     HWND affinity = nullptr;
@@ -1379,6 +1441,219 @@ HWND plabel(int page, HWND parent, int x, int y, const wchar_t* text, int w = kL
     return pctl(page, parent, L"Static", SS_LEFTNOWORDWRAP, x, y + 3, w, 18, text, 0);
 }
 
+// ---- 双端区间滑条（控制向量层区间） --------------------------------------------
+// 原生 Win32 没有双拇指滑条，这里自绘一个最小控件：一条轨道 + 两个圆拇指，
+// 拖动/方向键调整，值通过 WM_USER 消息读写（"lo hi" 由宿主拼装，conf 格式不变）。
+struct RngState {
+    int mn = 1, mx = 47, lo = 4, hi = 44, drag = 0;  // drag: 0 none, 1 lo, 2 hi
+};
+std::map<HWND, RngState> g_rng;
+constexpr UINT kRngSetMsg = WM_USER + 50;  // wParam=lo, lParam=hi
+constexpr UINT kRngGetMsg = WM_USER + 51;  // 返回 MAKELONG(lo, hi)
+constexpr UINT kRngChanged = 0x7E01;       // WM_COMMAND 通知码（父窗口据此刷新检查）
+constexpr COLORREF kRngRail = RGB(62, 74, 106);
+constexpr COLORREF kRngAccent = RGB(122, 162, 240);
+constexpr COLORREF kRngEdge = RGB(58, 70, 100);
+
+// windows.h 的 max/min 是宏，不能用 std::max/std::min（本文件其它地方同样手写比较）。
+static int rng_clamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+static int rng_larger(int a, int b) { return a > b ? a : b; }
+static int rng_smaller(int a, int b) { return a < b ? a : b; }
+
+int rng_span(const RngState& st, int w) { return rng_larger(1, w - (int)(16 * g_dpi / 96.0)); }
+int rng_x_of(const RngState& st, int v, int w) {
+    const int pad = (int)(8 * g_dpi / 96.0);
+    return pad + (int)((double)(v - st.mn) / (st.mx - st.mn) * rng_span(st, w));
+}
+int rng_val_of(const RngState& st, int x, int w) {
+    const int pad = (int)(8 * g_dpi / 96.0);
+    const double t = (double)(x - pad) / rng_span(st, w);
+    int v = st.mn + (int)std::lround(t * (st.mx - st.mn));
+    return rng_clamp(v, st.mn, st.mx);
+}
+
+void rng_notify(HWND h) {
+    HWND par = GetParent(h);
+    if (!par) return;
+    SendMessageW(par, WM_COMMAND,
+                 MAKEWPARAM(static_cast<int>(GetWindowLongPtrW(h, GWLP_ID)), kRngChanged),
+                 reinterpret_cast<LPARAM>(h));
+}
+
+void rng_paint(HWND h, HDC dc) {
+    auto it = g_rng.find(h);
+    if (it == g_rng.end()) return;
+    RngState& st = it->second;
+    RECT rc;
+    GetClientRect(h, &rc);
+    const double k = g_dpi / 96.0;
+    const int pad = (int)(8 * k), th = rng_larger(2, (int)(5 * k));
+    const int railY = (int)rc.bottom - (int)(8 * k);
+    // 背景与输入框一致；禁用时整体压暗
+    RECT body = rc;
+    body.bottom -= 1;
+    HBRUSH bg = CreateSolidBrush(st.drag == 0 ? kEditBg : RGB(30, 38, 62));
+    FillRect(dc, &body, bg);
+    DeleteObject(bg);
+    HPEN edge = CreatePen(PS_SOLID, 1, kRngEdge);
+    HGDIOBJ oldPen = SelectObject(dc, edge);
+    HGDIOBJ oldBr = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Rectangle(dc, rc.left, rc.top, rc.right, rc.bottom);
+    SelectObject(dc, oldBr);
+    SelectObject(dc, oldPen);
+    DeleteObject(edge);
+    // 轨道 + 选中段
+    RECT rl{rc.left + pad, railY - th / 2, rc.right - pad, railY - th / 2 + th};
+    HBRUSH rbr = CreateSolidBrush(kRngRail);
+    FillRect(dc, &rl, rbr);
+    DeleteObject(rbr);
+    const int xl = rng_x_of(st, st.lo, rc.right - rc.left);
+    const int xh = rng_x_of(st, st.hi, rc.right - rc.left);
+    RECT fl{rc.left + xl, rl.top, rc.left + xh, rl.bottom};
+    HBRUSH fbr = CreateSolidBrush(kRngAccent);
+    FillRect(dc, &fl, fbr);
+    DeleteObject(fbr);
+    // 两个圆拇指（低端空心、高端实心，便于区分）
+    const int r = (int)(7 * k);
+    for (int i = 0; i < 2; ++i) {
+        const int cx = rc.left + (i ? xh : xl);
+        RECT t{cx - r, railY - r, cx + r, railY + r};
+        HBRUSH tb = CreateSolidBrush(i ? kRngAccent : RGB(200, 214, 240));
+        HPEN tp = CreatePen(PS_SOLID, rng_larger(1, (int)(2 * k)), RGB(12, 17, 32));
+        HGDIOBJ ob = SelectObject(dc, tb), op = SelectObject(dc, tp);
+        Ellipse(dc, t.left, t.top, t.right, t.bottom);
+        SelectObject(dc, ob);
+        SelectObject(dc, op);
+        DeleteObject(tb);
+        DeleteObject(tp);
+    }
+    // 右上角数值
+    wchar_t buf[32];
+    swprintf(buf, 32, L"%d – %d", st.lo, st.hi);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(170, 182, 208));
+    HFONT oldFont = static_cast<HFONT>(SelectObject(dc, panel_font()));
+    RECT tr{rc.left, rc.top + (int)(1 * k), rc.right - (int)(6 * k), rc.top + railY - r};
+    DrawTextW(dc, buf, -1, &tr, DT_RIGHT | DT_SINGLELINE | DT_TOP | DT_NOPREFIX);
+    SelectObject(dc, oldFont);
+    if (GetFocus() == h) DrawFocusRect(dc, &rc);
+}
+
+LRESULT CALLBACK rng_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    auto it = g_rng.find(h);
+    switch (msg) {
+        case WM_CREATE:
+            g_rng.emplace(h, RngState{});
+            return 0;
+        case WM_DESTROY:
+            g_rng.erase(h);
+            return 0;
+        case kRngSetMsg:
+            if (it != g_rng.end()) {
+                it->second.lo = rng_clamp((int)wp, it->second.mn, it->second.mx);
+                it->second.hi = rng_clamp((int)lp, it->second.lo, it->second.mx);
+                InvalidateRect(h, nullptr, FALSE);
+            }
+            return 0;
+        case kRngGetMsg:
+            return it == g_rng.end() ? 0 : MAKELONG(it->second.lo, it->second.hi);
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(h, &ps);
+            rng_paint(h, dc);
+            EndPaint(h, &ps);
+            return 0;
+        }
+        case WM_ERASEBKGND:
+            return 1;  // WM_PAINT 已铺满
+        case WM_GETDLGCODE:
+            return DLGC_WANTARROWS;
+        case WM_ENABLE:
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        case WM_LBUTTONDOWN: {
+            if (it == g_rng.end() || !IsWindowEnabled(h)) return 0;
+            RECT rc;
+            GetClientRect(h, &rc);
+            const int x = static_cast<short>(LOWORD(lp));
+            const int w = rc.right - rc.left;
+            const int dl = std::abs(x - rng_x_of(it->second, it->second.lo, w));
+            const int dh = std::abs(x - rng_x_of(it->second, it->second.hi, w));
+            it->second.drag = dl <= dh ? 1 : 2;
+            SetFocus(h);
+            SetCapture(h);
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        }
+        case WM_MOUSEMOVE: {
+            if (it == g_rng.end() || !it->second.drag) return 0;
+            RECT rc;
+            GetClientRect(h, &rc);
+            const int v = rng_val_of(it->second, static_cast<short>(LOWORD(lp)), rc.right - rc.left);
+            if (it->second.drag == 1) {
+                const int nv = rng_smaller(v, it->second.hi);
+                if (nv != it->second.lo) { it->second.lo = nv; InvalidateRect(h, nullptr, FALSE); }
+            } else {
+                const int nv = rng_larger(v, it->second.lo);
+                if (nv != it->second.hi) { it->second.hi = nv; InvalidateRect(h, nullptr, FALSE); }
+            }
+            return 0;
+        }
+        case WM_LBUTTONUP:
+            if (it != g_rng.end() && it->second.drag) {
+                it->second.drag = 0;
+                ReleaseCapture();
+                InvalidateRect(h, nullptr, FALSE);
+                rng_notify(h);
+            }
+            return 0;
+        case WM_KEYDOWN: {
+            if (it == g_rng.end()) return 0;
+            const int step = (GetKeyState(VK_SHIFT) & 0x8000) ? 5 : 1;
+            RngState& st = it->second;
+            if (!st.drag) st.drag = 2;  // 未拖动过时默认调高端
+            int* cur = st.drag == 1 ? &st.lo : &st.hi;
+            int nv = *cur;
+            switch (wp) {
+                case VK_LEFT: nv -= step; break;
+                case VK_RIGHT: nv += step; break;
+                case VK_HOME: nv = st.mn; break;
+                case VK_END: nv = st.mx; break;
+                default: return 0;
+            }
+            st.drag = 0;  // 键盘调整不改变拖动状态
+            nv = rng_clamp(nv, st.mn, st.mx);
+            if (cur == &st.lo) nv = rng_smaller(nv, st.hi); else nv = rng_larger(nv, st.lo);
+            if (nv != *cur) {
+                *cur = nv;
+                InvalidateRect(h, nullptr, FALSE);
+                rng_notify(h);
+            }
+            return 0;
+        }
+        case WM_SETCURSOR:
+            SetCursor(LoadCursorW(nullptr, MAKEINTRESOURCEW(32649)));  // IDC_HAND
+            return TRUE;
+        default:
+            break;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+// 读回滑条区间（未创建/未初始化时返回 false）
+bool rng_get(HWND h, int* lo, int* hi) {
+    if (!h) return false;
+    const LRESULT r = SendMessageW(h, kRngGetMsg, 0, 0);
+    if (r == 0) return false;
+    *lo = LOWORD(static_cast<DWORD_PTR>(r));
+    *hi = HIWORD(static_cast<DWORD_PTR>(r));
+    return true;
+}
+
+void rng_set(HWND h, int lo, int hi) {
+    if (h) SendMessageW(h, kRngSetMsg, static_cast<WPARAM>(lo), static_cast<LPARAM>(hi));
+}
+
 void set_edit(HWND h, const std::string& s) { SetWindowTextW(h, to_w(s).c_str()); }
 
 std::string get_edit(HWND h) {
@@ -1462,6 +1737,20 @@ PanelVals panel_collect() {
                      reinterpret_cast<LPARAM>(kvt_buf));
         v.kv_type = from_w(kvt_buf);
     }
+    // 控制向量（CVEC，见 docs/CVEC.md）：0 = project，1 = add
+    v.no_cvec = get_check(g_pc.row_cvec.off);
+    v.cvec = get_edit(g_pc.row_cvec.edit);
+    v.cvec_mode = static_cast<int>(SendMessageW(g_pc.cvec_mode, CB_GETCURSEL, 0, 0)) == 1
+                      ? "add" : "project";
+    v.cvec_scale = get_edit(g_pc.cvec_scale);
+    {
+        int lo = 4, hi = 44;
+        if (rng_get(g_pc.cvec_layers, &lo, &hi))
+            v.cvec_layers = std::to_string(lo) + " " + std::to_string(hi);
+        else
+            v.cvec_layers = "4 44";
+    }
+    if (v.cvec_scale.empty()) v.cvec_scale = "1.0";
     v.rope_original = cfg("ROPE_ORIGINAL_CTX", "262144");  // 无 UI 行，conf/环境原样读
     v.rope_factor = derive_rope_factor(get_check(g_pc.yarn), v.max_context, v.rope_original);
     v.kvsnap_max_gb = get_edit(g_pc.kvsnap);
@@ -1644,35 +1933,47 @@ void place_row(const FileRow& r, int y, bool visible) {
 // 第 1 页布局：按版本只显示相关文件行，顺序重排，隐藏其余
 void layout_page1(int ver) {
     g_weights_ver = ver;
-    const FileRow* order[10];
+    const FileRow* order[12];
     int n = 0;
+    // 控制向量与权重版本无关：每个版本的顺序都是“文件行 … 控制向量 → tokenizer”。
     if (ver == kVerGguf) {
         order[n++] = &g_pc.row_gguf;
         order[n++] = &g_pc.row_gguf_mtp;
         order[n++] = &g_pc.row_gguf_vision;
         order[n++] = &g_pc.row_gguf_ple;
-        order[n++] = &g_pc.row_tok;
     } else if (ver == kVerV2) {
         order[n++] = &g_pc.row_model;
         order[n++] = &g_pc.row_ngram;
         order[n++] = &g_pc.row_mtp;
         order[n++] = &g_pc.row_vision;
-        order[n++] = &g_pc.row_tok;
     } else {
         order[n++] = &g_pc.row_model;
         order[n++] = &g_pc.row_overlay;
         order[n++] = &g_pc.row_mtp;
         order[n++] = &g_pc.row_vision;
-        order[n++] = &g_pc.row_tok;
     }
-    const FileRow* all[10] = {&g_pc.row_model,  &g_pc.row_ngram,  &g_pc.row_overlay,
+    order[n++] = &g_pc.row_cvec;
+    order[n++] = &g_pc.row_tok;
+    const FileRow* all[11] = {&g_pc.row_model,  &g_pc.row_ngram,  &g_pc.row_overlay,
                               &g_pc.row_mtp,    &g_pc.row_vision, &g_pc.row_gguf,
                               &g_pc.row_gguf_mtp, &g_pc.row_gguf_vision, &g_pc.row_gguf_ple,
-                              &g_pc.row_tok};
+                              &g_pc.row_cvec, &g_pc.row_tok};
     int y = 76;
     for (int i = 0; i < n; ++i) {
         place_row(*order[i], y, true);
         y += 26;
+        if (order[i] == &g_pc.row_cvec) {
+            // 参数行（模式 / scale / 层区间）紧跟控制向量文件行
+            place(g_pc.cvec_lab, kLblX + g_art_w, y + 3, kLblW, 18,
+                  SWP_SHOWWINDOW | SWP_NOCOPYBITS);
+            place(g_pc.cvec_mode, kEdX + g_art_w, y, 100, 200,
+                  SWP_SHOWWINDOW | SWP_NOCOPYBITS);
+            place(g_pc.cvec_scale, kEdX + 106 + g_art_w, y, 56, 22,
+                  SWP_SHOWWINDOW | SWP_NOCOPYBITS);
+            place(g_pc.cvec_layers, kEdX + 168 + g_art_w, y, 186, 26,
+                  SWP_SHOWWINDOW | SWP_NOCOPYBITS);
+            y += 26;
+        }
     }
     for (const FileRow* r : all) {
         bool shown = false;
@@ -1691,7 +1992,11 @@ void layout_page1(int ver) {
         return r;
     };
     RECT dirty = rect_in_parent(g_pc.tok_hint);
-    RECT tmp = rect_in_parent(g_pc.ver_note);
+    RECT tmp = rect_in_parent(g_pc.cvec_mode);
+    UnionRect(&dirty, &dirty, &tmp);
+    tmp = rect_in_parent(g_pc.cvec_layers);
+    UnionRect(&dirty, &dirty, &tmp);
+    tmp = rect_in_parent(g_pc.ver_note);
     UnionRect(&dirty, &dirty, &tmp);
     tmp = rect_in_parent(g_pc.moe_a4);
     UnionRect(&dirty, &dirty, &tmp);
@@ -1705,7 +2010,7 @@ void layout_page1(int ver) {
     const bool a4_row = ver == kVerV2;
     place(g_pc.moe_a4, kEdX + g_art_w, y + 46, 434, 20,
           SWP_NOCOPYBITS | (a4_row ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
-    const int out_y = a4_row ? y + 72 : 254;
+    const int out_y = y + (a4_row ? 72 : 46);
     place(g_pc.out1, 12 + g_art_w, out_y, 624, kListBottom - out_y,
           SWP_SHOWWINDOW | SWP_NOCOPYBITS);
     SetWindowTextW(g_pc.ver_note, ver == kVerGguf
@@ -1721,6 +2026,10 @@ void layout_page1(int ver) {
     tmp = rect_in_parent(g_pc.ver_note);
     UnionRect(&dirty, &dirty, &tmp);
     tmp = rect_in_parent(g_pc.moe_a4);
+    UnionRect(&dirty, &dirty, &tmp);
+    tmp = rect_in_parent(g_pc.cvec_mode);
+    UnionRect(&dirty, &dirty, &tmp);
+    tmp = rect_in_parent(g_pc.cvec_layers);
     UnionRect(&dirty, &dirty, &tmp);
     tmp = rect_in_parent(g_pc.out1);
     UnionRect(&dirty, &dirty, &tmp);
@@ -2062,6 +2371,16 @@ LRESULT CALLBACK panel_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             case kBrGgufPle:
                 if (panel_browse(g_pc.row_gguf_ple.edit)) panel_recheck();
                 return 0;
+            case kBrCvec:
+                if (panel_browse(g_pc.row_cvec.edit)) panel_recheck();
+                return 0;
+            case kOffCvec:
+                set_optional_row_state(g_pc.row_cvec.off, g_pc.row_cvec.edit,
+                                       g_pc.row_cvec.browse);
+                panel_recheck();
+                return 0;
+            case kCbCvecMode: panel_recheck(); return 0;
+            case kEdCvecLayers: panel_recheck(); return 0;
             case kBrKvsnapDir:
                 if (panel_browse_dir(g_pc.kvsnap_dir,
                                      TR(L"选择 KV 快照目录", L"Select KV snapshot folder")))
@@ -2177,6 +2496,14 @@ PanelResult panel_run() {
         wc.hIcon = cls_big;
         wc.hIconSm = cls_small;
         RegisterClassExW(&wc);
+        // 双端区间滑条（控制向量层区间）：自绘子窗口，无背景刷（自己铺满）
+        WNDCLASSEXW rc2{};
+        rc2.cbSize = sizeof rc2;
+        rc2.lpfnWndProc = rng_proc;
+        rc2.hInstance = hi;
+        rc2.lpszClassName = L"QwenoxRng";
+        rc2.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
+        RegisterClassExW(&rc2);
         registered = true;
     }
     // 先在光标所在显示器上建隐藏窗口，取得该屏 DPI 后再定尺寸、装背景、建控件。
@@ -2275,6 +2602,38 @@ PanelResult panel_run() {
     g_pc.row_gguf_ple = page1_file_row(h, ry, TR(L"PLE 表", L"PLE table"),
                                        kEdGgufPle, kBrGgufPle, kOffGgufPle,
                                        init.gguf_ple, init.no_gguf_ple);
+    ry += 26;
+    // 控制向量（CVEC，见 docs/CVEC.md）：模型资产，与权重版本无关，三种格式都显示。
+    g_pc.row_cvec = page1_file_row(h, ry, TR(L"控制向量", L"Control vector"), kEdCvec, kBrCvec,
+                                   kOffCvec, init.cvec, init.no_cvec);
+    ry += 26;
+    // 参数行：模式 / scale / 层区间（一行三控件，给检查列表留空间）
+    g_pc.cvec_lab = plabel(0, h, kLblX, ry, TR(L"模式/scale/层", L"Mode/scale/layers"));
+    g_pc.cvec_mode = pctl(0, h, L"ComboBox", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, kEdX, ry,
+                          110, 200, L"", kCbCvecMode);
+    SendMessageW(g_pc.cvec_mode, CB_ADDSTRING, 0,
+                 reinterpret_cast<LPARAM>(TR(L"project 投影", L"project (ablation)")));
+    SendMessageW(g_pc.cvec_mode, CB_ADDSTRING, 0,
+                 reinterpret_cast<LPARAM>(TR(L"add 加法", L"add (steering)")));
+    SendMessageW(g_pc.cvec_mode, CB_SETCURSEL, init.cvec_mode == "add" ? 1 : 0, 0);
+    g_pc.cvec_scale = pctl(0, h, L"Edit", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kEdX + 116, ry,
+                           64, 22, L"", kEdCvecScale);
+    set_edit(g_pc.cvec_scale, init.cvec_scale);
+    // 双端滑条（自绘）：显示 "lo – hi"，落盘仍是 "lo hi"
+    g_pc.cvec_layers = pctl(0, h, L"QwenoxRng", WS_TABSTOP, kEdX + 168, ry, 186, 26, L"",
+                            kEdCvecLayers);
+    {
+        int lo = 4, hi = 44;
+        const std::string& cl = init.cvec_layers;
+        const size_t sp = cl.find_first_of(" ,");
+        long a = 4, b = 44;
+        if (sp != std::string::npos && svcconf::parse_int(svcconf::trim(cl.substr(0, sp)), &a) &&
+            svcconf::parse_int(svcconf::trim(cl.substr(sp + 1)), &b) && a >= 1 && b >= a && b <= 47) {
+            lo = (int)a;
+            hi = (int)b;
+        }
+        rng_set(g_pc.cvec_layers, lo, hi);
+    }
     ry += 26;
     g_pc.row_tok = page1_file_row(h, ry, L"tokenizer", kEdTok, 0, 0, init.tok, false);
     g_pc.tok_hint = pctl(0, h, L"Static", SS_LEFTNOWORDWRAP, kEdX, 210, 434, 18,

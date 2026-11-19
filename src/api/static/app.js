@@ -128,6 +128,7 @@ const I18N = {
     "cfg.hint": "保存写入 service.conf（原内容备份为 .bak），下次启动引擎时生效；运行中的引擎与 API 端口不受影响。环境变量覆盖的键已置灰。",
     "cfg.grp_weights": "权重文件", "cfg.grp_ctx": "推理设置", "cfg.grp_net": "端口与监听",
     "cfg.aff_off": "不限制（默认）", "cfg.aff_ccd0": "钉到 CCD 0", "cfg.aff_ccd1": "钉到 CCD 1",
+    "cfg.cvec_project": "project（投影消融，默认）", "cfg.cvec_add": "add（加法引导）",
     "cfg.weights_ver": "权重版本",
     "cfg.ver_v1": "V1（单文件，n-gram 内嵌主权重）",
     "cfg.ver_v2": "V2（主权重 + 独立 n-gram 文件）",
@@ -266,6 +267,7 @@ const I18N = {
       "Keys overridden by environment variables are disabled.",
     "cfg.grp_weights": "Weight files", "cfg.grp_ctx": "Inference", "cfg.grp_net": "Ports & listen",
     "cfg.aff_off": "Unrestricted (default)", "cfg.aff_ccd0": "Pin to CCD 0", "cfg.aff_ccd1": "Pin to CCD 1",
+    "cfg.cvec_project": "project (ablation, default)", "cfg.cvec_add": "add (steering)",
     "cfg.weights_ver": "Weights version",
     "cfg.ver_v1": "V1 (single file, n-gram embedded)",
     "cfg.ver_v2": "V2 (main weights + separate n-gram)",
@@ -1613,14 +1615,16 @@ async function renderRequests(force) {
 const CFG_GROUPS = [
   { title: "cfg.grp_weights", keys: ["MODEL_FILE", "NGRAM_FILE", "OVERLAY_FILE",
       "MTP_FILE", "VISION_FILE", "GGUF_FILE", "GGUF_MTP_FILE", "GGUF_VISION_FILE",
-      "TOKENIZER_DIR"] },
+      "CVEC", "CVEC_MODE", "CVEC_SCALE", "CVEC_LAYERS", "TOKENIZER_DIR"] },
   { title: "cfg.grp_ctx", keys: ["MAX_CONTEXT", "PARALLEL", "KV_POOL_TOKENS", "KV_PAGED",
       "PREFILL_CHUNK", "QSA_INDEXER_BUDGET", "ROPE_FACTOR", "KVSNAP_MAX_GB", "AFFINITY"] },
   { title: "cfg.grp_net", keys: ["ENGINE_HOST", "ENGINE_PORT", "API_HOST", "API_PORT"] },
 ];
 // 权重组键带"浏览"弹窗（数据来自 /admin/files，仍可手输）：
 // TOKENIZER_DIR 选目录，其余选文件。
-const CFG_FILE_KEYS = new Set(CFG_GROUPS[0].keys);
+// 权重组里真正带"浏览"弹窗的键（CVEC_MODE/SCALE/LAYERS 不是路径）。
+const CFG_FILE_KEYS = new Set(CFG_GROUPS[0].keys.filter(
+  (k) => !["CVEC_MODE", "CVEC_SCALE", "CVEC_LAYERS"].includes(k)));
 // 权重版本 → 该版本相关的权重键（与旧托盘面板语义一致；TOKENIZER_DIR 各版本通用）。
 // V1：n-gram 内嵌主权重（保存时 NGRAM_FILE 由服务端固定为 $MODEL_FILE）；
 // V2：独立 n-gram 文件（OVERLAY_FILE 由服务端置空）；GGUF：只有 GGUF_* 三键。
@@ -1635,6 +1639,9 @@ const engEl = (id) => document.getElementById(id);
 let cfgBuilt = false, cfgDirty = false, engTimer = null, engLastStatus = null;
 let cfgVer = "v1";     // 当前选中的权重版本（GET /admin/config 的 weights_ver）
 const cfgInputs = {};  // key -> input/select
+// 控制向量与权重版本无关（三种格式通用），始终显示在权重组、始终参与保存。
+const CFG_CVEC_KEYS = ["CVEC", "CVEC_MODE", "CVEC_SCALE", "CVEC_LAYERS"];
+const cfgRangeSync = {};  // key -> () => void：双端滑条从 cfgInputs[key].value 重绘
 const cfgBadges = {};  // key -> env 覆盖徽章
 const cfgRows = {};    // key -> 行元素（权重版本切换时隐藏无关行）
 
@@ -1697,6 +1704,100 @@ function buildCfgForm() {
           o.textContent = t(k);
           inp.appendChild(o);
         }
+      } else if (key === "CVEC_MODE") {
+        // 控制向量模式（docs/CVEC.md）：project 投影消融 / add 加法引导
+        inp = document.createElement("select");
+        for (const [v, k] of [["project", "cfg.cvec_project"], ["add", "cfg.cvec_add"]]) {
+          const o = document.createElement("option");
+          o.value = v;
+          o.textContent = t(k);
+          inp.appendChild(o);
+        }
+      } else if (key === "CVEC_LAYERS") {
+        // 双端区间滑条：值仍以 "lo hi" 字符串保存（cfgInputs 里是隐藏 input）。
+        const MN = 1, MX = 47;
+        const hid = document.createElement("input");
+        hid.type = "hidden";
+        inp = hid;
+        const pct = (x) => ((x - MN) / (MX - MN)) * 100;
+        const wrap = document.createElement("div");
+        wrap.style.cssText = "position:relative;height:26px;width:100%;min-width:160px";
+        const rail = document.createElement("div");
+        rail.style.cssText = "position:absolute;left:8px;right:8px;top:11px;height:4px;" +
+          "border-radius:2px;background:var(--line2, #6b7793)";
+        const fill = document.createElement("div");
+        fill.style.cssText = "position:absolute;top:0;bottom:0;border-radius:2px;" +
+          "background:var(--accent, #7aa2f0)";
+        const mk = (v) => {
+          const r = document.createElement("input");
+          r.type = "range"; r.min = MN; r.max = MX; r.step = 1; r.value = v;
+          r.style.cssText = "position:absolute;left:0;right:0;top:0;width:100%;height:26px;" +
+            "margin:0;background:transparent;pointer-events:none;-webkit-appearance:none;" +
+            "appearance:none";
+          return r;
+        };
+        const inLo = mk(4), inHi = mk(44);
+        const val = document.createElement("span");
+        val.style.cssText = "font-size:12px;color:var(--ink-mid, #9aa6c0);margin-left:6px";
+        // 拇指可拖、轨道不拦截：Webkit 需要给 ::-webkit-slider-thumb 开 pointer-events，
+        // 这里用容器注入一段样式（id 去重）。
+        if (!document.getElementById("cfg-range-style")) {
+          const st = document.createElement("style");
+          st.id = "cfg-range-style";
+          st.textContent =
+            ".cfg-range input[type=range]::-webkit-slider-runnable-track{background:transparent;height:26px}" +
+            ".cfg-range input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;pointer-events:auto;" +
+            "width:16px;height:16px;margin-top:5px;border-radius:50%;background:var(--accent,#7aa2f0);" +
+            "border:2px solid #0b1020;cursor:pointer}" +
+            ".cfg-range input[type=range]::-moz-range-track{background:transparent;height:26px}" +
+            ".cfg-range input[type=range]::-moz-range-thumb{pointer-events:auto;width:14px;height:14px;" +
+            "border-radius:50%;background:var(--accent,#7aa2f0);border:2px solid #0b1020;cursor:pointer}" +
+            ".cfg-range input[type=range]:disabled::-webkit-slider-thumb{background:#6b7793;cursor:default}";
+          document.head.appendChild(st);
+        }
+        wrap.classList.add("cfg-range");
+        const parse = (v) => {
+          const q = String(v || "").trim().split(/[\s,]+/).map(Number);
+          let lo = q[0], hi = q[1];
+          if (!(lo >= MN && lo <= MX)) lo = 4;
+          if (!(hi >= MN && hi <= MX)) hi = 44;
+          if (lo > hi) { const x = lo; lo = hi; hi = x; }
+          return [lo, hi];
+        };
+        const paint = (lo, hi) => {
+          fill.style.left = pct(lo) + "%";
+          fill.style.width = (pct(hi) - pct(lo)) + "%";
+          val.textContent = lo + " – " + hi;
+          // 低端过中线后置顶，保证两端在重叠区间内都还能抓到
+          const loFront = pct(lo) > 50;
+          inLo.style.zIndex = loFront ? 3 : 2;
+          inHi.style.zIndex = loFront ? 2 : 3;
+        };
+        const commit = (lo, hi) => {
+          paint(lo, hi);
+          hid.value = lo + " " + hi;
+          markCfgDirty();
+        };
+        inLo.addEventListener("input", () => {
+          const lo = Math.min(+inLo.value, +inHi.value);
+          inLo.value = lo; paint(lo, +inHi.value);
+        });
+        inHi.addEventListener("input", () => {
+          const hi = Math.max(+inHi.value, +inLo.value);
+          inHi.value = hi; paint(+inLo.value, hi);
+        });
+        inLo.addEventListener("change", () => commit(+inLo.value, +inHi.value));
+        inHi.addEventListener("change", () => commit(+inLo.value, +inHi.value));
+        cfgRangeSync[key] = () => {
+          const [lo, hi] = parse(hid.value);
+          inLo.value = lo; inHi.value = hi; paint(lo, hi);
+          inLo.disabled = inHi.disabled = hid.disabled;
+        };
+        rail.append(fill);
+        wrap.append(rail, inLo, inHi);
+        row.classList.add("cfg-row-range");
+        inp.dataset.rangeWrap = "1";
+        row._rangeNodes = { wrap, val };
       } else if (key === "AFFINITY") {
         // 三态：不限制 / CCD 0 / CCD 1（落盘值 "" / "lower-half" / "upper-half"）
         inp = document.createElement("select");
@@ -1729,6 +1830,9 @@ function buildCfgForm() {
         browse.addEventListener("click", () => openFilePicker(key));
         wrap.append(inp, browse);
         row.append(lab, wrap);
+      } else if (row._rangeNodes) {
+        row.append(lab, row._rangeNodes.wrap, row._rangeNodes.val);
+        delete row._rangeNodes;
       } else {
         row.append(lab, inp);
       }
@@ -1750,7 +1854,8 @@ function markCfgDirty() {
 
 // 按权重版本显示/隐藏权重键行（TOKENIZER_DIR 各版本通用）。
 function applyWeightsVer() {
-  const vis = new Set([...(CFG_VER_KEYS[cfgVer] || []), "TOKENIZER_DIR"]);
+  // 控制向量与权重版本无关（三种格式通用），始终显示在权重组。
+  const vis = new Set([...(CFG_VER_KEYS[cfgVer] || []), "TOKENIZER_DIR", ...CFG_CVEC_KEYS]);
   for (const key of CFG_FILE_KEYS)
     if (cfgRows[key]) cfgRows[key].classList.toggle("hidden", !vis.has(key));
 }
@@ -1897,6 +2002,7 @@ async function loadConfig() {
       inp.disabled = envOvr;
       cfgBadges[key].classList.toggle("hidden", !envOvr);
     }
+    for (const k of Object.keys(cfgRangeSync)) cfgRangeSync[k]();
     cfgVer = CFG_VER_KEYS[j.weights_ver] ? j.weights_ver : "v1";
     engEl("cfg-weights-ver").value = cfgVer;
     applyWeightsVer();
@@ -1911,7 +2017,7 @@ async function loadConfig() {
 
 async function postConfig() {
   const values = {};
-  const vis = new Set([...(CFG_VER_KEYS[cfgVer] || []), "TOKENIZER_DIR"]);
+  const vis = new Set([...(CFG_VER_KEYS[cfgVer] || []), "TOKENIZER_DIR", ...CFG_CVEC_KEYS]);
   for (const key of Object.keys(cfgInputs)) {
     if (cfgInputs[key].disabled) continue;
     if (CFG_FILE_KEYS.has(key) && !vis.has(key)) continue;  // 非当前版本的权重键不发送

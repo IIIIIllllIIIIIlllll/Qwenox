@@ -523,7 +523,7 @@ private:
 
 using Values = std::map<std::string, std::string>;
 
-enum class FieldKind { kText, kBool, kChoice };
+enum class FieldKind { kText, kBool, kChoice, kRange };
 enum class FieldGroup { kAlways, kHgn, kV1, kV2, kGguf };
 struct Option {
     const char* value;
@@ -597,6 +597,18 @@ const std::vector<Field>& field_specs() {
          "KV cache type", "bf16 = default; fp16 = finer mantissa, same row size; q8 = saves memory",
          FieldKind::kChoice, FieldGroup::kAlways,
          {{"bf16", "bf16（默认）", "bf16 (default)"}, {"fp16", "fp16（半精度）", "fp16 (half precision)"}, {"q8", "q8（省显存）", "q8 (saves memory)"}}},
+        {0, "CVEC", "控制向量", "llama.cpp 控制向量 GGUF；留空表示关闭（见 docs/CVEC.md）",
+         "Control vector", "llama.cpp control-vector GGUF; empty = off (see docs/CVEC.md)",
+         FieldKind::kText, FieldGroup::kAlways, {}},
+        {0, "CVEC_MODE", "控制向量模式", "project 投影消融（默认）；add 加法引导",
+         "CVEC mode", "project = ablation (default); add = steering",
+         FieldKind::kChoice, FieldGroup::kAlways,
+         {{"project", "project（投影）", "project (ablation)"}, {"add", "add（加法）", "add (steering)"}}},
+        {0, "CVEC_SCALE", "控制向量 scale", "project 用 1.0；add 用 0.05–0.15",
+         "CVEC scale", "1.0 for project; 0.05-0.15 for add", FieldKind::kText, FieldGroup::kAlways, {}},
+        {0, "CVEC_LAYERS", "控制向量层区间", "双端调节：←/→ 移动，Tab 换端，Enter 确认；1–47",
+         "CVEC layer range", "Two-ended: Left/Right move, Tab switches end, Enter commits; 1-47",
+         FieldKind::kRange, FieldGroup::kAlways, {}},
         {1, "PREFILL_CHUNK", "prefill 分段", "0：Linux 默认 16384，Windows 默认 6144",
          "Prefill chunk", "0: Linux default 16384, Windows default 6144",
          FieldKind::kText, FieldGroup::kAlways, {}},
@@ -731,6 +743,10 @@ struct Model {
         values["KV_POOL_TOKENS"] = svcconf::cfg(conf, "KV_POOL_TOKENS", "0");
         values["KV_PAGED"] = svcconf::cfg(conf, "KV_PAGED", "1");
         values["KV_TYPE"] = svcconf::cfg(conf, "KV_TYPE", "bf16");
+        values["CVEC"] = svcconf::cfg_optional(conf, "CVEC", "");
+        values["CVEC_MODE"] = svcconf::cfg(conf, "CVEC_MODE", "project");
+        values["CVEC_SCALE"] = svcconf::cfg(conf, "CVEC_SCALE", "1.0");
+        values["CVEC_LAYERS"] = svcconf::cfg(conf, "CVEC_LAYERS", "4 44");
         values["PREFILL_CHUNK"] = svcconf::cfg(conf, "PREFILL_CHUNK", "0");
         values["CONC_PREFILL_CHUNK"] = svcconf::cfg(conf, "CONC_PREFILL_CHUNK", "8192");
         values["QSA_INDEXER_BUDGET"] = svcconf::cfg(conf, "QSA_INDEXER_BUDGET", "0");
@@ -780,6 +796,10 @@ struct Model {
             out["MTP_FILE"] = get("MTP_FILE");
             out["VISION_FILE"] = get("VISION_FILE");
         }
+        // 控制向量（CVEC*）在权重页但三种权重格式通用：权重分支只写各自的文件键，
+        // 这里显式补齐（循环跳过 page==0 的字段）。
+        for (const char* k : {"CVEC", "CVEC_MODE", "CVEC_SCALE", "CVEC_LAYERS"})
+            out[k] = get(k);
         for (const Field& f : field_specs()) {
             const std::string key = f.key;
             if (key == "#WEIGHTS" || f.page == 0 || key == "GGUF_I4R_PATCH") continue;
@@ -1031,6 +1051,26 @@ std::vector<Check> validate(const Model& model) {
                 "QSA_INDEXER_BUDGET only accepts 0 (default 2048) or 4096"));
     if (model.get("KV_TYPE") != "bf16" && model.get("KV_TYPE") != "fp16" && model.get("KV_TYPE") != "q8")
         fail(TR("KV_TYPE 只允许 bf16、fp16 或 q8", "KV_TYPE only accepts bf16, fp16 or q8"));
+    // 控制向量（CVEC，见 docs/CVEC.md）：留空 = 关闭；非空时校验文件/模式/scale/层区间。
+    if (!model.get("CVEC").empty()) {
+        check_file(TR("控制向量", "Control vector"), model.get("CVEC"), false, false, "GGUF");
+        if (model.get("CVEC_MODE") != "project" && model.get("CVEC_MODE") != "add")
+            fail(TR("CVEC_MODE 只允许 project 或 add", "CVEC_MODE only accepts project or add"));
+        double cscale = 0;
+        if (!strict_double(model.get("CVEC_SCALE"), &cscale) || cscale <= 0)
+            fail(TR("CVEC_SCALE 必须是大于 0 的有限小数", "CVEC_SCALE must be a finite number > 0"));
+        const std::string cl = model.get("CVEC_LAYERS");
+        const size_t sp = cl.find_first_of(" ,");
+        long clo = -1, chi = -1;
+        if (sp == std::string::npos ||
+            !strict_int(svcconf::trim(cl.substr(0, sp)), &clo) ||
+            !strict_int(svcconf::trim(cl.substr(sp + 1)), &chi) || clo < 1 || chi < clo || chi > 47)
+            fail(TR("CVEC_LAYERS 必须是 \"<起> <止>\"，1<=起<=止<=47",
+                    "CVEC_LAYERS must be \"<lo> <hi>\" with 1 <= lo <= hi <= 47"));
+        if (model.get("CVEC_MODE") == "add")
+            warn(TR("CVEC add 模式：配合 -refusal-additive.gguf、层 16 32、scale 0.05–0.15",
+                    "CVEC add mode: use with -refusal-additive.gguf, layers 16 32, scale 0.05-0.15"));
+    }
     if (model.get("MOE_A4") < "0" || model.get("MOE_A4") > "3" || model.get("MOE_A4").size() != 1)
         fail(TR("MOE_A4 只允许 0、1、2、3", "MOE_A4 only accepts 0, 1, 2 or 3"));
 
@@ -1208,6 +1248,11 @@ private:
         if (f.kind == FieldKind::kChoice) {
             for (const Option& option : f.options)
                 if (value == option.value) return option.text();
+        }
+        if (f.kind == FieldKind::kRange) {
+            int lo = 4, hi = 44;
+            parse_range(value, &lo, &hi);
+            return range_bar(lo, hi, range_edit_ ? range_active_ : 0);
         }
         return value.empty() ? TR("（空）", "(empty)") : value;
     }
@@ -1402,7 +1447,10 @@ private:
                     const int value_x = 2 + label_width + 1;
                     const int value_width = std::max(4, w - value_x - 1);
                     std::string value = display_value(f);
-                    if (selected && editing_) {
+                    if (selected && editing_ && range_edit_) {
+                        value = range_bar(range_lo_, range_hi_, range_active_);
+                        value = clip_text(value, value_width, true);
+                    } else if (selected && editing_) {
                         const std::string& raw = model_.values[edit_key_];
                         const auto off = utf8_offsets(raw);
                         edit_cursor_ = std::min(edit_cursor_, off.size() - 1);
@@ -1525,7 +1573,9 @@ private:
         }
         line(h - 2, TR("↑↓选择  ←→/数字翻页  Enter编辑/切换  Tab下一项  F2/Ctrl+S保存  Esc退出",
                        "↑↓ select  ←→/1-6 pages  Enter edit/toggle  Tab next  F2/Ctrl+S save  Esc quit"), "\x1b[2m");
-        line(h - 1, editing_ ? TR("编辑中：路径按 Tab 补全/循环，Enter 接受/确认，←→移动，Ctrl+U清空，Esc取消",
+        line(h - 1, range_edit_ ? TR("区间调节中：←/→ 移动当前端，↑/↓ 一次 5 层，Tab 换端，Enter 确认，Esc 取消",
+                                     "Range: Left/Right move the active end, Up/Down by 5, Tab switches end, Enter commits, Esc cancels")
+                   : editing_ ? TR("编辑中：路径按 Tab 补全/循环，Enter 接受/确认，←→移动，Ctrl+U清空，Esc取消",
                                   "Editing: Tab completes/cycles paths, Enter accepts, ←→ move, Ctrl+U clears, Esc cancels")
                              : TR("本工具只修改 service.conf；保存后重启服务生效，不启动引擎或 API。",
                                   "Only service.conf is modified; restart the service after saving. The engine or API is never started."),
@@ -1613,6 +1663,19 @@ private:
     void activate() {
         const Field* f = selected_field();
         if (!f) return;
+        if (f->kind == FieldKind::kRange) {
+            editing_ = true;
+            range_edit_ = true;
+            range_active_ = 2;
+            range_lo_ = 4;
+            range_hi_ = 44;
+            parse_range(model_.get(f->key), &range_lo_, &range_hi_);
+            edit_key_ = f->key;
+            edit_original_ = model_.get(f->key);
+            status_ = TR("←/→ 移动当前端（1 层），Tab 切换端点，Enter 确认，Esc 取消",
+                         "Left/Right move the active end by 1, Tab switches ends, Enter commits, Esc cancels");
+            return;
+        }
         if (f->kind == FieldKind::kText) {
             editing_ = true;
             completion_ = CompletionState{};
@@ -1636,6 +1699,56 @@ private:
         if (std::string(f->key) == "#WEIGHTS") selected_[0] = top_[0] = 0;
     }
 
+    void handle_range_edit(const Key& key) {
+        const int mn = 1, mx = 47;
+        if (key.type == KeyType::kSave) {
+            commit_range();
+            request_save();
+            return;
+        }
+        if (key.type == KeyType::kEscape || key.type == KeyType::kQuit) {
+            model_.values[edit_key_] = edit_original_;
+            range_edit_ = false;
+            editing_ = false;
+            status_.clear();
+            refresh_checks();
+            return;
+        }
+        if (key.type == KeyType::kEnter) {
+            commit_range();
+            return;
+        }
+        if (key.type == KeyType::kTab || key.type == KeyType::kBackTab) {
+            range_active_ = range_active_ == 1 ? 2 : 1;
+            return;
+        }
+        int delta = 0;
+        if (key.type == KeyType::kLeft) delta = -1;
+        else if (key.type == KeyType::kRight) delta = 1;
+        else if (key.type == KeyType::kUp) delta = 5;
+        else if (key.type == KeyType::kDown) delta = -5;
+        else return;
+        if (range_active_ == 1) {
+            range_lo_ = std::max(mn, std::min(range_hi_, range_lo_ + delta));
+        } else {
+            range_hi_ = std::max(range_lo_, std::min(mx, range_hi_ + delta));
+        }
+        model_.values[edit_key_] =
+            std::to_string(range_lo_) + " " + std::to_string(range_hi_);
+        refresh_checks();
+    }
+
+    void commit_range() {
+        if (!range_edit_) return;
+        range_edit_ = false;
+        editing_ = false;
+        const std::string final_v = std::to_string(range_lo_) + " " + std::to_string(range_hi_);
+        model_.values[edit_key_] = final_v;
+        if (final_v != edit_original_) changed();
+        else refresh_checks();
+        status_.clear();
+    }
+
     void commit_edit(bool move_next = false) {
         if (!editing_) return;
         editing_ = false;
@@ -1646,6 +1759,10 @@ private:
     }
 
     void handle_edit(const Key& key) {
+        if (range_edit_) {
+            handle_range_edit(key);
+            return;
+        }
         if (key.type == KeyType::kSave) {
             commit_edit();
             request_save();
@@ -1767,6 +1884,33 @@ private:
     bool running_ = false;
     bool dirty_ = false;
     bool editing_ = false;
+    // 双端区间编辑（CVEC_LAYERS）：range_active_ 1 = 低端，2 = 高端
+    bool range_edit_ = false;
+    int range_lo_ = 4, range_hi_ = 44, range_active_ = 2;
+    static bool parse_range(const std::string& v, int* lo, int* hi) {
+        const size_t sp = v.find_first_of(" ,");
+        long a = 4, b = 44;
+        if (sp == std::string::npos || !svcconf::parse_int(svcconf::trim(v.substr(0, sp)), &a) ||
+            !svcconf::parse_int(svcconf::trim(v.substr(sp + 1)), &b))
+            return false;
+        if (a < 1 || b < a || b > 47) return false;
+        *lo = static_cast<int>(a);
+        *hi = static_cast<int>(b);
+        return true;
+    }
+    static std::string range_bar(int lo, int hi, int active) {
+        // 30 格条：两端之间上色，端点用 ▲/▼ 标出当前可调的一端
+        const int cells = 30, mn = 1, mx = 47;
+        const int cl = (lo - mn) * (cells - 1) / (mx - mn);
+        const int ch = (hi - mn) * (cells - 1) / (mx - mn);
+        std::string out;
+        for (int i = 0; i < cells; ++i) {
+            if (i == cl) out += active == 1 ? "◆" : "●";
+            else if (i == ch) out += active == 2 ? "◆" : "●";
+            else out += (i > cl && i < ch) ? "━" : "─";
+        }
+        return out + "  " + std::to_string(lo) + "–" + std::to_string(hi);
+    }
     std::string edit_key_, edit_original_;
     size_t edit_cursor_ = 0, edit_scroll_ = 0;
     CompletionState completion_;
