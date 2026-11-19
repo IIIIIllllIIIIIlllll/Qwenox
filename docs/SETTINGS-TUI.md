@@ -108,7 +108,9 @@ Windows 匹配不区分大小写并接受两种路径分隔符，Linux 保持大
 
 界面分为六页：
 
-1. **权重**：hgn v1 / v2 / GGUF、主模型、n-gram、overlay、MTP、视觉塔、GGUF i4r 补丁、tokenizer。
+1. **权重**：hgn v1 / v2 / GGUF、主模型、n-gram、overlay、MTP、视觉塔、GGUF i4r 补丁、
+   控制向量（`CVEC` 文件与模式/scale/层区间，三种权重格式通用，见 [CVEC.md](CVEC.md)）、tokenizer。
+   层区间是双端条：Enter 进入，`←/→` 移动当前端、`↑/↓` 一次 5 层、`Tab` 换端、Enter 确认。
 2. **推理**：上下文、并发、KV 页池、prefill 分段、QSA、YaRN、MOE_A4、MTP gamma、图片上限。
 3. **缓存/启动**：SSD/RAM 检查点、PLE io_uring、Linux 内存与超时、Windows CPU 亲和性。
 4. **端口/日志**：引擎与 API 地址、运行时可视化、完整请求日志。

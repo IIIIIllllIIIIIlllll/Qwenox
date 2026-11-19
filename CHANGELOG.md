@@ -2,6 +2,21 @@
 
 版本号记在根目录 `VERSION` 文件里，编译时写进程序。查看当前版本有三种方式：托盘菜单第一行、控制台总览页"版本"、`GET /health` 返回的 `version` 字段。引擎本身可以运行 `qwenox-engine-win.exe --version`。
 
+## 未发布
+
+### 新功能
+
+- **控制向量（CVEC）**：引擎可直接加载 llama.cpp 控制向量 GGUF（如
+  `Qwen3.8-Flash-Next-refusal-projection.gguf`），在每层 HC 残差上做投影消融
+  （`h -= s·(h·v)·v`，默认）或加法引导（`h += s·v`），不改权重；参数为
+  `CVEC` / `CVEC_MODE` / `CVEC_SCALE` / `CVEC_LAYERS`（默认 `4 44`），另有
+  `QWENOX_CVEC_DIR` / `QWENOX_CVEC_PROBE`。语义与 Cudila/llama.cpp 的 cvec-hooks 分支对齐：
+  project 加载时单位化并把原范数并入 scale、张量 `direction.K` 用于第 K 层、闭区间、MTP/DFlash2
+  草稿头不另加向量。接入 service.conf、Linux/Windows 启动器、三处设置界面与 API 控制台；
+  prefill 的投影折进已有的“HC 写回 + norm”融合 kernel（写与 norm 之间一次块内 dot，
+  不增加残差流量），因此融合写保持开启，8K prefill 实测在噪声内（1183 vs 1176 tok/s）；
+  快照指纹混入向量内容。见 [CVEC.md](docs/CVEC.md)，内核回归在 `bash build_win.sh test`。
+
 ## v0.1.2 — 2026-11-12
 
 ### 新功能
