@@ -3208,11 +3208,14 @@ struct GpuModel {
     for (float* p : {x, lg1, xr1, xr2, w1, w2, acc, ey, sg, o1, o2, tmp}) CK(hipFree(p));
     for (int* p : {i1, i2}) CK(hipFree(p));
   }
-  // ---- shared expert || routed experts (QWENOX_SE_PAR, default on; =0 off) --
+  // ---- shared expert || routed experts (QWENOX_SE_PAR) ---------------------
   // P=1 decode only. The shared expert reads x alone; its result meets the
   // routed sum in k_axpy_sg_out. Same kernels, private gate/up/hid buffers
   // (the routed path uses d_guv/d_hid) -> bit-identical. No ht split-K
   // scratch (g_ht_zs/g_ht_cnt) user runs on the main stream inside the window.
+  // Windows graph execution can fall back with this cross-stream path, so
+  // Windows defaults off; QWENOX_SE_PAR=1 restores the old behavior. Linux
+  // defaults on, and QWENOX_SE_PAR=0 disables it on both platforms.
   hipStream_t se_st_ = nullptr;
   hipEvent_t se_fork_ev_ = nullptr, se_join_ev_ = nullptr;
   float* d_se_guv = nullptr;
@@ -3220,7 +3223,12 @@ struct GpuModel {
   float* d_se_ey = nullptr;  // moe_v2_1 uses d_ey as its x-rotation scratch
   float* d_se_sg = nullptr;
   void se_par_init() {
+#ifdef _WIN32
+    const char* se_par = getenv("QWENOX_SE_PAR");
+    if (!se_par || strcmp(se_par, "1") != 0) return;
+#else
     if (env_zero("QWENOX_SE_PAR")) return;
+#endif
     CK(hipStreamCreateWithFlags(&se_st_, hipStreamNonBlocking));
     CK(hipEventCreateWithFlags(&se_fork_ev_, hipEventDisableTiming));
     CK(hipEventCreateWithFlags(&se_join_ev_, hipEventDisableTiming));
