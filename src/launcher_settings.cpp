@@ -1,6 +1,6 @@
 // launcher_settings.cpp — launcher_settings：API/引擎之前的网页启动器。
 // 双击 start_win.exe（Windows）或运行 ./launcher_settings（Linux）后占用一个端口
-// （默认 127.0.0.1:8729，service.conf 的 LAUNCHER_HOST/LAUNCHER_PORT 可改）提供
+// （默认 0.0.0.0:8729，service.conf 的 LAUNCHER_HOST/LAUNCHER_PORT 可改）提供
 // 配置页：编辑 service.conf（权重/参数，与 settings_win.exe、API 网页控制台共用
 // svcconf 读写层与校验），点启动后才拉起 API + 引擎。
 // Windows 上是托盘程序（结构同 qwenox-win 的 tray_win.cpp：主线程托盘消息循环 +
@@ -2720,7 +2720,7 @@ int main(int argc, char** argv) {
             fprintf(stderr,
                     "launcher_settings：Qwenox 网页启动器\n"
                     "用法：launcher_settings [--host H] [--port N] [--no-browser]\n"
-                    "默认监听 127.0.0.1:8729（service.conf 的 LAUNCHER_HOST/"
+                    "默认监听 0.0.0.0:8729（service.conf 的 LAUNCHER_HOST/"
                     "LAUNCHER_PORT 可改）。\n");
             return 0;
         } else {
@@ -2750,7 +2750,7 @@ int main(int argc, char** argv) {
             host = e;
         } else {
             std::lock_guard<std::mutex> lk(g_conf_mtx);
-            host = svcconf::cfg(g_conf, "LAUNCHER_HOST", "127.0.0.1");
+            host = svcconf::cfg(g_conf, "LAUNCHER_HOST", "0.0.0.0");
         }
     }
     if (port <= 0) {
