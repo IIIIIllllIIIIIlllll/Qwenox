@@ -1790,6 +1790,207 @@ __global__ void k_q4cp_gemv_gg(const uint8_t* __restrict__ codes,
   }
 }
 
+// diagnostic (QWENOX_MOE_UNIQ): hist[P*161 + D] += 1, D = distinct expert ids among P*k slots
+__global__ void k_moe_uniq_hist(const int* __restrict__ ids, int P, int k, int id_stride,
+                                unsigned* __restrict__ hist) {
+  __shared__ unsigned char seen[512];
+  for (int i = threadIdx.x; i < 512; i += blockDim.x) seen[i] = 0;
+  __syncthreads();
+  for (int i = threadIdx.x; i < P * k; i += blockDim.x) seen[ids[(i / k) * id_stride + (i % k)] & 511] = 1;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    int d = 0;
+    for (int i = 0; i < 512; i++) d += seen[i];
+    if (P <= 16) atomicAdd(hist + P * 161 + d, 1u);
+  }
+}
+
+// ---- expert-grouped verify gate_up (QWENOX_MOE_GG) -------------------------
+// k_moe_group: one block. Sort the n = P*k slots by (expert, slot) and cut runs:
+// group g = expert gexp[g] with gn[g] slots gsl[g*16 + 0..gn-1] (ascending slot,
+// hence ascending token; a token's top-k experts are distinct so gn <= P <= 16).
+__global__ void k_moe_group(const int* __restrict__ ids, int P, int k, int id_stride,
+                            int* __restrict__ gexp, int* __restrict__ gn,
+                            int* __restrict__ gsl, int* __restrict__ ngrp) {
+  __shared__ unsigned keys[256];
+  const int n = P * k, t = threadIdx.x;
+  int m = 1;
+  while (m < n) m <<= 1;
+  for (int i = t; i < m; i += blockDim.x)
+    keys[i] = i < n ? ((unsigned)ids[(i / k) * id_stride + (i % k)] << 8) | (unsigned)i : 0xFFFFFFFFu;
+  __syncthreads();
+  for (int size = 2; size <= m; size <<= 1)
+    for (int stride = size >> 1; stride > 0; stride >>= 1) {
+      for (int i = t; i < m; i += blockDim.x) {
+        const int j = i ^ stride;
+        if (j > i) {
+          const bool up = (i & size) == 0;
+          const unsigned a = keys[i], b = keys[j];
+          if ((a > b) == up) { keys[i] = b; keys[j] = a; }
+        }
+      }
+      __syncthreads();
+    }
+  if (t == 0) {
+    int g = -1, last = -1;
+    for (int i = 0; i < n; i++) {
+      const int e = (int)(keys[i] >> 8);
+      if (e != last) { g++; last = e; gexp[g] = e; gn[g] = 0; }
+      gsl[g * 16 + gn[g]++] = (int)(keys[i] & 0xFFu);
+    }
+    *ngrp = g + 1;
+  }
+}
+
+// Same output as k_moe_group (groups by ascending expert, slots ascending),
+// by counting: cnt[e] via LDS atomics, group index = number of present experts
+// below e (block scan of the 512 flags), rank in group = earlier slots with the
+// same expert. blockDim 256, n = P*k <= 256, 512 experts.
+__global__ __launch_bounds__(256) void k_moe_group2(const int* __restrict__ ids, int P, int k,
+                                                    int id_stride, int* __restrict__ gexp,
+                                                    int* __restrict__ gn, int* __restrict__ gsl,
+                                                    int* __restrict__ ngrp) {
+  __shared__ int cnt[512];
+  __shared__ int gid[512];
+  __shared__ int es[256];
+  __shared__ int wsum[8];
+  const int t = threadIdx.x, n = P * k;
+  cnt[t] = 0;
+  cnt[t + 256] = 0;
+  __syncthreads();
+  int e = -1;
+  if (t < n) {
+    e = ids[(t / k) * id_stride + (t % k)] & 511;
+    es[t] = e;
+    atomicAdd(&cnt[e], 1);
+  }
+  __syncthreads();
+  // exclusive scan of flags over 512 experts: thread t owns experts 2t, 2t+1
+  const int f0 = cnt[2 * t] > 0, f1 = cnt[2 * t + 1] > 0;
+  int v = f0 + f1, incl = v;
+  const int lane = t & 31, w = t >> 5;
+#pragma unroll
+  for (int o = 1; o < 32; o <<= 1) {
+    const int u = __shfl_up(incl, o, 32);
+    if (lane >= o) incl += u;
+  }
+  if (lane == 31) wsum[w] = incl;
+  __syncthreads();
+  int base = 0;
+  for (int i = 0; i < w; i++) base += wsum[i];
+  const int ex = base + incl - v;
+  gid[2 * t] = ex;
+  gid[2 * t + 1] = ex + f0;
+  if (t == 255) *ngrp = base + incl;
+  __syncthreads();
+  if (t < n) {
+    int rank = 0;
+    for (int j = 0; j < t; j++) rank += es[j] == e;
+    const int g = gid[e];
+    gsl[g * 16 + rank] = t;
+    if (rank == 0) { gexp[g] = e; gn[g] = cnt[e]; }
+  }
+}
+
+// grid (ceil(pairs/16), max groups); block-uniform group -> dead groups exit as
+// whole blocks. Warp = rows (2rp, 2rp+1) of expert gexp[g] for up to TM slots
+// at a time (more slots: another pass over the same rows).
+template <int GSH, int TM>
+__global__ __launch_bounds__(512) void k_q4cp_gemv_ggx(
+    const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales,
+    const float* __restrict__ cb, const float* __restrict__ x, float* __restrict__ y,
+    uint64_t rows_per, uint64_t cols, uint64_t scale_stride, uint64_t x_stride, int kpt,
+    const int* __restrict__ gexp, const int* __restrict__ gnum, const int* __restrict__ gsl,
+    const int* __restrict__ ngrp) {
+  const int g = blockIdx.y;
+  if (g >= *ngrp) return;
+  __shared__ float cbf[16];
+  if (threadIdx.x < 16) cbf[threadIdx.x] = cb[threadIdx.x];
+  __syncthreads();
+  const uint64_t pairs_per_slot = (rows_per + 1) / 2;
+  const uint64_t rp = (uint64_t)blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
+  if (rp >= pairs_per_slot) return;
+  const int lane = threadIdx.x % warpSize;
+  const uint64_t row0 = (uint64_t)gexp[g] * rows_per + rp * 2;
+  const bool has1 = rp * 2 + 1 < rows_per;
+  const uint8_t* rc0 = codes + row0 * (cols / 2);
+  const uint8_t* rs0 = scales + row0 * scale_stride;
+  const uint8_t* rc1 = codes + (row0 + 1) * (cols / 2);
+  const uint8_t* rs1 = scales + (row0 + 1) * scale_stride;
+  const int ns = gnum[g];
+  const int* sl = gsl + g * 16;
+  for (int b0 = 0; b0 < ns; b0 += TM) {
+    const int nb = min(TM, ns - b0);
+    const float* xt[TM];
+#pragma unroll
+    for (int q = 0; q < TM; q++) xt[q] = x + (size_t)(sl[b0 + (q < nb ? q : 0)] / kpt) * x_stride;
+    float acc0[TM], acc1[TM];
+#pragma unroll
+    for (int q = 0; q < TM; q++) acc0[q] = acc1[q] = 0.f;
+    for (uint64_t gi = lane; gi < cols / 32; gi += warpSize) {
+      const uint4 pk0 = *(const uint4*)(rc0 + gi * 16);
+      const float s0 = __half2float(*(const __half*)(rs0 + (gi >> GSH) * 2));
+      uint4 pk1 = make_uint4(0, 0, 0, 0);
+      float s1 = 0.f;
+      if (has1) {
+        pk1 = *(const uint4*)(rc1 + gi * 16);
+        s1 = __half2float(*(const __half*)(rs1 + (gi >> GSH) * 2));
+      }
+      const uint32_t w0[4] = {pk0.x, pk0.y, pk0.z, pk0.w};
+      const uint32_t w1[4] = {pk1.x, pk1.y, pk1.z, pk1.w};
+      float a0[TM], a1[TM];
+#pragma unroll
+      for (int q = 0; q < TM; q++) a0[q] = a1[q] = 0.f;
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        float c0[8], c1[8];
+        uint32_t v0 = w0[i], v1 = w1[i];
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+          c0[j] = cbf[v0 & 0xf];
+          c1[j] = cbf[v1 & 0xf];
+          v0 >>= 4;
+          v1 >>= 4;
+        }
+#pragma unroll
+        for (int q = 0; q < TM; q++) {
+          if (q < nb) {
+            const float* xg = xt[q] + gi * 32 + i * 8;
+            const float4 t0 = *(const float4*)xg, t1 = *(const float4*)(xg + 4);
+            const float xv[8] = {t0.x, t0.y, t0.z, t0.w, t1.x, t1.y, t1.z, t1.w};
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+              a0[q] += c0[j] * xv[j];
+              a1[q] += c1[j] * xv[j];
+            }
+          }
+        }
+      }
+#pragma unroll
+      for (int q = 0; q < TM; q++) {
+        acc0[q] += a0[q] * s0;
+        acc1[q] += a1[q] * s1;
+      }
+    }
+#pragma unroll
+    for (int q = 0; q < TM; q++)
+      for (int off = warpSize / 2; off > 0; off >>= 1) {
+        acc0[q] += __shfl_down_sync(~0ull, acc0[q], off);
+        acc1[q] += __shfl_down_sync(~0ull, acc1[q], off);
+      }
+    if (lane == 0) {
+#pragma unroll
+      for (int q = 0; q < TM; q++) {
+        if (q < nb) {
+          const uint64_t out = (uint64_t)sl[b0 + q] * rows_per + rp * 2;
+          y[out] = acc0[q];
+          if (has1) y[out + 1] = acc1[q];
+        }
+      }
+    }
+  }
+}
+
 // --- pair slots that picked the same expert --------------------------------
 // Sorts the P*kpt (token, expert) slots by expert id (bitonic, padded to the
 // next power of two) and walks the sorted run pairing neighbours that share an

@@ -604,6 +604,30 @@ struct GpuModel {
   int* d_pair_a = nullptr;      // QWENOX_MOE_GRP：同专家配对的槽 a / 槽 b / 组数
   int* d_pair_b = nullptr;
   int* d_ngrp = nullptr;
+  unsigned* uniq_hist_ = nullptr;
+  // QWENOX_MOE_GG (default on, 0 = off): expert-grouped verify gate_up
+  // (k_moe_group2 + k_q4cp_gemv_ggx). Each distinct expert's rows are read
+  // once for all of its slots; per-slot arithmetic is k_q4cp_gemv_gg's.
+  int *d_gx_exp = nullptr, *d_gx_n = nullptr, *d_gx_sl = nullptr, *d_gx_ng = nullptr;
+  static bool moe_gg_on() {
+    static const bool on = [] {
+      const char* e = getenv("QWENOX_MOE_GG");
+      return !(e && e[0] == '0');
+    }();
+    return on;
+  }  // QWENOX_MOE_UNIQ diagnostic [17][161]
+  void uniq_report() {
+    if (!uniq_hist_) return;
+    std::vector<unsigned> h(17 * 161);
+    CK(hipStreamSynchronize(g_str));
+    CK(hipMemcpy(h.data(), uniq_hist_, h.size() * 4, hipMemcpyDeviceToHost));
+    CK(hipMemset(uniq_hist_, 0, h.size() * 4));
+    for (int P = 2; P <= 16; P++) {
+      double n = 0, sd = 0;
+      for (int d = 0; d <= 160; d++) { n += h[P * 161 + d]; sd += (double)d * h[P * 161 + d]; }
+      if (n > 0) fprintf(stderr, "[moe-uniq] P=%d calls=%.0f distinct avg %.1f of %d slots\n", P, n, sd / n, P * 10);
+    }
+  }
   int moe_dump_base_ = -1;      // QWENOX_MOE_TOPIDS_DUMP：记录用的当前 chunk base
   float *d_guvb, *d_hidb, *d_moeaccb, *d_eyb, *d_sgb;
   float* d_eb;              // [maxctx, 2560] PLE embeddings
@@ -1840,6 +1864,16 @@ struct GpuModel {
     se_par_init();
     moepp_init();
     gdnf_init();
+    if (moe_gg_on()) {
+      DALLOC(&d_gx_exp, 256 * 4);
+      DALLOC(&d_gx_n, 256 * 4);
+      DALLOC(&d_gx_sl, 256 * 16 * 4);
+      DALLOC(&d_gx_ng, 16);
+    }
+    if (getenv("QWENOX_MOE_UNIQ")) {
+      DALLOC(&uniq_hist_, 17 * 161 * 4);
+      CK(hipMemset(uniq_hist_, 0, 17 * 161 * 4));
+    }
     fprintf(stderr, "qwenox: state allocated (maxctx=%d)\n", maxctx);
   }
 
@@ -3191,6 +3225,10 @@ struct GpuModel {
     CK(hipEventCreateWithFlags(&se_join_ev_, hipEventDisableTiming));
     DALLOC(&d_se_guv, 1280 * 4);
     DALLOC(&d_se_hid, 640 * 4);
+    DALLOC(&d_se_guvb, 16 * 1280 * 4);
+    DALLOC(&d_se_hidb, 16 * 640 * 4);
+    DALLOC(&d_se_eyb, 16 * 2560 * 4);
+    DALLOC(&d_se_sgb, 64 * 4);
     DALLOC(&d_se_ey, 2560 * 4);
     DALLOC(&d_se_sg, 64);
     fprintf(stderr, "shared expert: parallel stream (P=1 decode)\n");
@@ -7037,6 +7075,7 @@ struct GpuModel {
   bool moe_b_v2(int l, const WView& gu, const WView& dn, float* acc, int P,
                 bool direct_output, const float* w4hc = nullptr, uint16_t* Rhc = nullptr,
                 bool vseg = false) {
+    bool se_pv = false;  // verify shared expert on the side stream (small-P branch)
     const int k = g_cfg.topk, E = g_cfg.experts, d = g_cfg.d, mid = g_cfg.moe_mid;
     if (gu.cols != (uint64_t)d || gu.rows != (uint64_t)E * 2 * mid || dn.dtype != 23 ||
         dn.cols != (uint64_t)mid || dn.rows != (uint64_t)E * d || mid % 128 || d % 128 ||
@@ -7348,6 +7387,19 @@ struct GpuModel {
     } else {
       const XCodes cg = xcodes(gu), cd = xcodes(dn);
       const bool direct_down = moe_down_topk && k == 10;
+      // QWENOX_SE_PAR (verify): shared expert || routed experts, private buffers.
+      se_pv = se_st_ != nullptr && d_se_guvb && P >= 2 && P <= 16 && !dbg &&
+                         !env_zero("QWENOX_SE_PAR_V");
+      if (se_pv) {
+        CK(hipEventRecord(se_fork_ev_, g_str));
+        CK(hipStreamWaitEvent(se_st_, se_fork_ev_, 0));
+        hipStream_t m = g_str;
+        g_str = se_st_;
+        se_chain_b(l, P, d_se_guvb, d_se_hidb, d_se_eyb, d_se_sgb);
+        CK(hipEventRecord(se_join_ev_, se_st_));
+        g_str = m;
+      }
+      if (uniq_hist_) k_moe_uniq_hist<<<1, 256, 0, g_str>>>(d_topidsb, P, k, 16, uniq_hist_);
       if (!direct_down) CK(hipMemsetAsync(acc, 0, (size_t)P * d * 4, g_str));
       v2_rot(d_xb, d, d_eyb, d, gu.suh, nullptr, d, P);  // d_eyb: free until the shared expert
       const uint64_t pairs = (uint64_t)P * k * mid;
@@ -7359,7 +7411,16 @@ struct GpuModel {
       // MOE_SORT only permutes warps (09-28: +0.3%); this removes groups.
       static const bool moe_grp_v2 =
           getenv("QWENOX_MOE_GRP") != nullptr && !env_zero("QWENOX_MOE_GRP");
-      if (moe_grp_v2 && P >= 2 && P * k <= 256) {
+      if (moe_gg_on() && d_gx_exp && P >= 2 && P <= 16 && P * k <= 256) {
+        if (g_cfg.experts == 512)
+          k_moe_group2<<<1, 256, 0, g_str>>>(d_topidsb, P, k, 16, d_gx_exp, d_gx_n, d_gx_sl, d_gx_ng);
+        else
+          k_moe_group<<<1, 128, 0, g_str>>>(d_topidsb, P, k, 16, d_gx_exp, d_gx_n, d_gx_sl, d_gx_ng);
+        const uint64_t pps = (uint64_t)mid;  // (2*mid + 1) / 2 row pairs
+        k_q4cp_gemv_ggx<2, 4><<<dim3((unsigned)((pps + 15) / 16), (unsigned)(P * k)), 512, 0, g_str>>>(
+            cg.codes, cg.scales, cg.cb, d_eyb, d_guvb, (uint64_t)2 * mid, gu.cols, gu.scale_stride,
+            (uint64_t)d, k, d_gx_exp, d_gx_n, d_gx_sl, d_gx_ng);
+      } else if (moe_grp_v2 && P >= 2 && P * k <= 256) {
         k_moe_pair_slots<<<1, 64, 0, g_str>>>(d_topidsb, P, k, 16, d_pair_a, d_pair_b,
                                               d_ngrp);
         k_q4cp_gemv_gg2<2><<<(unsigned)((pairs + 15) / 16), 512, 0, g_str>>>(
@@ -7385,7 +7446,15 @@ struct GpuModel {
       }
     }
     v2_rot(acc, d, acc, d, nullptr, dn.svh, d, P);
-    moe_b_shared(l, P, acc, direct_output);
+    if (se_pv) {
+      CK(hipStreamWaitEvent(g_str, se_join_ev_, 0));
+      k_axpy_sg<<<(P * 2560 + 255) / 256, 256, 0, g_str>>>(acc, d_se_eyb, d_se_sgb, g_cfg.d,
+                                                           P * g_cfg.d);
+      if (!direct_output)
+        CK(hipMemcpyAsync(d_yb, acc, (size_t)P * g_cfg.d * 4, hipMemcpyDeviceToDevice, g_str));
+    } else {
+      moe_b_shared(l, P, acc, direct_output);
+    }
     return false;
   }
 
@@ -7856,6 +7925,20 @@ struct GpuModel {
 #endif  // QWENOX_NPU
 
   // Shared expert output d_eyb [P][d] and gate logit d_sgb [P].
+  // moe_b_shared_ey's small-P computation (no merged / NPU path) into private
+  // buffers, for the verify side stream.
+  float *d_se_guvb = nullptr, *d_se_hidb = nullptr, *d_se_eyb = nullptr, *d_se_sgb = nullptr;
+  void se_chain_b(int l, int P, float* guv, float* hid, float* ey, float* sg) {
+    char buf[128], ub[128];
+    snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.gate_proj.weight", l);
+    snprintf(ub, sizeof ub, "layers.%d.mlp.shared_expert.up_proj.weight", l);
+    se_gate_up(buf, ub, d_xb, guv, guv + (size_t)P * 640, P, false);
+    k_silu_mul<<<(P * 640 + 255) / 256, 256, 0, g_str>>>(guv, guv + (size_t)P * 640, hid, P * 640);
+    snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.down_proj.weight", l);
+    gemm(wview(ckpt.at(buf)), hid, ey, P);
+    snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert_gate.weight", l);
+    gemm(wview(ckpt.at(buf)), d_xb, sg, P);
+  }
   void moe_b_shared_ey(int l, int P) {
     char buf[128];
     // shared expert (gate/up scratch in d_guvb head, silu out in d_hidb head)
