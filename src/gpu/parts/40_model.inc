@@ -12250,7 +12250,9 @@ struct GpuModel {
       for (int j = 0; j < g; j++) vt.push_back(drafts[j]);
       spec_snap = true;
       vsnap_row0_ = 0;  // D2-S2a: serial verify always packs at row 0
-      prefill_batch(vt, q + 1, true, true);
+      static const bool svf = !env_zero("QWENOX_SVF");
+      // Sampling below uses batched logits; final=true adds lm_head+argmax+D2H.
+      prefill_batch(vt, q + 1, !svf, true);
       spec_snap = false;
       bool smg_v = false;
       if (smg) {
@@ -12990,7 +12992,9 @@ struct GpuModel {
         }
         if (!pooled) {
           vsnap_row0_ = 0;
-          prefill_batch(vt, q + 1, true, true);
+          static const bool svf = !env_zero("QWENOX_SVF");
+          // Sampling below uses batched logits; final=true adds lm_head+argmax+D2H.
+          prefill_batch(vt, q + 1, !svf, true);
           if (smg) {
             const int pfx = sms_prefix_upload(sampler, drafts.data(), 0, g + 1);
             if (pfx >= 0) {
