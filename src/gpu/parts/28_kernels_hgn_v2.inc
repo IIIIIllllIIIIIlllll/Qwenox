@@ -1434,6 +1434,249 @@ __global__ __launch_bounds__(256) void k_hcf_down(const uint8_t* __restrict__ wq
   if (tid == 0) atomicExch(cnt + blockIdx.x, 0);
 }
 
+// ---- verify HC fusion (QWENOX_VHC) -----------------------------------------
+// gr_mix_b at verify sizes (P <= gemvmr_maxp, dense WMMA HC on) runs
+//   k_q6g64_wmma(down 320x10240, split-K ns=3) + k_q6g64_wred + k_silu_scale
+//   + k_q6g64_wmma(up 10240x320) + k_gr_combine_b_hc_bf16  (5 launches).
+// k_vhc_wmma replays k_q6g64_wmma's per-wave math verbatim (same 16-row WMMA
+// tiles, same KW group interleave and partial order) with fused epilogues:
+//  MODE 1 (down, RW=1 KW=8): every block stores its slice partial; the
+//    last-arriving block of a 16-row tile sums the slices in s order (as
+//    k_q6g64_wred) and applies silu(v * 0.25) (as k_silu_scale) -> t [P][R].
+//  MODE 2 (up, RW=4 KW=2, C = 320): wave row-tile rw takes rows
+//    rw * dd + blockIdx.x * 16, i.e. the 4 branch gates of the same 16
+//    columns, so the block finishes k_gr_combine_b_hc_bf16 for them -> x
+//    (f32 + bf16). G never leaves LDS.
+// XP > 0 (P <= XP): the block's x slice is staged once in LDS as the f16 A
+// operand (the same __floats2half2_rn values), and MODE 2 prefetches its
+// Rhat values at kernel start. Every output takes the old ops in the old
+// order -> bit-identical to the 5-launch chain (tools: _claude_hgn/vhc).
+template <int NPT, typename TX, bool XL>
+__device__ __forceinline__ void vhc_grp(const uint4 l0, const uint4 l1, const uint4 hp,
+                                        const uint32_t sb, const int g, const TX* __restrict__ x,
+                                        uint64_t xs, int P, int qrowA, int h,
+                                        const float* sxs, int nsl, int g0, htw_v8f* acc,
+                                        const uint4* xl, int xlst) {
+  const __half2 k1024 = __half2half2(__float2half(1024.f));
+  const float sc = __half2float(__ushort_as_half((unsigned short)(sb & 0xffffu)));
+  const float bi = __half2float(__ushort_as_half((unsigned short)(sb >> 16)));
+  const uint32_t lw[8] = {l0.x, l0.y, l0.z, l0.w, l1.x, l1.y, l1.z, l1.w};
+  const uint32_t hw[4] = {hp.x, hp.y, hp.z, hp.w};
+  htw_v8f d[NPT];
+#pragma unroll
+  for (int i = 0; i < NPT; i++)
+#pragma unroll
+    for (int e = 0; e < 8; e++) d[i][e] = 0.f;
+#pragma unroll
+  for (int ks = 0; ks < 4; ks++) {
+    const uint32_t lo = h ? lw[2 * ks + 1] : lw[2 * ks];
+    const uint32_t hi = hw[ks] >> (16 * h);
+    uint32_t own[4], oth[4];
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      const uint32_t c0 = ((lo >> (8 * j)) & 15u) | (((hi >> (4 * j)) & 3u) << 4);
+      const uint32_t c1 = ((lo >> (8 * j + 4)) & 15u) | (((hi >> (4 * j + 2)) & 3u) << 4);
+      const uint32_t u = (0x6400u | c0) | ((0x6400u | c1) << 16);
+      const __half2 v = __hsub2(*(const __half2*)&u, k1024);
+      own[j] = *(const uint32_t*)&v;
+    }
+#pragma unroll
+    for (int j = 0; j < 4; j++)
+      oth[j] = (uint32_t)__builtin_amdgcn_permlanex16((int)own[j], (int)own[j], 0x76543210,
+                                                      (int)0xfedcba98, false, false);
+    uint32_t bw[8];
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      bw[j] = h ? oth[j] : own[j];
+      bw[4 + j] = h ? own[j] : oth[j];
+    }
+    htw_v16h bf;
+    memcpy(&bf, bw, 32);
+#pragma unroll
+    for (int pt = 0; pt < NPT; pt++) {
+      const int p = pt * 16 + qrowA;
+      uint32_t aw[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+      if (XL) {
+        if (p < P) {
+          const uint4* q = xl + (size_t)p * xlst + (g - g0) * 8 + ks * 2;
+          const uint4 a0 = q[0], a1 = q[1];
+          aw[0] = a0.x; aw[1] = a0.y; aw[2] = a0.z; aw[3] = a0.w;
+          aw[4] = a1.x; aw[5] = a1.y; aw[6] = a1.z; aw[7] = a1.w;
+        }
+      } else if (p < P) {
+        const TX* xp = x + (size_t)p * xs + (size_t)g * 64 + ks * 16;
+        float xv[16];
+        hv2::ldx8(xp, xv);
+        hv2::ldx8(xp + 8, xv + 8);
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+          const __half2 hv = __floats2half2_rn(xv[2 * j], xv[2 * j + 1]);
+          aw[j] = *(const uint32_t*)&hv;
+        }
+      }
+      htw_v16h af;
+      memcpy(&af, aw, 32);
+      d[pt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, bf, d[pt]);
+    }
+  }
+#pragma unroll
+  for (int pt = 0; pt < NPT; pt++)
+#pragma unroll
+    for (int e = 0; e < 8; e++) {
+      const int p = pt * 16 + h * 8 + e;
+      const float sxv = p < P ? sxs[p * nsl + (g - g0)] : 0.f;
+      acc[pt][e] = fmaf(bi, sxv, fmaf(sc, d[pt][e], acc[pt][e]));
+    }
+}
+
+template <int NPT, int RW, int KW, typename TX, int MODE, int XP>
+__global__ __launch_bounds__(256) void k_vhc_wmma(const uint8_t* __restrict__ wq,
+                                                  const TX* __restrict__ x, uint64_t xs,
+                                                  float* __restrict__ out, int R, int C, int st,
+                                                  int gps, int P, float* __restrict__ tout,
+                                                  int* __restrict__ cnt,
+                                                  const uint16_t* __restrict__ rhat, int dd,
+                                                  float* __restrict__ xo,
+                                                  uint16_t* __restrict__ xo16) {
+  static_assert(RW * KW == 8, "8 waves");
+  constexpr int XLMAXG = MODE == 2 ? 5 : 54;  // groups per slice (C = 320 / gps = 54)
+  constexpr int XLST = XLMAXG * 8 + 1;        // uint4 per staged x row (+16 B pad)
+  constexpr int XLN = XP > 0 ? XP * XLST : 1;
+  constexpr int REDN = 8 * 16 * NPT * 16;
+  constexpr int UN = XP > 0 ? (XLN * 4 > REDN ? XLN * 4 : REDN) : REDN;
+  __shared__ float sxs[XP > 0 ? XP * XLMAXG : (MODE == 2 ? 16 * NPT * 8 : 48 * 64)];
+  __shared__ __attribute__((aligned(16))) float lds_u[UN];  // staged x, then red
+  float(*red)[16 * NPT][16] = (float(*)[16 * NPT][16])lds_u;
+  uint4* xl = (uint4*)lds_u;
+  const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+  const int rw = w / KW, kw = w % KW;
+  const int s = blockIdx.y;
+  const int ng = C >> 6;
+  const int g0 = s * gps, g1 = min(ng, g0 + gps), nsl = g1 - g0;
+  const int n = lane & 15, h = lane >> 4;
+  const int r0 = MODE == 2 ? rw * dd + blockIdx.x * 16 : (blockIdx.x * RW + rw) * 16;
+  const uint8_t* row = wq + (size_t)(r0 + n) * st;
+  uint4 cl0, cl1, chp, nl0, nl1, nhp;
+  uint32_t csb = 0, nsb = 0;
+  int g = g0 + kw;
+  if (g < g1) {
+    cl0 = *(const uint4*)(row + g * 32);
+    cl1 = *(const uint4*)(row + g * 32 + 16);
+    chp = *(const uint4*)(row + C / 2 + g * 16);
+    csb = *(const uint32_t*)(row + 3 * C / 4 + g * 4);
+  }
+  uint16_t rh4[4] = {0, 0, 0, 0};
+  if constexpr (MODE == 2 && XP > 0) {
+    if (tid < P * 16) {
+      const uint16_t* Rt = rhat + (size_t)(tid >> 4) * 4 * dd + blockIdx.x * 16 + (tid & 15);
+#pragma unroll
+      for (int b = 0; b < 4; b++) rh4[b] = Rt[b * dd];
+    }
+  }
+  for (int i = tid; i < P * nsl * 8; i += 256) {
+    const int sub = i & 7, pg = i >> 3, p = pg / nsl, gl = pg - p * nsl;
+    float xv[8];
+    hv2::ldx8(x + (size_t)p * xs + (size_t)(g0 + gl) * 64 + sub * 8, xv);
+    if constexpr (XP > 0) {
+      uint32_t hv[4];
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        const __half2 v2 = __floats2half2_rn(xv[2 * j], xv[2 * j + 1]);
+        hv[j] = *(const uint32_t*)&v2;
+      }
+      xl[(size_t)p * XLST + gl * 8 + sub] = make_uint4(hv[0], hv[1], hv[2], hv[3]);
+    }
+    float t = ((xv[0] + xv[1]) + (xv[2] + xv[3])) + ((xv[4] + xv[5]) + (xv[6] + xv[7]));
+    t += __shfl_xor(t, 1, 8);
+    t += __shfl_xor(t, 2, 8);
+    t += __shfl_xor(t, 4, 8);
+    if (sub == 0) sxs[p * nsl + gl] = t;
+  }
+  __syncthreads();
+  const int b_ = lane >> 1;
+  const int qrowA = (lane & 1) ? ((lane & 16) ? b_ : ((b_ + 4) & 7))
+                               : ((lane & 16) ? 8 + ((b_ + 4) & 7) : b_);
+  htw_v8f acc[NPT];
+#pragma unroll
+  for (int i = 0; i < NPT; i++)
+#pragma unroll
+    for (int e = 0; e < 8; e++) acc[i][e] = 0.f;
+  for (; g < g1; g += KW) {
+    if (g + KW < g1) {
+      const int gn = g + KW;
+      nl0 = *(const uint4*)(row + gn * 32);
+      nl1 = *(const uint4*)(row + gn * 32 + 16);
+      nhp = *(const uint4*)(row + C / 2 + gn * 16);
+      nsb = *(const uint32_t*)(row + 3 * C / 4 + gn * 4);
+    }
+    const uint4 l0 = cl0, l1 = cl1, hp = chp;
+    const uint32_t sb = csb;
+    cl0 = nl0;
+    cl1 = nl1;
+    chp = nhp;
+    csb = nsb;
+    vhc_grp<NPT, TX, (XP > 0)>(l0, l1, hp, sb, g, x, xs, P, qrowA, h, sxs, nsl, g0, acc, xl,
+                               XLST);
+  }
+  if constexpr (XP > 0) __syncthreads();  // red aliases the staged x
+#pragma unroll
+  for (int pt = 0; pt < NPT; pt++)
+#pragma unroll
+    for (int e = 0; e < 8; e++) red[w][pt * 16 + h * 8 + e][n] = acc[pt][e];
+  __syncthreads();
+  if constexpr (MODE == 1) {
+    for (int i = tid; i < RW * P * 16; i += 256) {
+      const int nn = i & 15, rest = i >> 4, p = rest % P, rwi = rest / P;
+      float v = red[rwi * KW][p][nn];
+#pragma unroll
+      for (int k = 1; k < KW; k++) v += red[rwi * KW + k][p][nn];
+      const int r = (blockIdx.x * RW + rwi) * 16 + nn;
+      out[((size_t)s * P + p) * R + r] = v;
+    }
+    __shared__ int s_last;
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) s_last = atomicAdd(cnt + blockIdx.x, 1) == (int)gridDim.y - 1;
+    __syncthreads();
+    if (!s_last) return;
+    __threadfence();
+    const int ns = (int)gridDim.y;
+    for (int i = tid; i < RW * P * 16; i += 256) {
+      const int nn = i & 15, rest = i >> 4, p = rest % P, rwi = rest / P;
+      const int r = (blockIdx.x * RW + rwi) * 16 + nn;
+      float v = __builtin_nontemporal_load(out + (size_t)p * R + r);
+      for (int k = 1; k < ns; k++)
+        v += __builtin_nontemporal_load(out + ((size_t)k * P + p) * R + r);
+      const float xx = v * 0.25f;
+      tout[(size_t)p * R + r] = xx / (1.f + expf(-xx));
+    }
+    if (tid == 0) atomicExch(cnt + blockIdx.x, 0);
+  } else {
+    for (int i = tid; i < RW * P * 16; i += 256) {
+      const int nn = i & 15, rest = i >> 4, p = rest % P, rwi = rest / P;
+      float v = red[rwi * KW][p][nn];
+#pragma unroll
+      for (int k = 1; k < KW; k++) v += red[rwi * KW + k][p][nn];
+      red[rwi * KW][p][nn] = v;  // G in place (one owner per element)
+    }
+    __syncthreads();
+    for (int i = tid; i < P * 16; i += 256) {
+      const int nn = i & 15, p = i >> 4;
+      const int c = blockIdx.x * 16 + nn;
+      const uint16_t* Rt = rhat + (size_t)p * 4 * dd;
+      float a = 0.f;
+#pragma unroll
+      for (int b = 0; b < 4; b++) {
+        float gate = 1.f / (1.f + expf(-red[b * KW][p][nn]));
+        a += gate * bf2f(XP > 0 ? rh4[b] : Rt[b * dd + c]);
+      }
+      const float value = a / 4;
+      xo[(size_t)p * dd + c] = value;
+      xo16[(size_t)p * dd + c] = f2bf(value);
+    }
+  }
+}
+
 // mix-up GEMV (branches*d rows x C, C < 1024, k_q6g64_gemv<1,float,8> lane
 // math) + sigmoid combine. Block = 8 output columns i for all 4 branches.
 __global__ __launch_bounds__(256) void k_hcf_upc(const uint8_t* __restrict__ wq,

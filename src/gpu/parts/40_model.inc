@@ -1861,6 +1861,7 @@ struct GpuModel {
     }
     pf_init();
     hcf_init();
+    vhc_init();
     se_par_init();
     moepp_init();
     gdnf_init();
@@ -3529,6 +3530,90 @@ struct GpuModel {
     k_repeat4<<<(2560 + 255) / 256, 256, 0, g_str>>>(d_emb, d_R, g_cfg.d);
     h_rms("gpu", -1, "emb", d_emb, g_cfg.d);
   }
+  // ---- verify HC (P <= gemvmr_maxp) ------------------------------------------
+  // QWENOX_VHC (default on; =0 off): gr_mix_b's 5-launch chain ->
+  // 2 x k_vhc_wmma, bit-identical (see 28_kernels_hgn_v2.inc). Only taken where
+  // the old chain is k_q6g64_wmma(down, ns 3) + wred + silu + k_q6g64_wmma(up)
+  // + combine, i.e. the default dense-WMMA HC config.
+  bool vhc_on_ = false;
+  float* vhc_part_ = nullptr;
+  int* vhc_cnt_ = nullptr;
+  bool vhc_wq_ok(const char* prefix) {
+    char b[160];
+    const char* sfx[2] = {"input_mix_weight_down", "input_mix_weight_up"};
+    const uint64_t rr[2] = {320, 10240}, cc[2] = {10240, 320};
+    for (int k = 0; k < 2; k++) {
+      snprintf(b, sizeof b, "%s.%s.weight", prefix, sfx[k]);
+      const Tensor* t = ckpt.find(b);
+      if (!t || t->dtype != 24) return false;
+      const WView w = wview(*t);
+      if (w.rows != rr[k] || w.cols != cc[k]) return false;
+    }
+    return true;
+  }
+  void vhc_init() {
+    if (g_cfg.d != 2560 || g_cfg.branches != 4) return;
+    if (env_zero("QWENOX_VHC")) return;
+    char p[128];
+    bool ok = vhc_wq_ok("hyper_connection_mixer");
+    for (int l = 0; ok && l < g_cfg.layers; l++) {
+      snprintf(p, sizeof p, "layers.%d.attn_hyper_connection", l);
+      ok = vhc_wq_ok(p);
+      snprintf(p, sizeof p, "layers.%d.mlp_hyper_connection", l);
+      ok = ok && vhc_wq_ok(p);
+    }
+    if (!ok) {
+      fprintf(stderr, "verify HC fusion: weights not q6g64 320x10240/10240x320 -> off\n");
+      return;
+    }
+    if (dense_wmma_hc_on() && !getenv("QWENOX_Q6W_SK") &&
+        !getenv("QWENOX_Q6W_BLOCKS") && !getenv("QWENOX_NO_GEMVMR")) {
+      DALLOC(&vhc_part_, (size_t)3 * 48 * 320 * 4);
+      DALLOC(&vhc_cnt_, 64 * 4);
+      CK(hipMemset(vhc_cnt_, 0, 64 * 4));
+      vhc_on_ = true;
+      fprintf(stderr, "verify HC fusion: on (P<=%d, 2 launches per HC mix)\n",
+              std::min(48, gemvmr_maxp()));
+    }
+  }
+  // gr_mix_b's non-norhat route at verify sizes. false -> caller runs the old chain.
+  bool vhc_try(const std::string& prefix, int P) {
+    if (!vhc_on_ || !prefill_fused || !gr_bf16 || P < 1 || P > 48 || P > gemvmr_maxp())
+      return false;
+    if ((((uintptr_t)d_Rhatbf16 | (uintptr_t)d_xb | (uintptr_t)d_xbf16) & 15) != 0) return false;
+    char b[160];
+    snprintf(b, sizeof b, "%s.input_mix_weight_down.weight", prefix.c_str());
+    const Tensor* td = ckpt.find(b);
+    snprintf(b, sizeof b, "%s.input_mix_weight_up.weight", prefix.c_str());
+    const Tensor* tu = ckpt.find(b);
+    if (!td || !tu || td->dtype != 24 || tu->dtype != 24) return false;
+    const WView dn = wview(*td), up = wview(*tu);
+    if (dn.rows != 320 || dn.cols != 10240 || up.rows != 10240 || up.cols != 320) return false;
+    // q6g64_wmma's config for these shapes at defaults: down ns 3 x gps 54, up 4x2 no split
+    const int R = 320, C = 10240, gps = 54, ns = 3, dd = 2560;
+    const uint16_t* xr = d_Rhatbf16;
+#define QWENOX_VHC_DN(NPT, XP)                                                              \
+  k_vhc_wmma<NPT, 1, 8, uint16_t, 1, XP><<<dim3(R / 16, ns), 256, 0, g_str>>>(              \
+      dn.data, xr, (uint64_t)C, vhc_part_, R, C, (int)dn.scale_stride, gps, P, d_t320b,     \
+      vhc_cnt_, nullptr, 0, nullptr, nullptr)
+    if (P <= 4) QWENOX_VHC_DN(1, 4);
+    else if (P <= 16) QWENOX_VHC_DN(1, 0);
+    else if (P <= 32) QWENOX_VHC_DN(2, 0);
+    else QWENOX_VHC_DN(3, 0);
+#undef QWENOX_VHC_DN
+#define QWENOX_VHC_UP(NPT, XP)                                                              \
+  k_vhc_wmma<NPT, 4, 2, float, 2, XP><<<dim3(dd / 16, 1), 256, 0, g_str>>>(                 \
+      up.data, d_t320b, (uint64_t)320, nullptr, (int)up.rows, 320, (int)up.scale_stride, 5, \
+      P, nullptr, nullptr, xr, dd, d_xb, d_xbf16)
+    if (P <= 16) QWENOX_VHC_UP(1, 16);
+    else if (P <= 32) QWENOX_VHC_UP(2, 0);
+    else QWENOX_VHC_UP(3, 0);
+#undef QWENOX_VHC_UP
+    xf16_src = d_xb;
+    xf16_xs = xf16_K = g_cfg.d;
+    xf16_P = P;
+    return true;
+  }
   // ---- HC chain fusion, P=1 decode (QWENOX_HC_FUSE, default on; =0 off) ---
   // enq_layer/enq_final only. The norm of the NEXT HC read is folded into the
   // preceding write (k_hcf_wn<true>) unless something touches R in between
@@ -4492,6 +4577,7 @@ struct GpuModel {
                       std::chrono::steady_clock::now() - pt0)
                       .count();
     } else {
+      if (vhc_try(prefix, P)) return;
       gemm(wview(ckpt.at(buf)), d_Rhatb, d_t320b, P, 0,
            gr_bf16 ? d_Rhatbf16 : nullptr);
     }
