@@ -190,6 +190,9 @@ for f in start_win.exe launcher_settings.exe settings_win.exe qwenox-settings.ex
 done
 [[ -d docs ]] && cp -a docs "$OUT/"
 [[ -d media ]] && cp -a media "$OUT/"
+# 控制向量（refusal）：发行包默认附带，CVEC 开箱可用（见 docs/CVEC.md）。
+[[ -f refusal/qwen38-flash-next-refusal.gguf ]] || die "缺少 refusal/qwen38-flash-next-refusal.gguf"
+cp -a refusal "$OUT/"
 
 cp -a "$TOK_DIR/tokenizer.json" "$OUT/data/tokenizer/"
 # qwenox-bench 的 prefill 基准直接读取 data/qsa-oracle/*.tokens；随包分发，

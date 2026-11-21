@@ -234,6 +234,8 @@ jobs:
           cp -a data/tokenizer "$out/data/"
           if [ -d docs ]; then cp -a docs "$out/docs"; fi
           if [ -d media ]; then cp -a media "$out/media"; fi
+          # 控制向量（refusal）：发行包默认附带，CVEC 开箱可用。
+          cp -a refusal "$out/"
           cat > "$out/models/README.txt" <<'EOF'
           模型权重目录（发行包不含权重）
           ================================
