@@ -373,12 +373,16 @@ inline bool validate_conf(const Conf& conf, std::string* err) {
         return false;
     }
     // Windows 设备内存是硬上限 95 GiB 的 arena：有效池 = max(KV_POOL_TOKENS,
-    // MAX_CONTEXT)，512K（524288）以上任何配置都放不下。
+    // MAX_CONTEXT)。上限随 KV 类型变：q8 每 token 的 KV 行 544 B（bf16 1024 B，
+    // 且 bf16 另存全上下文转置 V），实测 262144 token 的 K/V 阵列为 3.45 GiB
+    // 对 9.50 GiB，所以 q8 放到 2× token 数（1M）仍比 bf16 的 512K 池省。
     const long kv_pool_effective =
         kv_pool_tokens > max_context ? kv_pool_tokens : max_context;
-    if (kv_pool_effective > 524288) {
+    const long kv_pool_limit = kv_type == "q8" ? 1048576 : 524288;
+    if (kv_pool_effective > kv_pool_limit) {
         *err = "effective KV pool " + std::to_string(kv_pool_effective) +
-               " tokens exceeds the 512K (524288) limit";
+               " tokens exceeds the " + std::to_string(kv_pool_limit) +
+               " limit for KV_TYPE=" + kv_type;
         return false;
     }
     double arena_slack;

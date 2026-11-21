@@ -376,7 +376,7 @@ zh:{
   fb_empty:"（空目录或过滤后无匹配）",
   // 校验
   v_int:"需要整数", v_range:"范围 {a}–{b}", v_req:"必填", v_port:"不能和引擎端口相同",
-  v_par:"并发大于 1 需要开启分页 KV", v_pool:"有效 KV 池不能超过 512K（524288）",
+  v_par:"并发大于 1 需要开启分页 KV", v_pool:"有效 KV 池超过上限（q8 为 1M，其他 512K）",
   v_cvec_mode:"控制向量模式只允许 project 或 add", v_cvec_scale:"控制向量 scale 必须是大于 0 的小数",
   v_cvec_layers:"层区间必须是 \"起 止\"，1≤起≤止≤47",
   v_ip:"需要 IPv4 地址", v_aff:"需要非零整数掩码（如 0xFFFF）",
@@ -446,7 +446,7 @@ en:{
   fb_hint_dir:"Click a directory to enter, then pick it", fb_hint_file:"Click a file to pick; ↑ goes up; type a path + Enter",
   fb_empty:"(empty or filtered out)",
   v_int:"Integer required", v_range:"Range {a}–{b}", v_req:"Required", v_port:"Must differ from engine port",
-  v_par:"Concurrency > 1 needs paged KV", v_pool:"Effective KV pool must be ≤ 512K (524288)",
+  v_par:"Concurrency > 1 needs paged KV", v_pool:"Effective KV pool exceeds the cap (1M for q8, 512K otherwise)",
   v_cvec_mode:"CVEC mode must be project or add", v_cvec_scale:"CVEC scale must be a number > 0",
   v_cvec_layers:"CVEC layer range must be \"lo hi\" with 1 <= lo <= hi <= 47",
   v_ip:"IPv4 address required", v_aff:"Non-zero integer mask required (e.g. 0xFFFF)",
@@ -690,8 +690,9 @@ function validate(d){
   const n = k => parseIntStrict(eff(d, k));
   if (!err.API_PORT && !err.ENGINE_PORT && n("API_PORT") === n("ENGINE_PORT")) err.API_PORT = t("v_port");
   if (!err.PARALLEL && n("PARALLEL") > 1 && eff(d, "KV_PAGED") !== "1") err.PARALLEL = t("v_par");
-  if (!err.MAX_CONTEXT && !err.KV_POOL_TOKENS && Math.max(n("MAX_CONTEXT"), n("KV_POOL_TOKENS")) > 524288)
-    err[n("MAX_CONTEXT") > 524288 ? "MAX_CONTEXT" : "KV_POOL_TOKENS"] = t("v_pool");
+  const poolMax = eff(d, "KV_TYPE") === "q8" ? 1048576 : 524288;
+  if (!err.MAX_CONTEXT && !err.KV_POOL_TOKENS && Math.max(n("MAX_CONTEXT"), n("KV_POOL_TOKENS")) > poolMax)
+    err[n("MAX_CONTEXT") > poolMax ? "MAX_CONTEXT" : "KV_POOL_TOKENS"] = t("v_pool");
   // 控制向量（CVEC，见 docs/CVEC.md）：只有启用时才校验模式/scale/层区间。
   if (eff(d, "CVEC")) {
     const mode = eff(d, "CVEC_MODE");

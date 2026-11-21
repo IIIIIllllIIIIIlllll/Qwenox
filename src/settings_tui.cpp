@@ -1112,12 +1112,14 @@ std::vector<Check> validate(const Model& model) {
                 "KV_POOL_TOKENS < MAX_CONTEXT: Linux sizes the effective pool by MAX_CONTEXT"));
 #endif
     }
-    if (effective_pool > 524288) {
+    const long kv_pool_limit = model.get("KV_TYPE") == "q8" ? 1048576 : 524288;
+    if (effective_pool > kv_pool_limit) {
 #ifdef _WIN32
-        fail(TR("有效 KV 池超过 Windows 512K 上限", "Effective KV pool exceeds the Windows 512K limit"));
+        fail(TR("有效 KV 池超过 Windows 上限（q8 为 1M，其他 512K）",
+                "Effective KV pool exceeds the Windows limit (1M for q8, 512K otherwise)"));
 #else
-        warn(TR("有效 KV 池超过 512K：Linux 可尝试，但这份配置不能直接用于 Windows",
-                "Effective KV pool exceeds 512K: fine to try on Linux, but this config will not work on Windows"));
+        warn(TR("有效 KV 池超过 Windows 上限（q8 为 1M，其他 512K）：Linux 可尝试，但这份配置不能直接用于 Windows",
+                "Effective KV pool exceeds the Windows limit (1M for q8, 512K otherwise): fine to try on Linux, but this config will not work on Windows"));
 #endif
     }
 
