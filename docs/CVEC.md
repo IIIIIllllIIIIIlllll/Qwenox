@@ -1,4 +1,4 @@
-# 控制向量（refusal projection）
+# 控制向量（refusal）
 
 qwenox 可以加载 llama.cpp 格式的控制向量 GGUF，在每层 hyper-connection（HC）残差上做
 **投影消融**（project）或**加法引导**（add）。向量不修改权重，启动时决定，运行期零额外开销
@@ -6,7 +6,9 @@ qwenox 可以加载 llama.cpp 格式的控制向量 GGUF，在每层 hyper-conne
 
 参考向量：[Cudecnik/Qwen3.8-Flash-Next-refusal-projection](https://huggingface.co/Cudecnik/Qwen3.8-Flash-Next-refusal-projection)
 （`Qwen3.8-Flash-Next-refusal-projection.gguf`，约 480 KB；参考实现在 Cudila/llama.cpp 的
-`cvec-hooks` 分支）。qwenox 的语义、层映射和参数与它对齐。
+`cvec-hooks` 分支）。qwenox 的语义、层映射和参数与它对齐。本仓库在
+`refusal/qwen38-flash-next-refusal.gguf` 保留一份原样副本；上游 projection 与 additive
+两个文件逐字节相同，因此只保留一份。
 
 ## 开启方法
 
@@ -38,7 +40,7 @@ Windows 设置面板、终端设置（`bash build.sh settings`）与网页启动
 启动日志确认加载成功：
 
 ```text
-qwenox: cvec /path/…-refusal-projection.gguf: mode=project dir=per-layer layers=4..44 scale=1, 41/41 directions (norm 0.999998..1.000001)
+qwenox: cvec refusal/qwen38-flash-next-refusal.gguf: mode=project dir=per-layer layers=4..44 scale=1, 41/41 directions (norm 0.999998..1.000001)
 ```
 
 没有这一行就是没加载（`--check` 也会打印 `ENV QWENOX_CVEC=…`）。
@@ -55,8 +57,8 @@ add:      h ← h + s·v            (s = scale，v 保持原样)
 - 张量 `direction.K` 用于第 K 层（0 基）的输出残差（与 llama.cpp 控制向量的层编号一致）；
   `CVEC_LAYERS` 是闭区间。
 - project 加载时把向量单位化并把原范数并入 scale；实测参考文件范数为 1.0，两者等价。
-- 参考配置：project、per-layer、scale 1.0、层 4..44。加法文件（`…-refusal-additive.gguf`）
-  只配 add 模式、层 16..32、scale 0.05–0.15——**不要**用 1.0，会输出乱码。
+- 参考配置：project、per-layer、scale 1.0、层 4..44。同一个向量也可用于 add 模式：
+  层 16..32、scale 0.05–0.15——**不要**用 1.0，会输出乱码。
 - 只作用于 trunk；MTP / DFlash2 草稿头不另加向量（草稿的验证由目标模型完成，与参考一致）。
 - 与权重格式无关：hgn v1/v2 与 GGUF 都能用。
 

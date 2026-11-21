@@ -424,7 +424,7 @@ the tray icon → "Export diagnostics…". On Linux the start script collects th
 - [YARN-512K.md](docs/YARN-512K.md) / [YARN-512K-RESULTS.md](docs/YARN-512K-RESULTS.md) — YaRN 512K and measurements
 - [MTP_EN.md](docs/MTP_EN.md) / [NGRAM_EN.md](docs/NGRAM_EN.md) — speculative decoding
 - [KLD.md](docs/KLD.md) — quality testing (same method as unsloth / llama.cpp)
-- [CVEC.md](docs/CVEC.md) — control vectors (refusal projection / additive), loading and semantics (in Chinese)
+- [CVEC.md](docs/CVEC.md) — control vectors (refusal), loading and semantics (in Chinese)
 - [BENCHMARK_EN.md](docs/BENCHMARK_EN.md) — benchmark tools
 - [bench/README.md](bench/README.md) — task-level evaluation (long-context code-needle A/B, in Chinese)
 - [PORTING-WINDOWS_EN.md](docs/PORTING-WINDOWS_EN.md) — Windows port and measurements
@@ -443,6 +443,8 @@ GGUF support draws heavily on [gufo](https://github.com/gufo-org/gufo) (MIT lice
 The 4-bit prefill speedup (`MOE_A4`) draws on warpfront's [hipfire](https://github.com/warpfront/hipfire) (Apache-2.0 license): quantizing routed-expert activations to int4 per block and running the expert GEMMs on INT4 WMMA comes from hipfire's IU4 route, reimplemented here for the hgn v2 i4r format (`k_quant_a4` / `k_moe_iu4`, `src/gpu/parts/27_kernels_moe_lut.inc`); the packed epilogue of the LUT expert GEMM also follows hipfire's approach. The task evaluations shared by the hipfire author helped us weigh this switch. Thanks to the hipfire author.
 
 The ngram speculative drafting idea and the two-level prompt cache draw on [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT license); GGUF weights and the vision tower (mmproj) reuse the same files as llama.cpp, and the IQ3_S grid table comes from llama.cpp. See the "Attribution" section of [NGRAM_EN.md](docs/NGRAM_EN.md) for the ngram notice.
+
+The control-vector (refusal) format and reference vector come from Cudecnik's [Qwen3.8-Flash-Next-refusal-projection](https://huggingface.co/Cudecnik/Qwen3.8-Flash-Next-refusal-projection) (Qwen Community License 1.0); `refusal/qwen38-flash-next-refusal.gguf` in this repository is an unmodified copy of that reference vector (the upstream projection and additive filenames hold identical bytes, so only one copy is kept). Thanks to the author for publishing the calibration and patches.
 
 ## License
 

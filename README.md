@@ -378,7 +378,7 @@ MTP 开、视觉塔开、prefill chunk 8192）：
 - [YARN-512K.md](docs/YARN-512K.md) / [YARN-512K-RESULTS.md](docs/YARN-512K-RESULTS.md) — YaRN 512K 与实测
 - [MTP.md](docs/MTP.md) / [NGRAM.md](docs/NGRAM.md) — 投机解码
 - [KLD.md](docs/KLD.md) — 质量测试（与 unsloth / llama.cpp 同口径）
-- [CVEC.md](docs/CVEC.md) — 控制向量（refusal projection / additive）的加载与应用
+- [CVEC.md](docs/CVEC.md) — 控制向量（refusal）的加载与应用
 - [BENCHMARK.md](docs/BENCHMARK.md) — 性能测试工具
 - [bench/README.md](bench/README.md) — 任务级评测（长上下文代码捞针 A/B）
 - [PORTING-WINDOWS.md](docs/PORTING-WINDOWS.md) — Windows 移植与实测
@@ -397,6 +397,8 @@ GGUF 支持大量参考了 [gufo](https://github.com/gufo-org/gufo)（MIT 许可
 prefill 4-bit 加速（`MOE_A4`）借鉴了 warpfront 的 [hipfire](https://github.com/warpfront/hipfire)（Apache-2.0 许可证）：路由专家激活按块量化成 int4、专家 GEMM 走 INT4 WMMA 的做法来自 hipfire 的 IU4 路由，本项目按 hgn v2 的 i4r 格式重新实现（`k_quant_a4` / `k_moe_iu4`，`src/gpu/parts/27_kernels_moe_lut.inc`）；LUT 专家 GEMM 的 packed epilogue 也参考了 hipfire 的写法。hipfire 作者分享的任务评测结果帮助我们判断了这个开关的取舍。感谢 hipfire 作者。
 
 ngram 投机解码的起草思路与两级 prompt 缓存借鉴了开源项目 [llama.cpp](https://github.com/ggml-org/llama.cpp)（MIT 许可证），GGUF 权重与视觉塔（mmproj）直接复用 llama.cpp 的同一份文件；IQ3_S 码表取自 llama.cpp；ngram 声明详见 [NGRAM.md](docs/NGRAM.md) 的「来源与声明」一节。
+
+控制向量（refusal）的格式与参考向量来自 Cudecnik 的 [Qwen3.8-Flash-Next-refusal-projection](https://huggingface.co/Cudecnik/Qwen3.8-Flash-Next-refusal-projection)（Qwen Community License 1.0）；本仓库的 `refusal/qwen38-flash-next-refusal.gguf` 是该仓库参考向量的原样副本（上游 projection 与 additive 两个文件名内容相同，故只保留一份）。感谢作者公开标定结果与 llama.cpp 补丁。
 
 ## 许可证
 
