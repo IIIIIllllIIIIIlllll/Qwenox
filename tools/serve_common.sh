@@ -104,7 +104,7 @@ serve_init() {
     echo "警告：ROPE_FACTOR=1 且 MAX_CONTEXT=$MAX_CONTEXT 超过原生 $ROPE_ORIGINAL_CTX，超出部分的位置编码未验证（需要时请设 ROPE_FACTOR）" >&2
   (( PARALLEL == 1 || KV_PAGED )) || fail 'PARALLEL>1 需要 KV_PAGED=1'
   (( ENGINE_PORT <= 65535 && API_PORT <= 65535 && ENGINE_PORT != API_PORT )) || fail '端口必须为不同的 1–65535 整数'
-  (( MTP_GAMMA <= 8 )) || fail 'MTP_GAMMA 范围为 0–8（0=引擎按模式自选 greedy 4 / 采样自适应）'
+  (( MTP_GAMMA <= 8 )) || fail 'MTP_GAMMA 范围为 0–8（0=引擎按模式自选：greedy 4；采样由置信门规划）'
   for cmd in flock ss systemctl stat awk pgrep setsid; do command -v "$cmd" >/dev/null || fail "缺少命令：$cmd"; done
   systemctl --user show-environment >/dev/null || fail 'systemd 用户会话不可用，请通过普通用户 SSH 登录运行'
   [[ -x build/qwenox-engine && -x build/qwenox-api ]] || fail '缺少编译产物，请先运行 bash build.sh'
@@ -197,7 +197,7 @@ serve_run() {
   export QWENOX_ROPE_BETA_SLOW="$ROPE_BETA_SLOW"
   export QWENOX_ROPE_ATTN_SCALE="$ROPE_ATTN_SCALE"
   # --serve reads QWENOX_SPEC_GAMMA; --gamma is for offline --spec-gen.
-  # MTP_GAMMA=0：不导出，引擎按请求模式自选（greedy 4 / 采样自适应）。
+  # MTP_GAMMA=0：不导出，引擎按请求模式自选（greedy 4；采样由置信门规划，默认 0.95,0.98）。
   if (( MTP_GAMMA > 0 )); then export QWENOX_SPEC_GAMMA="$MTP_GAMMA"; fi
   local engine_connect_host="$ENGINE_HOST"
   if [[ "$engine_connect_host" == 0.0.0.0 ]]; then engine_connect_host=127.0.0.1; fi
@@ -206,7 +206,7 @@ serve_run() {
 
   echo "项目：$ROOT"
   echo "权重：$FORMAT，$MAIN_MODEL"
-  echo "配置：${MAX_CONTEXT} 上下文，MTP gamma=$([[ $MTP_GAMMA == 0 ]] && echo 'auto（greedy 4 / 采样自适应）' || echo "$MTP_GAMMA")，engine ${ENGINE_HOST}:${ENGINE_PORT}，API ${API_HOST}:${API_PORT}"
+  echo "配置：${MAX_CONTEXT} 上下文，MTP gamma=$([[ $MTP_GAMMA == 0 ]] && echo 'auto（greedy 4 / 采样置信门）' || echo "$MTP_GAMMA")，engine ${ENGINE_HOST}:${ENGINE_PORT}，API ${API_HOST}:${API_PORT}"
   if (( KV_PAGED )); then
     echo "KV：分页，页池 $(( (KV_POOL_TOKENS > MAX_CONTEXT ? KV_POOL_TOKENS : MAX_CONTEXT) )) token（${PARALLEL} 路并发共享），RAM 检查点 ${RCKPT_MAX} 个"
   else

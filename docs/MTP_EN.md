@@ -2,7 +2,7 @@
 
 *中文版:[MTP.md](MTP.md)*
 
-The service defaults to `MTP_GAMMA=0` (auto): greedy (temperature=0) uses a fixed 4; sampling adapts per round, picking 3–7 from running per-depth acceptance estimates (see `Model::GammaCtl`). Setting 1–8 forces that fixed length for every request. For manual comparisons, change only the length each time:
+The service defaults to `MTP_GAMMA=0` (auto): greedy (temperature=0) plans four drafts, then the chain is truncated by the `QWENOX_GREEDY_CONF` top-1 gate (default 0.9); sampling is planned by the confidence gate up to seven drafts, and the actual length is decided by `QWENOX_SAMPLED_GATE` (default **0.95,0.98**; explicit 0 falls back to `QWENOX_SPEC_CONF`'s top-1 0.9). Only when both `QWENOX_SAMPLED_GATE` and `QWENOX_SPEC_CONF` are 0 does sampling auto adapt from per-depth acceptance estimates (`Model::GammaCtl`, 3–7). Setting 1–8 caps the planned length; gating, concurrent scheduling, the remaining output budget and joint drafting can all change the actual length. For manual comparisons, change only the cap each time:
 
 ```bash
 MTP_GAMMA=1 bash start_hgn.sh    # start_gguf.sh for GGUF weights
@@ -32,77 +32,6 @@ temperature=0 is a greedy control and is not guaranteed to raise the acceptance 
 
 This implementation has no separate draft_temperature or tunable acceptance threshold: greedy mode verifies whether tokens match, and sampling mode performs rejection sampling by p/q. QWENOX_MTP_NORM/HAGG are legacy structure-debug switches; keep their default values.
 
-## r2's mtp.spec_cost calibration (cost gate)
-
-`qwen38-flash-next-drafter-r2.hgn` carries five f32 tensors beside the 31
-`mtp.*` tensors: `mtp.spec_cost.cal_g[50]` / `abar_g[8]` / `cal_s[50]` /
-`abar_s[8]` / `t[2]`. The engine reads them at MTP init; all five must be
-present to override the built-in default tables as a group (the defaults are
-reversed from upstream halogen 0.20.7's embedded profile and backstop the old
-`mtp.hgn`, same as upstream's fallback). The default gates match upstream:
-sampled rounds use `QWENOX_SAMPLED_GATE` (drawn-probability 0.95/0.98), greedy
-uses `QWENOX_GREEDY_CONF` (default 0.9, 0 = off); to use the calibration:
-
-```bash
-QWENOX_MTP_GATE_RULE=cost bash start_hgn.sh   # or sampled-only: QWENOX_SAMPLED_GATE=cost
-```
-
-The gate formula matches the upstream original (reversed from flash_serve on
-2026-11-19; n = chain length after folding in draft n's calibrated acceptance,
-prev accumulates from 1):
-
-- greedy: draft n first looks up `cal_g` by its top-1 confidence bin,
-  `prev *= cal_g[bin]`; for n≥2, trim to n-1 when
-  `prev·Tg < T(n+1)-T(n)`; for n≤6, stop at n when
-  `prev·abar_g[n+1]·Tg < T(n+2)-T(n+1)+Hg`; capped at 7.
-- sampled: bin by the **drawn token's** probability (not top-1) into `cal_s`,
-  single check `prev·abar_s[n+1]·Ts < T(n+2)-T(n+1)+Hs` stops at n.
-
-`T(1..8)` and `Hg/Hs` are the engine's built-in per-row verify profile;
-`t = {Tg, Ts}` comes from the head file (the fallback is 14.0 ms). Greedy
-output stays bit-identical and sampled output keeps the exact
-rejection-sampling distribution; only the draft length changes. Startup logs
-`mtp: spec cost from the head file (...)` or `from built-in defaults (...)`;
-a partial tensor set falls back to the defaults.
-
-`QWENOX_SAMPLED_GATE=t1,t2` is the default sampled-gate flavor (default
-**0.95,0.98**, matching upstream halogen): it applies to the **drawn token's**
-probability, t1 for the first draft and t2 afterwards. Setting `0` disables it
-and falls back to `QWENOX_SPEC_CONF`'s top-1 flavor (default 0.9); when both
-are set, SAMPLED_GATE wins.
-
-`QWENOX_SPEC_COST_SCALE` defaults to **1.0** (= the upstream formula). It is a
-Qwenox-only plain multiplier on the cost side (smaller = deeper drafts): the
-built-in T/H profile is fitted on halogen's engine, so tune it if this
-machine's round/rollback costs differ (see the local A/B below). On
-low-confidence or synthetic tokens (for example qsa-oracle) cost can be slower
-from rollbacks; raise the scale or leave the cost rule off there.
-
-Local A/B (2026-11-19, same binary, same 3072-token code-generation prompt,
-default sampling, JOINT on; median of 3):
-
-| Config | tok/s | commit/round | MTP per-draft acc |
-| --- | --- | --- | --- |
-| old head + top-1 0.9 gate (`SAMPLED_GATE=0`) | 68.8 | 6.1 | 0.81 |
-| r2 + upstream gate (default 0.95,0.98) | 67.0 | 5.4 | 0.83 |
-| old head + upstream gate | 64.5 | 5.6 | 0.82 |
-| r2 + top-1 0.9 gate (`SAMPLED_GATE=0`) | 64.5 | 5.4 | 0.82 |
-| r2 + cost (scale 0.5) | 64.1 | 5.4 | 0.78 |
-| r2 + cost (scale 1.0) | 52.9 | 3.6 | 0.59 |
-| old head + cost (scale 1.0, built-in tables) | 50.8 | 3.5 | 0.61 |
-
-How to read this: the built-in T/H profile is fitted on upstream's engine; at
-scale 1.0 the static chain cap is only 2 (the `max_g` in the startup log),
-which over-trims on this machine whose marginal per-row cost is much lower;
-scale 0.5 catches up with the top-1 gate. On gate flavors: top-1 0.9 extends
-chains by confidence, and the old head is systematically overconfident (at
-top-1≈0.9 its true acceptance is 0.64 vs r2's 0.85), which pays off on
-high-acceptance code. The upstream drawn-probability gate trims exactly the
-drafts that drew an improbable token (those bound to be rejected), so r2's
-honest calibration flips the result: +3.9% over the old head (67.0 vs 64.5),
-reproducing upstream's claimed gain — which is why the default gate now
-follows upstream.
-
 ## Reading the Logs
 
 ```bash
@@ -124,6 +53,9 @@ All on by default; turn off only for troubleshooting:
 | `QWENOX_SMS_GPU=0` | Disable GPU sampling prep (bias, legacy presence/frequency and llama repeat corrections + top-k on the GPU, only candidates copied back; active for top_k 1..64, otherwise the host full-vocab path is used). Output distribution unchanged; the exact tokens for a given seed may differ |
 | `QWENOX_DRAFT_LM_Q4=0` | Drafts use the production lm_head again (default: the base file's 4-bit copy; affects drafts only, never committed tokens; ~350 MB extra VRAM) |
 | `QWENOX_ARGMAX_OLD=1` | Single-block argmax (differs only on exact ties) |
+| `QWENOX_GREEDY_CONF=0` | Disable the greedy draft confidence gate (default 0.9: close the chain when the draft head's top-1 probability falls below 0.9; that step is still verified, output is unchanged and only likely-rejected verify rows are skipped) |
+| `QWENOX_SAMPLED_GATE=0` | Disable the sampled draft confidence gate (default **0.95,0.98**: the second draft needs the first draw's probability ≥ t1, and later drafts each need the previous one ≥ t2; explicit 0 falls back to `QWENOX_SPEC_CONF`'s top-1 threshold, default 0.9) |
+| `QWENOX_SPEC_CONF=0` | Disable the sampled top-1 confidence gate (default 0.9); set together with `QWENOX_SAMPLED_GATE=0` to return to adaptive γ |
 
 llama `REPEAT` also uses the GPU sparse path for MTP/chain sampling: drafts share the base window,
 while each verify row simulates its complete hypothetical window, including duplicates, full-window eviction
@@ -143,17 +75,17 @@ One-shot check: `bash tools/tg_verify.sh` (kernel unit test + greedy token ident
 
 ## Adaptive γ (auto)
 
-The controller keeps two sets of per-depth acceptance estimates, split by whether the previous round was fully accepted. A round that follows a full accept is clearly more likely to be accepted (real-text sampling: .93/.86/.83 vs .77/.71/.73). A deeper γ makes full accepts rarer, so the effective acceptance falls as γ grows. A single estimate can't see this and drifts deep. The controller combines the two sets through their stationary probabilities into an expected commit, divides by the cost `1 + r·γ`, and picks γ.
+The controller keeps two sets of per-depth acceptance estimates, split by whether the previous round was fully accepted. A round that follows a full accept is clearly more likely to be accepted (real-text sampling: .93/.86/.83 vs .77/.71/.73). A deeper γ makes full accepts rarer, so the effective acceptance falls as γ grows. A single estimate can't see this and drifts deep. The controller combines the two sets through their stationary probabilities into an expected commit, divides by the cost `1 + r·γ`, and picks γ. Sampling is gated by default, so this controller is inactive there; to exercise it for sampling, set both `QWENOX_SAMPLED_GATE=0` and `QWENOX_SPEC_CONF=0`.
 
 | Switch | Effect |
 |---|---|
-| `QWENOX_SPEC_ADAPT=0` | Sampling auto falls back to fixed 3 |
+| `QWENOX_SPEC_ADAPT=0` | Sampling auto's controller falls back to 3; with the confidence gates on (the default) the gate still plans, up to 7 |
 | `QWENOX_SPEC_ADAPT_GREEDY=1` | Greedy auto adapts too (default fixed 4; paired tests put the two within ±1%, and fixed is reproducible) |
 | `QWENOX_SPEC_ADAPT_R` | Slope/intercept ratio of the round cost model `1 + r·γ` (measured ≈ 42 + 10.7·γ ms → 0.25; default 0.3 offsets the model's optimism about deep γ) |
 | `QWENOX_SPEC_ADAPT_ALPHA` | EMA step of the per-depth acceptance estimates (default 0.05) |
 | `QWENOX_SPEC_ADAPT_HYST` / `_MIN` / `_MAX` | Switch margin (default 0.02) / γ floor 3 (runs stuck at γ2 measured ~20% slower than γ3) / cap 7 (γ=8 = 9 verify rows, past the P≤8 fast paths) |
 
-Offline: `--gamma 0` (pp_prod.sh `GAMMA=0`) runs adaptive. Tuning tools:
+Offline: `--gamma 0` (pp_prod.sh `GAMMA=0`) enables auto; the confidence gates still plan by default — set both `QWENOX_SAMPLED_GATE` and `QWENOX_SPEC_CONF` to 0 to exercise the adaptive controller. Tuning tools:
 
 - `tools/gamma_trace.sh` + `tools/gamma_sim.py`: `QWENOX_SPEC_TRACE=1` prints per-round `γ,accepted,ms`; replay controllers offline. `MODEL=markov` (two-state generator; fixed-γ commit/round within ~2% of measured) is the most accurate; the default pos/round replays underpredict shallow γ by 7–9% — use them for ranking only.
 - `tools/gamma_force_check.sh`: `QWENOX_SPEC_FORCE=<ids file>` makes greedy spec verify against a reference sequence, so every γ config commits identical tokens — a paired comparison with only timing noise (~±1%). Comparing γ values directly, greedy trajectories diverge at near-ties and a single prompt varies ±15–27%.

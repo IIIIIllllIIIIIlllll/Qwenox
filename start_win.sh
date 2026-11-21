@@ -96,7 +96,7 @@ if [[ "$engine_connect_host" == 0.0.0.0 ]]; then engine_connect_host=127.0.0.1; 
 [[ "$ENGINE_PORT" =~ ^[1-9][0-9]*$ && "$ENGINE_PORT" -le 65535 ]] || fail 'ENGINE_PORT 必须为 1–65535'
 [[ "$API_PORT" =~ ^[1-9][0-9]*$ && "$API_PORT" -le 65535 ]] || fail 'API_PORT 必须为 1–65535'
 [[ "$ENGINE_PORT" != "$API_PORT" ]] || fail 'ENGINE_PORT 与 API_PORT 必须不同'
-[[ "$MTP_GAMMA" =~ ^[0-8]$ ]] || fail 'MTP_GAMMA 范围为 0–8（0=引擎按模式自选 greedy 4 / 采样自适应）'
+[[ "$MTP_GAMMA" =~ ^[0-8]$ ]] || fail 'MTP_GAMMA 范围为 0–8（0=引擎按模式自选：greedy 4；采样由置信门规划）'
 [[ "$KVSNAP_MAX_GB" =~ ^(0|[1-9][0-9]*)$ ]] || fail 'KVSNAP_MAX_GB 必须为非负整数'
 [[ "$RCKPT_MAX" =~ ^(0|[1-9][0-9]*)$ ]] || fail 'RCKPT_MAX 必须为非负整数'
 [[ "$KV_TYPE" == bf16 || "$KV_TYPE" == fp16 || "$KV_TYPE" == q8 ]] || fail "KV_TYPE must be bf16, fp16 or q8"
@@ -154,7 +154,7 @@ for port in "$ENGINE_PORT" "$API_PORT"; do
 done
 echo "项目：$ROOT"
 echo "模型：$MODEL_FILE$([[ "$WEIGHTS" == gguf ]] && echo "（GGUF，MTP：${GGUF_MTP_FILE:-不使用}）")"
-echo "配置：${MAX_CONTEXT} 上下文，MTP gamma=$([[ $MTP_GAMMA == 0 ]] && echo 'auto（greedy 4 / 采样自适应）' || echo "$MTP_GAMMA")，engine ${ENGINE_HOST}:${ENGINE_PORT}，API ${API_HOST}:${API_PORT}"
+echo "配置：${MAX_CONTEXT} 上下文，MTP gamma=$([[ $MTP_GAMMA == 0 ]] && echo 'auto（greedy 4 / 采样置信门）' || echo "$MTP_GAMMA")，engine ${ENGINE_HOST}:${ENGINE_PORT}，API ${API_HOST}:${API_PORT}"
 if (( KV_PAGED )); then
   echo "KV：分页，页池 $(( (KV_POOL_TOKENS > MAX_CONTEXT ? KV_POOL_TOKENS : MAX_CONTEXT) )) token（${PARALLEL} 路并发共享），RAM 检查点 ${RCKPT_MAX} 个"
   (( PARALLEL == 1 )) || echo "提示：每多一路并发约多占 0.27 GiB 设备内存，arena（95 GiB 上限）放不下的部分会回退 hipMalloc" >&2
@@ -193,7 +193,7 @@ KVSNAP_DIR="${KVSNAP_DIR-}"
 if [[ -n "$KVSNAP_DIR" ]]; then
   KVSNAP_DIR="${KVSNAP_DIR%/}"; export QWENOX_KVSNAP_DIR="${KVSNAP_DIR%\\}/qwenox-kvsnap"
 fi
-# MTP_GAMMA=0：不导出（并清掉外部残留），引擎按请求模式自选（greedy 4 / 采样自适应）。
+# MTP_GAMMA=0：不导出（并清掉外部残留），引擎按请求模式自选（greedy 4；采样由置信门规划，默认 0.95,0.98）。
 if (( MTP_GAMMA > 0 )); then export QWENOX_SPEC_GAMMA="$MTP_GAMMA"; else unset QWENOX_SPEC_GAMMA; fi
 unset QWENOX_KV_PAGED QWENOX_KV_POOL_TOKENS
 if (( KV_PAGED )); then
