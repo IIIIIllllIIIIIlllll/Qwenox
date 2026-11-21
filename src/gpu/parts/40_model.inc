@@ -17,6 +17,42 @@ struct ReqCancelled : std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
+#ifdef _WIN32
+// QWENOX_WIN_KICK (default on): submit the null stream's queued kernels now
+// instead of at the next sync / 256th command (no direct dispatch on Windows).
+// Only outside capture.
+static inline void win_kick() {
+  static const bool on = [] {
+    const char* e = getenv("QWENOX_WIN_KICK");
+    return !(e && !strcmp(e, "0"));
+  }();
+  if (!on || g_str != nullptr) return;
+  hipStreamCaptureStatus st = hipStreamCaptureStatusNone;
+  if (hipStreamIsCapturing(nullptr, &st) != hipSuccess || st != hipStreamCaptureStatusNone) {
+    (void)hipGetLastError();
+    return;
+  }
+  // An event record is a marker: the queue thread submits everything queued
+  // before it. (hipStreamQuery also submits but can stall ~0.4 ms per call.)
+  static hipEvent_t ev = [] {
+    hipEvent_t e = nullptr;
+    if (hipEventCreateWithFlags(&e, hipEventDisableTiming) != hipSuccess) e = nullptr;
+    return e;
+  }();
+  if (ev) (void)hipEventRecord(ev, nullptr);
+}
+static inline int win_kick_stride() {
+  static const int s = [] {
+    const char* e = getenv("QWENOX_WIN_KICK_LAYERS");
+    return e ? atoi(e) : 1;
+  }();
+  return s;
+}
+#else
+static inline void win_kick() {}
+static inline int win_kick_stride() { return 0; }
+#endif
+
 struct GpuModel {
   const Checkpoint& ckpt;
   bool ple_on = true;
@@ -8984,6 +9020,7 @@ struct GpuModel {
     DpfScope dpf(*this, P);
     dpf.layer(0);
     enq_layer_b(0, P, false, true, base);
+    win_kick();
     dpf.pause();
     vg_dump_row("vg0", P, base);
     if (prog_total > 0) prog_probe(0, P);
@@ -9013,6 +9050,7 @@ struct GpuModel {
       dpf.layer(l);
       enq_layer_b(l, P, fuse_prev, flush_mlp, base);
       dpf.pause();
+      if (win_kick_stride() > 0 && l % win_kick_stride() == 0) win_kick();
       {
         char tag[8];
         snprintf(tag, sizeof tag, "pcL%d", l);
@@ -9743,6 +9781,7 @@ struct GpuModel {
       CK(hipMemcpyAsync(d_mtok, &tok, 4, hipMemcpyHostToDevice, g_str));
     CK(hipMemcpyAsync(d_mpos, &mtp_pos, 4, hipMemcpyHostToDevice, g_str));
     mtp_input_1(tap);
+    win_kick();
     mtp_gr_read("mtp.layers.0.attn_hyper_connection", d_x);
     mtp_qsa(d_x, d_y);
     mtp_gr_write("mtp.layers.0.attn_hyper_connection", d_y);
@@ -10333,6 +10372,7 @@ struct GpuModel {
     CK(hipMemcpyAsync(d_tokarr, toks.data(), P * 4, hipMemcpyHostToDevice,
                       g_str));
     mtp_input_b(taps, P);
+    win_kick();
     xf16_src = nullptr;
     mtp_gr_read_b("mtp.layers.0.attn_hyper_connection", P);
     // aggr 10-05: ingest = KV/indexer build only (see mtp_qsa_b kv_only). The
@@ -10750,13 +10790,26 @@ struct GpuModel {
         src, stride, stride, d_sm_ctrl, d_sm_cand_ids, d_sm_cand_vals,
         d_sm_cand_n, SMS_TCAP);
     std::vector<int> cn(rows);
-    CK(hipMemcpy(cn.data(), d_sm_cand_n, rows * 4, hipMemcpyDeviceToHost));
+    bool got = false;
+#ifdef _WIN32
+    {  // Windows: the three reads share one sync (see wsc_d2hv)
+      const WscSeg sg[3] = {
+          {cn.data(), d_sm_cand_n, (size_t)rows * 4},
+          {h_sm_ids.data(), d_sm_cand_ids, (size_t)rows * SMS_TCAP * 4},
+          {h_sm_vals.data(), d_sm_cand_vals, (size_t)rows * SMS_TCAP * 4}};
+      got = wsc_d2hv(sg, 3, g_str);
+    }
+#endif
+    if (!got)
+      CK(hipMemcpy(cn.data(), d_sm_cand_n, rows * 4, hipMemcpyDeviceToHost));
     for (int r = 0; r < rows; r++)
       if (cn[r] < k || cn[r] > SMS_TCAP) return false;
-    CK(hipMemcpy(h_sm_ids.data(), d_sm_cand_ids, (size_t)rows * SMS_TCAP * 4,
-                 hipMemcpyDeviceToHost));
-    CK(hipMemcpy(h_sm_vals.data(), d_sm_cand_vals,
-                 (size_t)rows * SMS_TCAP * 4, hipMemcpyDeviceToHost));
+    if (!got) {
+      CK(hipMemcpy(h_sm_ids.data(), d_sm_cand_ids, (size_t)rows * SMS_TCAP * 4,
+                   hipMemcpyDeviceToHost));
+      CK(hipMemcpy(h_sm_vals.data(), d_sm_cand_vals,
+                   (size_t)rows * SMS_TCAP * 4, hipMemcpyDeviceToHost));
+    }
     std::vector<int> ord;
     for (int r = 0; r < rows; r++) {
       const int m = cn[r];

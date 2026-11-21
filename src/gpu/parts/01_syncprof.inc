@@ -100,14 +100,146 @@ static inline int sp_kind(hipMemcpyKind k, bool async) {
     default: return async ? SP_ASYNC_D2D : SP_MEMCPY_D2D;
   }
 }
+
+#ifdef _WIN32
+// ---- Windows small host<->device transfers (QWENOX_WIN_SMALLCOPY=0: off) ----
+// Under WDDM a small hipMemcpy D2H or pageable hipMemcpyAsync H2D goes through
+// the runtime's copy path and leaves the GPU idle ~0.1-0.3 ms per call around
+// it; the sampled draft loop does ~16 of them per round. Small reads become
+// one copy kernel into a persistent coherent pinned buffer plus one stream
+// sync; small async writes become kernel arguments. Same bytes, same stream
+// order. Large transfers, capture and non-device sources keep the runtime path.
+static const bool g_wsc_on = [] {
+  const char* e = getenv("QWENOX_WIN_SMALLCOPY");
+  return !(e && !strcmp(e, "0"));
+}();
+__global__ void k_wsc_copy(uint32_t* dst, const uint32_t* src, unsigned n4) {
+  for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += gridDim.x * blockDim.x)
+    dst[i] = src[i];
+  __threadfence_system();
+}
+struct WscVals {
+  int v[16];
+  int n;
+};
+__global__ void k_wsc_set(int* dst, WscVals s) {
+  if ((int)threadIdx.x < s.n) dst[threadIdx.x] = s.v[threadIdx.x];
+}
+struct WscSeg {
+  void* dst;
+  const void* src;
+  size_t n;
+};
+struct WinSmallCopy {
+  static constexpr size_t kCap = (size_t)512 << 10;
+  std::mutex mu;
+  uint8_t* h = nullptr;
+  uint8_t* hd = nullptr;
+  bool failed = false;
+  bool ready() {
+    if (h) return true;
+    if (failed) return false;
+    if (hipHostMalloc((void**)&h, kCap, hipHostMallocMapped | hipHostMallocCoherent) != hipSuccess ||
+        hipHostGetDevicePointer((void**)&hd, h, 0) != hipSuccess) {
+      failed = true;
+      h = nullptr;
+      fprintf(stderr, "win-smallcopy: pinned staging unavailable, using hipMemcpy\n");
+      return false;
+    }
+    return true;
+  }
+};
+static WinSmallCopy g_wsc;
+static inline bool wsc_capturing(hipStream_t s) {
+  hipStreamCaptureStatus st = hipStreamCaptureStatusNone;
+  return hipStreamIsCapturing(s, &st) != hipSuccess || st != hipStreamCaptureStatusNone;
+}
+static inline bool wsc_is_device(const void* p) {
+  hipPointerAttribute_t a{};
+  if (hipPointerGetAttributes(&a, p) != hipSuccess) {
+    (void)hipGetLastError();
+    return false;
+  }
+  return a.type == hipMemoryTypeDevice;
+}
+// Pageable host memory: the runtime stages it synchronously anyway. Pinned
+// destinations keep the real async path.
+static inline bool wsc_is_pageable(const void* p) {
+  hipPointerAttribute_t a{};
+  if (hipPointerGetAttributes(&a, p) != hipSuccess) {
+    (void)hipGetLastError();
+    return true;
+  }
+  return a.type != hipMemoryTypeHost && a.type != hipMemoryTypeDevice &&
+         a.type != hipMemoryTypeManaged;
+}
+// Reads every segment (device -> host) with one sync. False: nothing was
+// enqueued and the caller must use hipMemcpy.
+static inline bool wsc_d2hv(const WscSeg* sg, int nseg, hipStream_t s) {
+  if (!g_wsc_on) return false;
+  size_t tot = 0;
+  for (int i = 0; i < nseg; i++) {
+    if (sg[i].n == 0 || (sg[i].n & 3) || ((uintptr_t)sg[i].src & 3)) return false;
+    tot += (sg[i].n + 15) & ~(size_t)15;
+  }
+  if (tot > WinSmallCopy::kCap) return false;
+  for (int i = 0; i < nseg; i++)
+    if (!wsc_is_device(sg[i].src)) return false;
+  std::lock_guard<std::mutex> lk(g_wsc.mu);
+  if (!g_wsc.ready() || wsc_capturing(s)) return false;
+  size_t off = 0;
+  for (int i = 0; i < nseg; i++) {
+    const unsigned n4 = (unsigned)(sg[i].n / 4);
+    const unsigned grid = std::min(64u, (n4 + 255) / 256);
+    hipLaunchKernelGGL(k_wsc_copy, dim3(grid), dim3(256), 0, s, (uint32_t*)(g_wsc.hd + off),
+                       (const uint32_t*)sg[i].src, n4);
+    off += (sg[i].n + 15) & ~(size_t)15;
+  }
+  const hipError_t e = hipStreamSynchronize(s);
+  if (e != hipSuccess) {
+    fprintf(stderr, "win-smallcopy: sync failed: %s\n", hipGetErrorString(e));
+    abort();
+  }
+  off = 0;
+  for (int i = 0; i < nseg; i++) {
+    memcpy(sg[i].dst, g_wsc.h + off, sg[i].n);
+    off += (sg[i].n + 15) & ~(size_t)15;
+  }
+  return true;
+}
+// Small async host -> device write as kernel arguments (values read now, as
+// the runtime does for pageable sources).
+static inline bool wsc_h2d(void* dst, const void* src, size_t n, hipStream_t s) {
+  if (!g_wsc_on || n == 0 || n > 64 || (n & 3) || ((uintptr_t)dst & 3)) return false;
+  if (wsc_capturing(s) || !wsc_is_device(dst)) return false;
+  WscVals v{};
+  v.n = (int)(n / 4);
+  memcpy(v.v, src, n);
+  hipLaunchKernelGGL(k_wsc_set, dim3(1), dim3(32), 0, s, (int*)dst, v);
+  return true;
+}
+#endif
 static inline hipError_t sp_hipMemcpy(const char* f, int l, void* dst, const void* src,
                                       size_t n, hipMemcpyKind k) {
   SpTimer t(f, l, sp_kind(k, false));
+#ifdef _WIN32
+  if (k == hipMemcpyDeviceToHost) {
+    const WscSeg sg{dst, src, n};
+    if (wsc_d2hv(&sg, 1, nullptr)) return hipSuccess;
+  }
+#endif
   return hipMemcpy(dst, src, n, k);
 }
 static inline hipError_t sp_hipMemcpyAsync(const char* f, int l, void* dst, const void* src,
                                            size_t n, hipMemcpyKind k, hipStream_t s = nullptr) {
   SpTimer t(f, l, sp_kind(k, true));
+#ifdef _WIN32
+  if (k == hipMemcpyHostToDevice && wsc_h2d(dst, src, n, s)) return hipSuccess;
+  if (k == hipMemcpyDeviceToHost && wsc_is_pageable(dst)) {
+    const WscSeg sg{dst, src, n};
+    if (wsc_d2hv(&sg, 1, s)) return hipSuccess;
+  }
+#endif
   return hipMemcpyAsync(dst, src, n, k, s);
 }
 static inline hipError_t sp_hipStreamSynchronize(const char* f, int l, hipStream_t s) {
