@@ -15,8 +15,9 @@
   草稿头不另加向量。接入 service.conf、Linux/Windows 启动器、三处设置界面与 API 控制台；
   prefill 的投影折进已有的“HC 写回 + norm”融合 kernel（写与 norm 之间一次块内 dot，
   不增加残差流量），因此融合写保持开启，8K prefill 实测在噪声内（1183 vs 1176 tok/s）；
-  快照指纹混入向量内容。见 [CVEC.md](docs/CVEC.md)，内核回归在 `bash build_win.sh test`。
+  快照指纹混入向量内容。见 [CVEC.md](docs/CVEC.md)，内核回归在 `bash build_win.sh test`；发行包附带 `refusal/qwen38-flash-next-refusal.gguf`（约 480 KB，上游参考向量副本）。
 - **MTP 草稿置信门默认值**：采样默认 `QWENOX_SAMPLED_GATE=0.95,0.98`（作用于抽中 token 的概率；显式 0 退回 `QWENOX_SPEC_CONF` 的 top-1 0.9），greedy 默认 `QWENOX_GREEDY_CONF=0.9`；只改变草稿长度，不改变 greedy 输出与采样分布。
+- **q8 的 KV 池上限提到 1M**：`KV_TYPE=q8` 时有效池上限为 1048576 token，bf16/fp16 保持 524288；启动器/API 校验、设置面板、TUI 与网页启动器同步（#58）。
 
 ## v0.1.2 — 2026-11-12
 
