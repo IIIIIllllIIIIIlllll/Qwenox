@@ -314,8 +314,8 @@ API_FLAGS=(-O2 -std=c++17 "${VER_FLAGS[@]}" -Isrc/api -Ithird_party -Ithird_part
 ensure_gen_static_inc() {
   if [ ! -x build/gen_static_inc ] || [ tools/gen_static_inc.cpp -nt build/gen_static_inc ]; then
     echo "[生成] build/gen_static_inc"
-    "$CXX" -O2 -std=c++17 tools/gen_static_inc.cpp -o "build/gen_static_inc.tmp.$$" \
-      && mv -f "build/gen_static_inc.tmp.$$" build/gen_static_inc || return 1
+    "$CXX" -O2 -std=c++17 tools/gen_static_inc.cpp -o "build/gen_static_inc.tmp.$BASHPID" \
+      && mv -f "build/gen_static_inc.tmp.$BASHPID" build/gen_static_inc || return 1
   fi
 }
 # 图标源文件全仓唯一(src/launch_win.ico / src/apple-touch-icon.png)，
