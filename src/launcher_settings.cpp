@@ -1785,7 +1785,23 @@ void handle_config_post(const http::Request& q, http::Response* r, http::Stream*
     send_json(r, j);
 }
 
-void handle_status(const http::Request&, http::Response* r, http::Stream*) {
+// Host 头中的主机部分（去掉端口）；缺失或无有效主机时返回空串。
+// IPv6 字面量保留方括号（"[::1]:8729" -> "[::1]"）。
+std::string request_hostname(const http::Request& q) {
+    std::string host = q.header("host");
+    if (host.empty()) return {};
+    if (host[0] == '[') {
+        const size_t end = host.find(']');
+        return end == std::string::npos ? std::string() : host.substr(0, end + 1);
+    }
+    const size_t colon = host.rfind(':');
+    if (colon != std::string::npos &&
+        host.find_first_not_of("0123456789", colon + 1) == std::string::npos)
+        host.resize(colon);
+    return host;
+}
+
+void handle_status(const http::Request& q, http::Response* r, http::Stream*) {
     json j = status_json();
 #ifdef _WIN32
     j["platform"] = "windows";
@@ -1795,7 +1811,14 @@ void handle_status(const http::Request&, http::Response* r, http::Stream*) {
     // 控制台地址（API 就绪后前端展示链接）
     std::lock_guard<std::mutex> lk(g_conf_mtx);
     const std::string host = svcconf::cfg(g_conf, "API_HOST", "0.0.0.0");
-    j["console_url"] = "http://" + engine_net::connect_host(host) + ":" +
+    // API_HOST 为通配地址时按浏览器实际访问的主机名/IP 跳转（经局域网打开
+    // 启动器页时不能写死 127.0.0.1）；指定了具体地址则沿用该监听地址。
+    std::string console_host = engine_net::connect_host(host);
+    if (host == "0.0.0.0") {
+        std::string req_host = request_hostname(q);
+        if (!req_host.empty()) console_host = req_host;
+    }
+    j["console_url"] = "http://" + console_host + ":" +
                        svcconf::cfg(g_conf, "API_PORT", "8731") + "/";
     send_json(r, j);
 }
