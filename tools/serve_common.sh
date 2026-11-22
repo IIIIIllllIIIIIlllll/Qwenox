@@ -105,7 +105,7 @@ serve_init() {
   (( PARALLEL == 1 || KV_PAGED )) || fail 'PARALLEL>1 需要 KV_PAGED=1'
   (( ENGINE_PORT <= 65535 && API_PORT <= 65535 && ENGINE_PORT != API_PORT )) || fail '端口必须为不同的 1–65535 整数'
   (( MTP_GAMMA <= 8 )) || fail 'MTP_GAMMA 范围为 0–8（0=引擎按模式自选：greedy 4；采样由置信门规划）'
-  for cmd in flock ss systemctl stat awk pgrep setsid; do command -v "$cmd" >/dev/null || fail "缺少命令：$cmd"; done
+  for cmd in flock ss systemctl stat awk setsid; do command -v "$cmd" >/dev/null || fail "缺少命令：$cmd"; done
   systemctl --user show-environment >/dev/null || fail 'systemd 用户会话不可用，请通过普通用户 SSH 登录运行'
   [[ -x build/qwenox-engine && -x build/qwenox-api ]] || fail '缺少编译产物，请先运行 bash build.sh'
   # 权重格式只由启动器决定：外部残留的 QWENOX_GGUF* 一律清掉，GGUF 启动器再按 service.conf 导出。
@@ -131,7 +131,8 @@ serve_run() {
   for port in "$ENGINE_PORT" "$API_PORT"; do
     [[ -z "$(ss -H -ltn "sport = :$port")" ]] || fail "端口 $port 已被占用"
   done
-  if processes="$(pgrep -af '(^|/)(qwenox[^/[:space:]]*|flash_serve|serve_api\.py)([[:space:]]|$)')"; then
+  source "$ROOT/tools/service_processes.sh"
+  if processes="$(running_service_processes)"; then
     fail "已有引擎或 API 进程，请先停止：$processes"
   fi
   available="$(awk '/MemAvailable:/{print int($2/1048576)}' /proc/meminfo)"

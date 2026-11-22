@@ -53,7 +53,8 @@ esac
 TIMEOUT_SCALE="${QWENOX_TIMEOUT_SCALE:-1}"
 [[ "$TIMEOUT_SCALE" =~ ^[1-9][0-9]*$ ]] || { echo 'QWENOX_TIMEOUT_SCALE 必须是正整数' >&2; exit 2; }
 command -v flock >/dev/null || { echo '缺少 flock，请安装 util-linux' >&2; exit 1; }
-if processes="$(pgrep -af '(^|/)(qwenox[^/[:space:]]*|flash_serve|serve_api\.py)([[:space:]]|$)')"; then
+source "$ROOT/tools/service_processes.sh"
+if processes="$(running_service_processes)"; then
   echo "已有引擎或 API 在运行，请先在原终端停止服务：$processes" >&2
   exit 1
 fi
@@ -392,6 +393,7 @@ build_launcher() {
 }
 
 build_test() {
+  run 1 30 bash tools/service_processes_test.sh || return 1
   run 1 30 python3 tools/cvec_config_test.py --bash "$BASH" || return 1
   run 8 180 python3 tools/kv_admission_test.py --cxx "$CXX" || return 1
   run 8 180 python3 tools/kv_page_test.py --cxx "$CXX" || return 1
