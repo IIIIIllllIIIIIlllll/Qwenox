@@ -63,8 +63,9 @@ HIPCC=/opt/rocm/bin/hipcc GPU_ARCH=gfx1151 bash build.sh
   用户态运行库和 API 所需的
   libpng/libjpeg/libwebp 依赖闭包复制到 `build/lib/`，并仅复制
   `GPU_ARCH` 对应的 rocBLAS/hipBLASLt kernel db。二进制带
-  `$ORIGIN/lib` RPATH，`start_hgn.sh` / `start_gguf.sh` 也会显式使用这套私有库；部署时把整个
-  `build/` 一起复制即可，目标机器不需要另装这些运行库。
+  `$ORIGIN/lib` RPATH，`start_hgn.sh` / `start_gguf.sh` 也会显式使用这套私有库；新版 ROCm
+  按 gfx 架构分目录时，kernel db 环境变量会指向对应的 `library/<GPU_ARCH>/`，而不是
+  `library/` 顶层。部署时把整个 `build/` 一起复制即可，目标机器不需要另装这些运行库。
 
 ## 编译选项(供参考)
 

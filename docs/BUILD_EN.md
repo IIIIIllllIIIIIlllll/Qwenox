@@ -70,8 +70,10 @@ HIPCC=/opt/rocm/bin/hipcc GPU_ARCH=gfx1151 bash build.sh
   user-space runtime plus the libpng/libjpeg/libwebp dependency closure
   into `build/lib/`. It also copies only the rocBLAS/hipBLASLt kernel database
   for `GPU_ARCH`. The binaries contain an `$ORIGIN/lib` RPATH and `start_hgn.sh` /
-  `start_gguf.sh` explicitly select the bundled files, so deployments should copy the whole
-  `build/` directory and do not need these runtimes installed separately.
+  `start_gguf.sh` explicitly select the bundled files. With newer ROCm releases that split
+  kernel databases by architecture, their environment variables point to
+  `library/<GPU_ARCH>/`, not the top-level `library/` directory. Deployments should copy
+  the whole `build/` directory and do not need these runtimes installed separately.
 
 ## Compile options (for reference)
 

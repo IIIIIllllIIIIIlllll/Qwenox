@@ -425,10 +425,14 @@ case "$TARGET" in
     build_test
     if (( BUNDLE_RUNTIME )); then
       bundle_gpu_runtime build/ktest
+      rocblas_db="$ROOT/build/lib/rocblas/library"
+      hipblaslt_db="$ROOT/build/lib/hipblaslt/library"
+      [[ ! -d "$rocblas_db/$GPU_ARCH" ]] || rocblas_db="$rocblas_db/$GPU_ARCH"
+      [[ ! -d "$hipblaslt_db/$GPU_ARCH" ]] || hipblaslt_db="$hipblaslt_db/$GPU_ARCH"
       run 8 600 env \
         "LD_LIBRARY_PATH=$ROOT/build/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-        "ROCBLAS_TENSILE_LIBPATH=$ROOT/build/lib/rocblas/library" \
-        "HIPBLASLT_TENSILE_LIBPATH=$ROOT/build/lib/hipblaslt/library" \
+        "ROCBLAS_TENSILE_LIBPATH=$rocblas_db" \
+        "HIPBLASLT_TENSILE_LIBPATH=$hipblaslt_db" \
         build/ktest
     else
       run 8 600 build/ktest

@@ -43,11 +43,18 @@ serve_init() {
   ROPE_BETA_SLOW="${ROPE_BETA_SLOW:-1}"
   ROPE_ATTN_SCALE="${ROPE_ATTN_SCALE:-0}"
   if [[ -f "$ROOT/build/bundled-runtime.conf" ]]; then
-    # --bundle 产物优先使用随包库；kernel db 使用绝对路径，不依赖 cwd。
+    # --bundle 产物优先使用随包库；新版 kernel db 的环境变量须指向 gfx 子目录。
     [[ -d "$ROOT/build/lib" ]] || fail '缺少 build/lib，请重新运行 bash build.sh --bundle'
+    local GPU_ARCH rocblas_db hipblaslt_db
+    source "$ROOT/build/bundled-runtime.conf"
+    [[ "$GPU_ARCH" =~ ^gfx[0-9A-Za-z]+$ ]] || fail 'bundled-runtime.conf 中的 GPU_ARCH 无效'
+    rocblas_db="$ROOT/build/lib/rocblas/library"
+    hipblaslt_db="$ROOT/build/lib/hipblaslt/library"
+    [[ ! -d "$rocblas_db/$GPU_ARCH" ]] || rocblas_db="$rocblas_db/$GPU_ARCH"
+    [[ ! -d "$hipblaslt_db/$GPU_ARCH" ]] || hipblaslt_db="$hipblaslt_db/$GPU_ARCH"
     export LD_LIBRARY_PATH="$ROOT/build/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-    export ROCBLAS_TENSILE_LIBPATH="$ROOT/build/lib/rocblas/library"
-    export HIPBLASLT_TENSILE_LIBPATH="$ROOT/build/lib/hipblaslt/library"
+    export ROCBLAS_TENSILE_LIBPATH="$rocblas_db"
+    export HIPBLASLT_TENSILE_LIBPATH="$hipblaslt_db"
     [[ -d "$ROCBLAS_TENSILE_LIBPATH" && -d "$HIPBLASLT_TENSILE_LIBPATH" ]] || \
       fail '缺少 rocBLAS/hipBLASLt kernel db，请重新运行 bash build.sh --bundle'
     local pattern
