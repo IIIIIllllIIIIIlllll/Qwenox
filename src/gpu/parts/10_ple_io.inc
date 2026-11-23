@@ -958,6 +958,24 @@ __global__ void k_index_scores(const float* queries, const float* keys, float* s
   }
 }
 
+// Score indexer blocks [b0, n1) only, writing the same absolute columns as
+// k_index_scores. MTP's window uses this so a long cache is not scored.
+__global__ void k_index_scores_range(const float* queries, const float* keys, float* scores,
+                                     int stride, int b0, int n1,
+                                     const int* __restrict__ ptab = nullptr) {
+  int b = b0 + blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
+  int lane = threadIdx.x % warpSize;
+  if (b >= n1) return;
+  const float* kb = keys + (size_t)ik_blk(ptab, b) * 128;
+  for (int h = 0; h < 4; h++) {
+    float sum = 0.f;
+    for (int d = lane; d < 128; d += warpSize)
+      sum += queries[h * 128 + d] * kb[d];
+    for (int s = warpSize / 2; s; s >>= 1) sum += __shfl_down_sync(~0ull, sum, s);
+    if (!lane) scores[h * stride + b] = sum;
+  }
+}
+
 // Paged prefill: gather logical blocks [0, nb) of one layer's indexer keys
 // into a contiguous scratch so the score sgemm / tiled kernel keep their
 // exact shape (bit-identical to the unpaged layout). grid = nb, block = 128.
@@ -993,7 +1011,8 @@ __global__ void k_ik_twin_build(const float* __restrict__ src,
 // nonnegative; low bits break equal-score ties by smaller block id.
 template <int Items, int IB, bool Combined = false>
 __global__ void k_index_select(const float* scores, int stride, int* selected,
-                                int first, const int* pos = nullptr) {
+                                int first, const int* pos = nullptr,
+                                int win_tokens = 0) {
   static_assert(256 * Items > IB, "selector needs new score items");
   constexpr int IdItems = IB / 256;
   using TopSort = rocprim::block_radix_sort<uint64_t, 256, Items>;
@@ -1001,15 +1020,21 @@ __global__ void k_index_select(const float* scores, int stride, int* selected,
   __shared__ union { typename TopSort::storage_type top; typename IdSort::storage_type ids; } storage;
   __shared__ uint64_t best[IB];
   int q = blockIdx.x, t = pos ? *pos : first + q, n = (t + 1) / 4;
+  // win_tokens > 0: top-k is taken over the last window only (absolute block
+  // ids). 0 keeps the full [0, n) scan, bit-identical to the unwindowed kernel.
+  int b0 = 0;
+  if (win_tokens > 0 && t + 1 > win_tokens) b0 = (t + 1 - win_tokens) / 4;
+  if (b0 > n) b0 = n;
+  const int nwin = n - b0;
   int tid = threadIdx.x;
-  if (n <= IB) {
+  if (nwin <= IB) {
     for (int i = tid; i < IB; i += 256)
-      selected[(size_t)q * IB + i] = i < n ? i : -1;
+      selected[(size_t)q * IB + i] = i < nwin ? b0 + i : -1;
     return;
   }
   for (int i = tid; i < IB; i += 256) best[i] = 0;
   __syncthreads();
-  for (int base = 0; base < n; base += 256 * Items - IB) {
+  for (int base = b0; base < n; base += 256 * Items - IB) {
     uint64_t items[Items];
     for (int i = 0; i < Items; i++) {
       int rank = tid * Items + i;
@@ -1017,14 +1042,15 @@ __global__ void k_index_select(const float* scores, int stride, int* selected,
       else {
         int b = base + rank - IB;
         float s = 0.f;
+        const bool live = b >= b0 && b < n;
         if constexpr (Combined) {
-          if (b < n) s = scores[(size_t)q * stride + b];
+          if (live) s = scores[(size_t)q * stride + b];
         } else {
-          if (b < n)
+          if (live)
             for (int h = 0; h < 4; h++) s += fmaxf(0.f, scores[((size_t)q * 4 + h) * stride + b]);
           s *= 0.08838834764831845f;
         }
-        items[i] = b < n ? ((uint64_t)__float_as_uint(s) << 32) | (0xffffffffu - (uint32_t)b) : 0;
+        items[i] = live ? ((uint64_t)__float_as_uint(s) << 32) | (0xffffffffu - (uint32_t)b) : 0;
       }
     }
     TopSort().sort_desc(items, storage.top);
@@ -1048,25 +1074,29 @@ __global__ void k_index_select(const float* scores, int stride, int* selected,
 
 template <bool Combined>
 static void index_select_rocprim(const float* scores, int stride, int* selected,
-                                 int first, int count, const int* pos = nullptr) {
+                                 int first, int count, const int* pos = nullptr,
+                                 int win_tokens = 0) {
   if (g_index_budget == 512)
     k_index_select<4, 512, Combined><<<count, 256, 0, g_str>>>(
-        scores, stride, selected, first, pos);
+        scores, stride, selected, first, pos, win_tokens);
   else
     k_index_select<8, 1024, Combined><<<count, 256, 0, g_str>>>(
-        scores, stride, selected, first, pos);
+        scores, stride, selected, first, pos, win_tokens);
 }
 
 static void index_select(const float* scores, int stride, int* selected,
-                         int first, int count, const int* pos = nullptr) {
+                         int first, int count, const int* pos = nullptr,
+                         int win_tokens = 0) {
   int n = pos ? stride : min(stride, (first + count) / 4);
   static bool old_sel = getenv("QWENOX_INDEX_OLDSEL") != nullptr;
-  if (!old_sel && n > g_index_budget && n <= 8192) {
+  // The LDS selector scans [0, n). A live window has to take the rocPRIM
+  // kernel, which honors win_tokens. win_tokens == 0 keeps the old choice.
+  if (win_tokens <= 0 && !old_sel && n > g_index_budget && n <= 8192) {
     k_index_select_rs<<<count, 256, 0, g_str>>>(scores, stride, selected, first,
                                                 pos);
     return;
   }
-  index_select_rocprim<false>(scores, stride, selected, first, count, pos);
+  index_select_rocprim<false>(scores, stride, selected, first, count, pos, win_tokens);
 }
 
 __global__ void k_moe_route_pack(const int* ids, int* keys, int* values, int pairs, int k) {

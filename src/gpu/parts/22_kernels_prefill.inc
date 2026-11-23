@@ -1148,7 +1148,8 @@ __global__ void k_qsa_flash(const float* __restrict__ q, const KVT* __restrict__
                             float* pacc = nullptr, float* pml = nullptr,
                             int kbase = 0,
                             const int* __restrict__ ptab = nullptr,
-                            const int* __restrict__ dvb = nullptr) {
+                            const int* __restrict__ dvb = nullptr,
+                            int kv_win = 0) {
   static_assert(!SharedV || Sparse, "shared V is a sparse-attention specialization");
   // P3-B: dvb carries the batch base on device (graph capture); sparse first
   // is recomputed as max(base, qsa_index_first()), matching the host launcher exactly.
@@ -1218,6 +1219,13 @@ __global__ void k_qsa_flash(const float* __restrict__ q, const KVT* __restrict__
     p_lo = blockIdx.x * cpb * QSA_KT;
     p_hi = min(ntok, p_lo + cpb * QSA_KT);
   }
+  // Dense decode window (MTP, selected == nullptr): drop splits that end
+  // before the last kv_win tokens. Sparse selections already name their blocks.
+  if (Split && kv_win > 0 && !blocks && ntok > kv_win) {
+    const int aligned = (ntok - kv_win) & ~(QSA_KT - 1);
+    if (p_lo < aligned) p_lo = aligned;
+    if (p_hi < p_lo) p_hi = p_lo;
+  }
   for (int p0 = p_lo; p0 < p_hi; p0 += QSA_KT) {
     // make the prefetched chunk visible, then prefetch the next one
     if (Sparse) {
@@ -1269,6 +1277,10 @@ __global__ void k_qsa_flash(const float* __restrict__ q, const KVT* __restrict__
       }
       float s = ((s4.x + s4.y) + (s4.z + s4.w)) * scale;
       bool masked = Sparse ? p0 + pl >= ntok : p0 + pl > kb + rg;
+      if (kv_win > 0 && !blocks) {
+        const int row_end = Sparse ? ntok : kb + rg + 1;
+        if (row_end > kv_win && p0 + pl < row_end - kv_win) masked = true;
+      }
       if (masked) s = -1e30f;
       // chunk max/sum over the 8 lanes of this row (width-8 shfl groups)
       float cm = s;

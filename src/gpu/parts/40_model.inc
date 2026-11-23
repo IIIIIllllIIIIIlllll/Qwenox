@@ -919,6 +919,15 @@ struct GpuModel {
   int mtp_norm_mode = 0;       // 0 = full-10240 RMSNorm (H1), 1 = 4x2560 (H2)
   int mtp_hagg_mode = 0;       // 0 = sum branches + repeat4, 1 = per-branch + bcast e
   int mtp_pos = 0;             // host mirror of the MTP stream position
+  // Draft attention span, in tokens (basalt mtp_window). 0 = the whole cache.
+  // QWENOX_MTP_WINDOW overrides; the default matches basalt's 32768. Below the
+  // window the original score/select launches run unchanged.
+  int mtp_kv_window = [] {
+    const char* e = getenv("QWENOX_MTP_WINDOW");
+    if (!e || !e[0]) return 32768;
+    const int v = atoi(e);
+    return v < 0 ? 0 : v;
+  }();
   float* d_mR = nullptr;       // MTP hyper stream (10240)
   float* d_mRhat = nullptr;    // MTP normed stream (10240)
   // S3c: d_mR 入 SLOT_FIELDS 后指向本池的第 bound_ 行（[nslots][10240] 连续，
@@ -1794,10 +1803,11 @@ struct GpuModel {
         }
         mtp_avail = true;
         fprintf(stderr,
-                "mtp: draft head enabled (norm=%s hagg=%s kv=%s fc_hidden dtype=%d)\n",
+                "mtp: draft head enabled (norm=%s hagg=%s kv=%s window=%d fc_hidden dtype=%d)\n",
                 mtp_norm_mode ? "branch" : "full",
                 mtp_hagg_mode ? "branch" : "sum",
                 qsa_kv_q8 ? "q8g32" : (qsa_kv_fp16 ? "fp16" : (qsa_kv_fp32 ? "fp32" : "bf16")),
+                mtp_kv_window,
                 (int)ckpt.at("mtp.fc_hidden.weight").dtype);
         // drafter r2 (and later): optional mtp.spec_cost.* calibration. The
         // per-round time table and the two base costs are the engine's
@@ -9553,11 +9563,55 @@ struct GpuModel {
                                                       g_cfg.branches);
   }
 
+  // Tokens the draft layer may read. 0 = no clip. A positive window is at
+  // least one indexer budget (the selector always emits that many blocks) and
+  // a multiple of 4, so the block window is exact: nwin = window/4.
+  int mtp_win_tokens() const {
+    if (mtp_kv_window <= 0) return 0;
+    int w = mtp_kv_window & ~3;
+    const int minw = g_index_budget * 4;
+    if (w < minw) {
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        fprintf(stderr, "mtp: QWENOX_MTP_WINDOW=%d raised to %d (indexer budget)\n",
+                mtp_kv_window, minw);
+      }
+      w = minw;
+    }
+    return w;
+  }
+  // First indexer block kept for host_pos, or 0 when the window does not clip.
+  // Block-aligned down, so at most 3 tokens before the token window stay visible.
+  int mtp_win_b0(int host_pos) const {
+    const int w = mtp_win_tokens();
+    if (w <= 0) return 0;
+    const int vis = host_pos + 1;
+    if (vis <= w) return 0;
+    return (vis - w) / 4;
+  }
+  // Sparse draft attention: top-k inside the window. b0 == 0 is the old launch.
+  void mtp_index_select_pos(const int* dpos, int host_pos, const int* ptab) {
+    const int b0 = mtp_win_b0(host_pos);
+    if (b0 <= 0) {
+      k_index_scores<<<(index_blocks + 3) / 4, 128, 0, g_str>>>(
+          d_iq, d_mik, d_iscores, index_blocks, dpos, ptab);
+      index_select(d_iscores, index_blocks, d_iselected, 0, 1, dpos);
+      return;
+    }
+    const int n1 = (host_pos + 1) / 4;
+    const int nwin = n1 - b0;
+    k_index_scores_range<<<(nwin + 3) / 4, 128, 0, g_str>>>(
+        d_iq, d_mik, d_iscores, index_blocks, b0, n1, ptab);
+    index_select(d_iscores, index_blocks, d_iselected, 0, 1, dpos, mtp_win_tokens());
+  }
+
   template <typename KVT>
   void mtp_qsa_attn(const KVT* kc, const KVT* vc) {
     k_qsa_flash<true, false, KVT, true><<<dim3(QSA_DEC_NSPLIT, 2), 128, 0, g_str>>>(
         d_qs, kc, vc, d_attn, 1, 256, 2, 24, qsa_dense ? nullptr : d_iselected, 0,
-        d_mpos, d_pacc, d_pml, 0, kvpt());
+        d_mpos, d_pacc, d_pml, 0, kvpt(), nullptr,
+        qsa_dense ? mtp_win_tokens() : 0);
     k_qsa_flash_combine<<<dim3(12, 2), 64, 0, g_str>>>(d_pml, d_pacc, d_attn, 12,
                                                        256, d_mpos);
   }
@@ -9579,9 +9633,7 @@ struct GpuModel {
                                            d_ikh ? d_ikh + (size_t)(g_cfg.layers / 4) *
                                                        ik_layer_blocks * 128
                                                  : nullptr);
-      k_index_scores<<<(index_blocks + 3) / 4, 128, 0, g_str>>>(
-          d_iq, d_mik, d_iscores, index_blocks, d_mpos, kvpt());
-      index_select(d_iscores, index_blocks, d_iselected, 0, 1, d_mpos);
+      mtp_index_select_pos(d_mpos, mtp_pos, kvpt());
     }
     snprintf(buf, sizeof buf, "%s.q_proj.weight", pfx);
     gemv(wview(ckpt.at(buf)), x, d_qg);
@@ -9647,7 +9699,8 @@ struct GpuModel {
     k_qsa_flash<true, false, KVT, true>
         <<<dim3(QSA_DEC_NSPLIT, 2), 128, 0, g_str>>>(
             q, kc, vc, out, 1, 256, 2, 24,
-            qsa_dense ? nullptr : d_iselected, 0, mp, d_pacc, d_pml, 0, pt);
+            qsa_dense ? nullptr : d_iselected, 0, mp, d_pacc, d_pml, 0, pt,
+            nullptr, qsa_dense ? mtp_win_tokens() : 0);
     k_qsa_flash_combine<<<dim3(12, 2), 64, 0, g_str>>>(d_pml, d_pacc, out,
                                                        12, 256, mp);
   }
@@ -9678,9 +9731,7 @@ struct GpuModel {
                                            d_ikh ? d_ikh + (size_t)(g_cfg.layers / 4) *
                                                        ik_layer_blocks * 128
                                                  : nullptr);
-      k_index_scores<<<(index_blocks + 3) / 4, 128, 0, g_str>>>(
-          d_iq, d_mik, d_iscores, index_blocks, mp, pt);
-      index_select(d_iscores, index_blocks, d_iselected, 0, 1, mp);
+      mtp_index_select_pos(mp, slot_mtp_pos(s), pt);
     }
     snprintf(buf, sizeof buf, "%s.q_norm.weight", pfx);
     float* qnw = ensure_norm256(buf);
@@ -10191,8 +10242,11 @@ struct GpuModel {
         // sgemm alone was ~0.23 s per 32K prompt, the tiled kernel ~0.03 s).
         // Only the MTP draft path sees these selections.
         // QWENOX_MTP_INDEX_SGEMM=1 keeps the old sgemm + index_select.
+        // A live window falls through to sgemm + windowed rocPRIM select: the
+        // fused selectors scan every block. kv_only (the default) never gets here.
         static const bool mtp_sgemm = getenv("QWENOX_MTP_INDEX_SGEMM") != nullptr;
-        if (index_fused2 && !mtp_sgemm && count >= 16 &&
+        const bool win_clip = mtp_win_tokens() > 0 && first + count > mtp_win_tokens();
+        if (index_fused2 && !mtp_sgemm && !win_clip && count >= 16 &&
             getenv("QWENOX_INDEX_OLDSEL") == nullptr) {
           int* const selrow = d_iselected + (size_t)(first - base) * g_index_budget;
           if (index_f16()) {
@@ -10239,7 +10293,7 @@ struct GpuModel {
           exit(1);
         }
         index_select(d_iscores, nb, d_iselected + (size_t)(first - base) * g_index_budget,
-                     first, count);
+                     first, count, nullptr, win_clip ? mtp_win_tokens() : 0);
         first = nxt;
       }
     }

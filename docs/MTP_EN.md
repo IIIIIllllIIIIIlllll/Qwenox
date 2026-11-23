@@ -56,6 +56,7 @@ All on by default; turn off only for troubleshooting:
 | `QWENOX_GREEDY_CONF=0` | Disable the greedy draft confidence gate (default 0.9: close the chain when the draft head's top-1 probability falls below 0.9; that step is still verified, output is unchanged and only likely-rejected verify rows are skipped) |
 | `QWENOX_SAMPLED_GATE=0` | Disable the sampled draft confidence gate (default **0.95,0.98**: the second draft needs the first draw's probability ≥ t1, and later drafts each need the previous one ≥ t2; explicit 0 falls back to `QWENOX_SPEC_CONF`'s top-1 threshold, default 0.9) |
 | `QWENOX_SPEC_CONF=0` | Disable the sampled top-1 confidence gate (default 0.9); set together with `QWENOX_SAMPLED_GATE=0` to return to adaptive γ |
+| `QWENOX_MTP_WINDOW=0` | Disable windowed MTP (default **32768**: the drafter attends only the last 32768 KV tokens; shorter contexts match the full-history path bit for bit. Drafts only, committed tokens unchanged) |
 
 llama `REPEAT` also uses the GPU sparse path for MTP/chain sampling: drafts share the base window,
 while each verify row simulates its complete hypothetical window, including duplicates, full-window eviction

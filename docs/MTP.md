@@ -56,6 +56,7 @@ grep -E 'decode-live:|spec(-sample)?:|depth acc:|spec(-sample)? time:' logs/*/en
 | `QWENOX_GREEDY_CONF=0` | 关闭 greedy 草稿置信门（默认 0.9：草稿头 top-1 概率跌破 0.9 时收链，该步仍验证；输出不变，只省掉大概率被拒的 verify 行） |
 | `QWENOX_SAMPLED_GATE=0` | 关闭采样草稿置信门（默认 **0.95,0.98**：第 2 个草稿需第一次抽中的概率 ≥ t1，第 3 个起各需前一次 ≥ t2；显式 0 退回 `QWENOX_SPEC_CONF` 的 top-1 口径，默认 0.9） |
 | `QWENOX_SPEC_CONF=0` | 关闭采样 top-1 置信门（默认 0.9）；与 `QWENOX_SAMPLED_GATE=0` 同时设置才回到自适应 γ |
+| `QWENOX_MTP_WINDOW=0` | 关闭 windowed-mtp（默认 **32768**：草稿注意力只参考最近 32768 token 的 KV；短于窗口时与全历史逐位一致。只影响草稿，不影响提交 token） |
 
 llama `REPEAT` 在 MTP/chain 采样中也使用 GPU 稀疏路径：draft 共享基础窗口，verify 逐行模拟完整窗口，
 包括重复 token、满窗口淘汰和 rollback。单条逐行窗口超过 1024 个有效 ID，以及 DFlash2 + active llama，
