@@ -39,9 +39,10 @@ models/
   `QWENOX_GGUF=<该分片> QWENOX_GGUF_DENSE=1`，基座 Checkpoint 为空，全部张量来自 GGUF。MTP sidecar 由启动器
   以 `QWENOX_GGUF_MTP` 显式传入（空串 = 不用）；直接运行引擎且没设 `QWENOX_GGUF_MTP` 时，引擎自动使用分片
   目录里唯一的 `mtp-*.gguf`。
-- PLE n-gram 表直接用 GGUF 里的 IQ4_NL（90 B/行，约 27 GiB；hgn fp8 为 160 B/行 47.7 GiB），
-  prefill 在 GPU 上解量化（`k_ple_iq4nl_dequant`），decode 在 CPU 上解量化；`PLE_URING=1` 的 io_uring 批量读
-  改为指向表所在的分片。
+- PLE n-gram 表直接用 GGUF 里的 IQ4_NL（90 B/行，约 27 GiB；hgn fp8 为 160 B/行 47.7 GiB）
+  或 Q5_0（110 B/行；部分量化器把表存成 Q5_0），
+  prefill 在 GPU 上解量化（`k_ple_iq4nl_dequant` / `k_ple_q50_dequant`），decode 在 CPU 上解量化；
+  `PLE_URING=1` 的 io_uring 批量读改为指向表所在的分片。
 - Linux 与 Windows 都支持（Windows 2026-10-13 起，见下文"UD-IQ4_XS（Windows）"）。
 
 ## 用法：混合模式（过渡，仍需 hgn；只用于验证脚本直接运行引擎，启动器会清掉这些变量）
@@ -62,7 +63,7 @@ export QWENOX_GGUF_MTP=$D/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf          # G3.
 | `QWENOX_GGUF_MTP_EXPERTS=0` | 调试用：MTP 路由专家仍取 hgn |
 | `--vision-tower <mmproj.gguf>` | 路径以 `.gguf` 结尾时按 llama.cpp mmproj（clip / qwen3vl_merger）加载，转成与 hgn 视觉文件相同的 bf16 张量（`gguf_map::build_vision`） |
 | `QWENOX_GGUF_PLE=1` | 混合模式下 PLE n-gram 表也用 GGUF 的 IQ4_NL（默认保留 hgn 的 fp8 表，KLD 更好，见下） |
-| `QWENOX_GGUF_PLE=<路径>` | 用独立 GGUF 里的 `per_layer_token_embd.weight`（BF16 或 IQ4_NL，如 engram 拆出文件）取代内置 PLE 表；行数与行序必须与模型配置一致。service.conf 里对应 `GGUF_PLE_FILE` |
+| `QWENOX_GGUF_PLE=<路径>` | 用独立 GGUF 里的 `per_layer_token_embd.weight`（BF16、IQ4_NL 或 Q5_0，如 engram 拆出文件）取代内置 PLE 表；行数与行序必须与模型配置一致。service.conf 里对应 `GGUF_PLE_FILE` |
 | `QWENOX_GGUF_DENSE_FILTER=a,b,...` | 调试用：只有名字包含其中某个子串的张量来自 GGUF（`!` 前缀表示取反），用于二分定位 |
 
 另：llama.cpp 控制向量（refusal projection / additive GGUF）与权重格式无关，hgn 和 GGUF 都能加，

@@ -739,6 +739,7 @@ struct GpuModel {
   const Tensor* ple_table = nullptr;
   float ple_tscale = 1.f;
   bool ple_iq4 = false;  // table is the GGUF IQ4_NL view (dtype 11, g_ple_rb 90)
+  bool ple_q50 = false;  // table is the GGUF Q5_0 view (dtype 12, g_ple_rb 110)
   bool ple_bf16 = false;  // table is raw bf16 (dtype 0, g_ple_rb 320, no scale)
   int ple_ringpos = 0;           // host mirror for direct mode
   int* d_token = nullptr;        // device scalars for graph-replayable kernels
@@ -1641,10 +1642,11 @@ struct GpuModel {
             "PLE n-gram table (layers.1.ple.ngram_embedding.weight) not found: hgn v2 keeps it "
             "in a separate file — set NGRAM_FILE (qwenox: pass that .hgn as an overlay)");
       ple_iq4 = ple_table->dtype == 11;
+      ple_q50 = ple_table->dtype == 12;
       ple_bf16 = ple_table->dtype == 0;
-      if (ple_iq4) {
-        // GGUF IQ4_NL table: 90 B rows, no global scale.
-        g_ple_rb = 90;
+      if (ple_iq4 || ple_q50) {
+        // GGUF IQ4_NL / Q5_0 table: 90 / 110 B rows, no global scale.
+        g_ple_rb = ple_iq4 ? 90 : 110;
         // The batch reader is re-pointed at the file holding the table: a
         // g_gguf shard for the built-in one, g_gguf_ple for an external
         // QWENOX_GGUF_PLE=<path> file.
@@ -1659,7 +1661,8 @@ struct GpuModel {
 #else
                 g_ple_off_ok = g_ple_fd >= 0;
 #endif
-                fprintf(stderr, "ple: IQ4_NL n-gram table from %s%s\n", mp.path.c_str(),
+                fprintf(stderr, "ple: %s n-gram table from %s%s\n",
+                        ple_iq4 ? "IQ4_NL" : "Q5_0", mp.path.c_str(),
                         g_ple_off_ok ? "" : " (batch reader unavailable: mapped reads)");
               }
       } else {
@@ -3394,6 +3397,10 @@ struct GpuModel {
       gguf::dequant_row(gguf::IQ4_NL, p, dst, 160);
       return;
     }
+    if (ple_q50) {
+      gguf::dequant_row(gguf::Q5_0, p, dst, 160);
+      return;
+    }
     if (ple_bf16) {
       const uint16_t* p16 = (const uint16_t*)p;
       for (int i = 0; i < 160; i++) dst[i] = hgn::bf16_to_f32(p16[i]);
@@ -3432,8 +3439,9 @@ struct GpuModel {
     for (int h = 0; h < 16; h++) ple_deq(addrs[h], dst + h * 160);
   }
   // raw variant: staging keeps the g_ple_rb row bytes per head (fp8 codes,
-  // IQ4_NL blocks or bf16 values); dequant happens on GPU (k_ple_fp8_dequant /
-  // k_ple_iq4nl_dequant / k_ple_bf16_dequant). ~4x less host work per token.
+  // IQ4_NL / Q5_0 blocks or bf16 values); dequant happens on GPU
+  // (k_ple_fp8_dequant / k_ple_iq4nl_dequant / k_ple_q50_dequant /
+  // k_ple_bf16_dequant). ~4x less host work per token.
   void ple_rows_fp8(int t, uint8_t* dst) {
     auto cat = [&](int back) -> int64_t {
       int j = t - back;
@@ -8818,6 +8826,10 @@ struct GpuModel {
       size_t nb = (size_t)P * 2560 / 32;
       k_ple_iq4nl_dequant<<<(unsigned)((nb + 255) / 256), 256, 0, g_str>>>(
           stg_dev, d_eb, nb);
+    } else if (ple_q50) {
+      size_t nb = (size_t)P * 2560 / 32;
+      k_ple_q50_dequant<<<(unsigned)((nb + 255) / 256), 256, 0, g_str>>>(
+          stg_dev, d_eb, nb);
     } else if (ple_bf16) {
       size_t n16 = (size_t)P * 2560 / 16;
       k_ple_bf16_dequant<<<(unsigned)((n16 + 255) / 256), 256, 0, g_str>>>(
@@ -9317,6 +9329,10 @@ struct GpuModel {
       if (ple_iq4) {
         size_t nb = (size_t)R * 2560 / 32;
         k_ple_iq4nl_dequant<<<(unsigned)((nb + 255) / 256), 256, 0, g_str>>>(
+            stg_dev, d_eb, nb);
+      } else if (ple_q50) {
+        size_t nb = (size_t)R * 2560 / 32;
+        k_ple_q50_dequant<<<(unsigned)((nb + 255) / 256), 256, 0, g_str>>>(
             stg_dev, d_eb, nb);
       } else if (ple_bf16) {
         size_t n16 = (size_t)R * 2560 / 16;

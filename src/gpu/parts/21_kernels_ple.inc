@@ -113,6 +113,29 @@ __global__ void k_ple_iq4nl_dequant(const uint8_t* __restrict__ src,
   }
 }
 
+// --- PLE Q5_0 staging dequant (GGUF table, dtype 12): raw 22 B blocks
+// [fp16 d][4 B qh][16 B qs], 5 per 160-wide row, packed 16 rows per token ->
+// f32 embeddings (block b -> dst[32b..32b+31]). Bit-exact with
+// gguf::dequant_row(Q5_0) (fp16->f32 exact, one f32 multiply per element).
+__global__ void k_ple_q50_dequant(const uint8_t* __restrict__ src,
+                                  float* __restrict__ dst, size_t nblk) {
+  size_t b = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (b >= nblk) return;
+  const uint8_t* p = src + b * 22;
+  const float d = __half2float(__ushort_as_half((uint16_t)(p[0] | (p[1] << 8))));
+  uint32_t qh;
+  memcpy(&qh, p + 2, 4);
+  const uint8_t* qs = p + 6;
+  float* o = dst + b * 32;
+#pragma unroll
+  for (int j = 0; j < 16; j++) {
+    const int x0 = (qs[j] & 0xF) | (int)(((qh >> j) & 1) << 4);
+    const int x1 = (qs[j] >> 4) | (int)(((qh >> (j + 16)) & 1) << 4);
+    o[j] = d * (float)(x0 - 16);
+    o[j + 16] = d * (float)(x1 - 16);
+  }
+}
+
 // --- PLE bf16 staging dequant (dtype 0 table): raw bf16 rows (16 rows x 160
 // per token, packed 5120 B/token) -> f32 embeddings. Bit-exact with
 // hgn::bf16_to_f32 (zero-extend << 16); no scale.

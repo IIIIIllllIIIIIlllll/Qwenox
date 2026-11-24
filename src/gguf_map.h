@@ -12,7 +12,8 @@
 //   * BF16 indexer q_proj(512)+k_proj(128) -> one bf16 index_qk_proj(640)
 //   * PLE config KV arrays -> dtype 4 u64
 // Routed experts are NOT built here (read in place by 26_kernels_moe_gguf.inc);
-// the PLE n-gram table is a borrowed view (add_ple_table, dtype 11 IQ4_NL).
+// the PLE n-gram table is a borrowed view (add_ple_table, dtype 11 IQ4_NL or
+// dtype 12 Q5_0).
 //
 // GGUF vs HF/engine transforms (semantics from gufo reference.cpp, MIT;
 // verified numerically against hgn by tools/g3_map_check.cpp):
@@ -406,15 +407,18 @@ inline size_t build(hgn::Checkpoint& ck, const gguf::File& g, const gguf::File* 
 }
 
 // PLE n-gram table: per_layer_token_embd.weight (IQ4_NL [rows][160], same row
-// order as the hgn fp8 table) as a zero-copy dtype 11 view of the mmap; the
-// engine streams 90 B rows from it (40_model.inc ple_rows*, 10_ple_io.inc).
+// order as the hgn fp8 table; Q5_0 [rows][160] also accepted) as a zero-copy
+// dtype 11 (IQ4_NL) / dtype 12 (Q5_0) view of the mmap; the engine streams
+// rows from it (40_model.inc ple_rows*, 10_ple_io.inc).
 inline void add_ple_table(hgn::Checkpoint& ck, const gguf::File& g) {
   const std::string name = "layers.1.ple.ngram_embedding.weight";
   if (g_keep && !g_keep(name)) return;
   const gguf::Tensor& t = g.at("per_layer_token_embd.weight");
-  need(t.type == gguf::IQ4_NL && t.ne[0] == 160 && t.row_bytes() == 90,
-       "per_layer_token_embd: expected IQ4_NL [rows][160]");
-  hgn::Tensor d = desc(name, 11, {t.rows(), 160});
+  need(t.ne[0] == 160 && (t.type == gguf::IQ4_NL || t.type == gguf::Q5_0),
+       "per_layer_token_embd: expected IQ4_NL or Q5_0 [rows][160]");
+  need(t.row_bytes() == (t.type == gguf::IQ4_NL ? 90 : 110),
+       "per_layer_token_embd: row size mismatch");
+  hgn::Tensor d = desc(name, t.type == gguf::IQ4_NL ? 11 : 12, {t.rows(), 160});
   d.data = t.data;
   d.data_size = t.nbytes;
   ck.add_view(d);
@@ -428,17 +432,17 @@ inline void add_ple_table_file(hgn::Checkpoint& ck, const gguf::File& g) {
   const std::string name = "layers.1.ple.ngram_embedding.weight";
   if (g_keep && !g_keep(name)) return;
   const gguf::Tensor& t = g.at("per_layer_token_embd.weight");
-  if (t.type == gguf::IQ4_NL) {
-    need(t.ne[0] == 160 && t.row_bytes() == 90,
-         "external PLE: expected IQ4_NL [rows][160]");
-    hgn::Tensor d = desc(name, 11, {t.rows(), 160});
+  if (t.type == gguf::IQ4_NL || t.type == gguf::Q5_0) {
+    need(t.ne[0] == 160 && t.row_bytes() == (t.type == gguf::IQ4_NL ? 90 : 110),
+         "external PLE: expected IQ4_NL/Q5_0 [rows][160]");
+    hgn::Tensor d = desc(name, t.type == gguf::IQ4_NL ? 11 : 12, {t.rows(), 160});
     d.data = t.data;
     d.data_size = t.nbytes;
     ck.add_view(d);
     return;
   }
   need(t.type == gguf::BF16 && t.ne[0] == 160 && t.rows() % 128 == 0,
-       "external PLE: expected BF16 [128*R][160] or IQ4_NL [rows][160]");
+       "external PLE: expected BF16 [128*R][160] or IQ4_NL/Q5_0 [rows][160]");
   hgn::Tensor d = desc(name, 0, {128, t.rows() / 128, 160});
   d.data = t.data;
   d.data_size = t.nbytes;

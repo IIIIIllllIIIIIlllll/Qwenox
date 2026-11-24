@@ -150,11 +150,11 @@ static int gg_a4_env() {
 }
 
 // The PLE n-gram table never enters the device arena (read from page cache /
-// disk at runtime): dtype 10 (hgn fp8), 11 (GGUF IQ4_NL) — or dtype 0 when the
-// table ships as raw bf16 under the same name (320 B rows). dtype 4 = the tiny
-// u64 hash config tensors, also host-side only.
+// disk at runtime): dtype 10 (hgn fp8), 11 (GGUF IQ4_NL), 12 (GGUF Q5_0) — or
+// dtype 0 when the table ships as raw bf16 under the same name (320 B rows).
+// dtype 4 = the tiny u64 hash config tensors, also host-side only.
 static inline bool is_ple_offarena(const Tensor& t) {
-  return t.dtype == 10 || t.dtype == 11 || t.dtype == 4 ||
+  return t.dtype == 10 || t.dtype == 11 || t.dtype == 12 || t.dtype == 4 ||
          t.name == "layers.1.ple.ngram_embedding.weight";
 }
 
@@ -728,13 +728,18 @@ static void gguf_dense_apply(Checkpoint& ck) {
   }
   g_gguf_dense = true;
   g_dense_rowfast = true;
+  const char* ple_tag = "; PLE table IQ4_NL";
+  if (ple) {
+    const Tensor* pt = ck.find("layers.1.ple.ngram_embedding.weight");
+    if (pt && pt->dtype == 12) ple_tag = "; PLE table Q5_0";
+  }
   double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   fprintf(stderr,
           "gguf dense: %zu tensors from GGUF%s (%d q8g32, %d native %.2f GiB, %.2f GiB synthetic, "
           "%.1f s)%s\n",
           n, g_gguf_mtp ? " + MTP sidecar" : "", n8, nn, nbytes / 1073741824.0,
           bytes / 1073741824.0, s,
-          ple ? "; PLE table IQ4_NL" : g_gguf_ple ? "; PLE table external" : "");
+          ple ? ple_tag : g_gguf_ple ? "; PLE table external" : "");
 }
 // After GpuModel construction: free host copies of large synthetic tensors
 // (the device arena has them). Small ones stay: ensure_hcnorm/ensure_norm256

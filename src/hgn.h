@@ -23,6 +23,10 @@
 //   dtype 11 IQ4_NL rows (GGUF PLE n-gram table, a borrowed view of the mmap):
 //            per row cols/32 blocks of 18 B [fp16 d][16 B nibbles];
 //            w[32b+j] = d * kvalues_iq4nl[lo nibble of byte j], w[32b+16+j] = .. hi
+//   dtype 12 Q5_0 rows (same table, GGUF Q5_0 variant): per row cols/32 blocks
+//            of 22 B [fp16 d][4 B qh][16 B qs];
+//            w[32b+j] = d * ((qs[j] lo nibble | qh bit j << 4) - 16),
+//            w[32b+16+j] = d * ((qs[j] hi nibble | qh bit (j+16) << 4) - 16)
 #pragma once
 
 #include <cmath>
