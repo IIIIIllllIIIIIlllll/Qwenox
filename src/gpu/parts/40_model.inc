@@ -4799,7 +4799,10 @@ struct GpuModel {
       // Verify sizes (P<=8): 1 token/block -> 4P blocks instead of 4*ceil(P/4).
       // Per-(t,b) arithmetic is T-invariant (proto: R/Rhat bit-identical), the
       // 4-token serial loop was pure latency at 4 blocks. QWENOX_SCAT_T1=0: T=4.
+      // cvec 时把 T=1 放到会合 verify 的上限（多槽 kVSnapRows = 48）：T=4 会把
+      // 投影归约按 token 串行，多路 decode 只在这条路上变慢。逐 (t,b) 仍逐 bit 相同。
       static const bool scat_t1 = !env_zero("QWENOX_SCAT_T1");
+      const bool cvec_t1 = cvec_p && scat_t1 && !write_done && P <= 48;
       // v2 (coalesced + pipelined): kernel −5% only (this op is at ~190 GB/s,
       // bandwidth-bound) and not bit-identical -> opt-in QWENOX_GR_SCAT_V2=1.
       // cvec 时走基础 kernel（v2 没有投影折入），开启 v2 也不影响正确性以外的功能。
@@ -4825,18 +4828,30 @@ struct GpuModel {
           k_gr_scatter_norm_inj_bf16_v2<4><<<4 * ((P + 3) / 4), 256, 0, g_str>>>(
               pfull, pin, (uint16_t*)d_Rb, y, hw, rh, wn, d_injp[nxt], P,
               g_cfg.norm_eps, sc);
-      } else if (scat_t1 && P <= 8 && !write_done)
-        k_gr_scatter_norm_inj_bf16<1><<<4 * P, 256, 0, g_str>>>(
+      } else if (cvec_t1)
+        k_gr_scatter_norm_inj_bf16<1, true, true><<<4 * P, 256, 0, g_str>>>(
             pfull, pin, (uint16_t*)d_Rb, y, hw, rh, wn, d_injp[nxt],
             g_cfg.d, P, g_cfg.norm_eps, sc, cdir, csc);
+      else if (scat_t1 && P <= 8 && !write_done)
+        k_gr_scatter_norm_inj_bf16<1><<<4 * P, 256, 0, g_str>>>(
+            pfull, pin, (uint16_t*)d_Rb, y, hw, rh, wn, d_injp[nxt],
+            g_cfg.d, P, g_cfg.norm_eps, sc, nullptr, 0.f);
+      else if (write_done && cvec_p)
+        k_gr_scatter_norm_inj_bf16<4, false, true><<<4 * ((P + 3) / 4), 256, 0, g_str>>>(
+            nullptr, nullptr, (uint16_t*)d_Rb, nullptr, hw, rh, wn,
+            d_injp[nxt], g_cfg.d, P, g_cfg.norm_eps, sc, cdir, csc);
       else if (write_done)
         k_gr_scatter_norm_inj_bf16<4, false><<<4 * ((P + 3) / 4), 256, 0, g_str>>>(
             nullptr, nullptr, (uint16_t*)d_Rb, nullptr, hw, rh, wn,
-            d_injp[nxt], g_cfg.d, P, g_cfg.norm_eps, sc, cdir, csc);
+            d_injp[nxt], g_cfg.d, P, g_cfg.norm_eps, sc, nullptr, 0.f);
+      else if (cvec_p)
+        k_gr_scatter_norm_inj_bf16<4, true, true><<<4 * ((P + 3) / 4), 256, 0, g_str>>>(
+            pfull, pin, (uint16_t*)d_Rb, y, hw, rh, wn, d_injp[nxt],
+            g_cfg.d, P, g_cfg.norm_eps, sc, cdir, csc);
       else
         k_gr_scatter_norm_inj_bf16<4><<<4 * ((P + 3) / 4), 256, 0, g_str>>>(
             pfull, pin, (uint16_t*)d_Rb, y, hw, rh, wn, d_injp[nxt],
-            g_cfg.d, P, g_cfg.norm_eps, sc, cdir, csc);
+            g_cfg.d, P, g_cfg.norm_eps, sc, nullptr, 0.f);
       injp_cur = nxt;
       injp_for = read_prefix;
     } else if (gr_bf16)

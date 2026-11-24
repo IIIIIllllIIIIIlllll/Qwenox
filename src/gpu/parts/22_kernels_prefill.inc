@@ -518,34 +518,24 @@ __global__ void k_gr_write_b_hc_bf16(const float* __restrict__ w4,
   }
 }
 
-// 控制向量投影（33_cvec.inc）在融合写+norm kernel 里的块内 dot：values[j] 是本线程
-// 持有的列 c = lane + j*stride，dir 是该层的单位方向。返回全块可见的 dot；sm 需
-// >= 32 个 float，返回后可复用（内部首尾各一道屏障）。
-__device__ inline float cvec_block_dot(const float* __restrict__ dir,
-                                       const float* values, int J, int stride, int d,
-                                       int lane, float* sm) {
-  __syncthreads();  // 上一轮读 sm 的线程已读完
-  float s = 0.f;
+// 块内点积归约。求和顺序与原先一致：warp xor，再由 32 路 xor 吃掉 nw 个 warp 和。
+// s_dot 与 sm 分开，调用方把返回值留在寄存器后即可复用 sm。开头一道屏障保证上一轮
+// 还在读 sm 的线程（f4 的分支循环）已经读完。sm 至少要放下 nw 个 warp 和。
+__device__ inline float cvec_reduce(float partial, int lane, float* sm, float* s_dot) {
+  __syncthreads();
 #pragma unroll
-  for (int j = 0; j < J; j++) {
-    const int c = lane + j * stride;
-    if (c < d) s += values[j] * dir[c];
-  }
-#pragma unroll
-  for (int o = 16; o; o >>= 1) s += __shfl_xor(s, o, 32);
+  for (int o = 16; o; o >>= 1) partial += __shfl_xor(partial, o, 32);
   const int nw = (int)(blockDim.x >> 5);
-  if ((lane & 31) == 0) sm[lane >> 5] = s;
+  if ((lane & 31) == 0) sm[lane >> 5] = partial;
   __syncthreads();
   if (lane < 32) {
     float t = lane < nw ? sm[lane] : 0.f;
 #pragma unroll
     for (int o = 16; o; o >>= 1) t += __shfl_xor(t, o, 32);
-    if (lane == 0) sm[0] = t;
+    if (lane == 0) *s_dot = t;
   }
   __syncthreads();
-  const float r = sm[0];
-  __syncthreads();
-  return r;
+  return *s_dot;
 }
 
 // [gr-injfuse-begin]  (sed-extracted by tools/injfuse_proto.cu — needs f2bf/bf2f)
@@ -567,6 +557,7 @@ __global__ void k_gr_scatter_norm_b_hc_bf16(
   const float* wg = w + (size_t)b * d;
   uint16_t* og = Rhat + (size_t)group * d;
   __shared__ float sm[256];
+  __shared__ float s_dot;
   __shared__ float inject;
   if (lane == 0)
     inject = 2.f / (1.f + expf(-w4[(size_t)t * branches + b] * 0.25f));
@@ -574,20 +565,25 @@ __global__ void k_gr_scatter_norm_b_hc_bf16(
 
   float values[10];
   float ss = 0.f;
+  float partial = 0.f;
+  const bool proj = cdir != nullptr;
 #pragma unroll
   for (int j = 0; j < 10; j++) {
     int c = lane + j * 256;
     float rounded = 0.f;
     if (c < d) {
       uint16_t r16 = f2bf(bf2f(Rg[c]) + inject * yg[c]);
-      Rg[c] = r16;
+      // 投影时中间残差只留在寄存器里，最后写一次投影后的值。先写再整段重写
+      // 会在多路 verify 上多一轮残差流量。
+      if (!proj) Rg[c] = r16;
       rounded = bf2f(r16);
-      ss += rounded * rounded;
+      if (proj) partial += rounded * cdir[c];
+      else ss += rounded * rounded;
     }
     values[j] = rounded;
   }
-  if (cdir) {  // 控制向量：写与 norm 之间投影（重算 ss）
-    const float cd = cvec_block_dot(cdir, values, 10, 256, d, lane, sm) * cs;
+  if (proj) {
+    const float cd = cvec_reduce(partial, lane, sm, &s_dot) * cs;
     ss = 0.f;
 #pragma unroll
     for (int j = 0; j < 10; j++) {
@@ -645,7 +641,10 @@ __global__ void k_inj_psum(const float* __restrict__ pin, float* __restrict__ w4
 // Write == false (B2-1, QWENOX_HC_FUSE_WRITE, default off): the write was
 // already applied to R by the moe reduce (k_*_hc, same expression), so only
 // the norm / Rhat / pout work remains; y/pfull/pin are unused, pass null.
-template <int T, bool Write = true>
+// Cvec：投影折进本 kernel，且不实例化进关闭路径（关闭时寄存器与原来一致）。
+// 点积在寄存器里的已舍入残差上做，残差只写投影后的那一次。T>1 时方向先放进 LDS，
+// 不要每个 token 再从全局读一遍。
+template <int T, bool Write = true, bool Cvec = false>
 __global__ void __launch_bounds__(256) k_gr_scatter_norm_inj_bf16(
     const float* __restrict__ pfull, const float* __restrict__ pin,
     uint16_t* __restrict__ R, const float* __restrict__ y,
@@ -657,8 +656,10 @@ __global__ void __launch_bounds__(256) k_gr_scatter_norm_inj_bf16(
   const int t0 = (blockIdx.x >> 2) * T;
   const int lane = threadIdx.x;
   __shared__ float sm[256];
+  __shared__ float s_dot;
   __shared__ float red[8][4];
   __shared__ float s_inj[T];
+  __shared__ float s_dir[(Cvec && T > 1) ? 2560 : 1];
   if (Write && lane < T) {
     const int t = t0 + lane;
     float v = 0.f;
@@ -678,6 +679,20 @@ __global__ void __launch_bounds__(256) k_gr_scatter_norm_inj_bf16(
     for (int k = 0; k < 4; k++)
       wr[k][j] = c < d ? bf2f(winj[(size_t)k * 4 * d + (size_t)b * d + c]) : 0.f;
   }
+  if constexpr (Cvec && T > 1) {
+#pragma unroll
+    for (int j = 0; j < 10; j++) {
+      const int c = lane + j * 256;
+      if (c < d) s_dir[c] = cdir[c];
+    }
+  } else if constexpr (!Cvec) {
+    (void)cdir;
+    (void)cs;
+    (void)s_dir[0];
+    (void)s_dot;
+  } else {
+    (void)s_dir[0];
+  }
   __syncthreads();
   for (int i = 0; i < T; i++) {
     const int t = t0 + i;
@@ -686,8 +701,13 @@ __global__ void __launch_bounds__(256) k_gr_scatter_norm_inj_bf16(
     const float* yg = Write ? y + (size_t)t * d : nullptr;
     uint16_t* og = Rhat ? Rhat + ((size_t)t * 4 + b) * d : nullptr;
     const float inject = Write ? s_inj[i] : 0.f;
+    const float* dirp = nullptr;
+    if constexpr (Cvec && T > 1) dirp = s_dir;
+    else if constexpr (Cvec) dirp = cdir;
     float values[10];
     float ss = 0.f;
+    float partial = 0.f;
+    if constexpr (!Cvec) (void)partial;
 #pragma unroll
     for (int j = 0; j < 10; j++) {
       int c = lane + j * 256;
@@ -696,21 +716,22 @@ __global__ void __launch_bounds__(256) k_gr_scatter_norm_inj_bf16(
         uint16_t r16 = Rg[c];
         if constexpr (Write) {
           r16 = f2bf(bf2f(r16) + inject * yg[c]);
-          Rg[c] = r16;
+          if constexpr (!Cvec) Rg[c] = r16;
         }
         rounded = bf2f(r16);
-        ss += rounded * rounded;
+        if constexpr (Cvec) partial += rounded * dirp[c];
+        else ss += rounded * rounded;
       }
       values[j] = rounded;
     }
-    if (cdir) {  // 控制向量：写与 norm 之间投影（重算 ss；Write=false 也适用）
-      const float cd = cvec_block_dot(cdir, values, 10, 256, d, lane, sm) * cs;
+    if constexpr (Cvec) {
+      const float cd = cvec_reduce(partial, lane, sm, &s_dot) * cs;
       ss = 0.f;
 #pragma unroll
       for (int j = 0; j < 10; j++) {
         const int c = lane + j * 256;
         if (c < d) {
-          const uint16_t r16 = f2bf(values[j] - cd * cdir[c]);
+          const uint16_t r16 = f2bf(values[j] - cd * dirp[c]);
           Rg[c] = r16;
           values[j] = bf2f(r16);
           ss += values[j] * values[j];
@@ -896,6 +917,7 @@ __global__ void k_gr_scatter_norm_b_hc_bf16_f4(
   int lane = threadIdx.x;
   const float* yg = y + (size_t)t * d;
   __shared__ float sm[256];
+  __shared__ float s_dot;
   __shared__ float s_y[2560];
   __shared__ float inject;
   for (int c = lane; c < d; c += 256) s_y[c] = yg[c];
@@ -909,20 +931,23 @@ __global__ void k_gr_scatter_norm_b_hc_bf16_f4(
     __syncthreads();
     float values[10];
     float ss = 0.f;
+    float partial = 0.f;
+    const bool proj = cdir != nullptr;
 #pragma unroll
     for (int j = 0; j < 10; j++) {
       int c = lane + j * 256;
       float rounded = 0.f;
       if (c < d) {
         uint16_t r16 = f2bf(bf2f(Rg[c]) + inject * s_y[c]);
-        Rg[c] = r16;
+        if (!proj) Rg[c] = r16;
         rounded = bf2f(r16);
-        ss += rounded * rounded;
+        if (proj) partial += rounded * cdir[c];
+        else ss += rounded * rounded;
       }
       values[j] = rounded;
     }
-    if (cdir) {  // 控制向量：写与 norm 之间投影（重算 ss）
-      const float cd = cvec_block_dot(cdir, values, 10, 256, d, lane, sm) * cs;
+    if (proj) {
+      const float cd = cvec_reduce(partial, lane, sm, &s_dot) * cs;
       ss = 0.f;
 #pragma unroll
       for (int j = 0; j < 10; j++) {
@@ -973,6 +998,7 @@ __global__ void k_gr_scatter_norm_b(const float* __restrict__ w4,
   const float* wg = w + (size_t)b * d;
   float* og = Rhat + (size_t)group * d;
   __shared__ float sm[1024];
+  __shared__ float s_dot;
   __shared__ float inject;
   if (lane == 0)
     inject = 2.f / (1.f + expf(-w4[(size_t)t * branches + b] * 0.25f));
@@ -980,19 +1006,22 @@ __global__ void k_gr_scatter_norm_b(const float* __restrict__ w4,
 
   float values[3] = {0.f, 0.f, 0.f};
   float ss = 0.f;
+  float partial = 0.f;
+  const bool proj = cdir != nullptr;
+  const int stride = (int)blockDim.x;
 #pragma unroll
   for (int j = 0; j < 3; j++) {
-    int c = lane + j * blockDim.x;
+    int c = lane + j * stride;
     if (c < d) {
       float value = Rg[c] + inject * yg[c];
-      Rg[c] = value;
+      if (!proj) Rg[c] = value;
       values[j] = value;
-      ss += value * value;
+      if (proj) partial += value * cdir[c];
+      else ss += value * value;
     }
   }
-  if (cdir) {  // 控制向量：写与 norm 之间投影（fp32 残差，重算 ss）
-    const int stride = (int)blockDim.x;
-    const float cd = cvec_block_dot(cdir, values, 3, stride, d, lane, sm) * cs;
+  if (proj) {
+    const float cd = cvec_reduce(partial, lane, sm, &s_dot) * cs;
     ss = 0.f;
 #pragma unroll
     for (int j = 0; j < 3; j++) {
