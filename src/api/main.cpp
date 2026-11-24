@@ -2355,7 +2355,7 @@ void handle_memory(const http::Request&, http::Response* r, http::Stream*) {
 // 路由集中度/熵、top-5 候选（字段说明见 src/gpu/parts/19_viz.inc），每个位置
 // 另附 b = 该 token 的原始字节（hex，前端按流拼 UTF-8）。允许跨域读取。
 void handle_viz(const http::Request& q, http::Response* r, http::Stream*) {
-    r->set("Access-Control-Allow-Origin", "*");
+    // 跨域头由 http.cpp 统一加注，这里不再重复设置。
     r->set("Cache-Control", "no-store");
     const auto qp = parse_query(q.query);
     std::string args;

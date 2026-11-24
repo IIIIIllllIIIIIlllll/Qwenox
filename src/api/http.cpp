@@ -534,6 +534,9 @@ void Server::serve_connection(sock_t fd, const std::string& remote) {
         }
 
         Response res;
+        // CORS: every response carries the allow-origin header, including SSE
+        // streams (write_head passes res.headers through) and error replies.
+        res.set("Access-Control-Allow-Origin", "*");
         SseStream st(fd);
         st.set_capture(static_cast<bool>(logger_));
         st.set_headers(req.headers);
@@ -558,7 +561,19 @@ void Server::serve_connection(sock_t fd, const std::string& remote) {
 
         bool ok = true;
         try {
-            if (hit != nullptr) {
+            if (req.method == "OPTIONS") {
+                // CORS preflight: answer for any path; the browser has the real
+                // method in Access-Control-Request-Method, so route matching
+                // against registered handlers would wrongly produce a 405.
+                res.status = 204;
+                res.set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+                const std::string req_headers =
+                    req.header("access-control-request-headers");
+                res.set("Access-Control-Allow-Headers",
+                        req_headers.empty() ? "Content-Type, Authorization"
+                                            : req_headers);
+                res.set("Access-Control-Max-Age", "86400");
+            } else if (hit != nullptr) {
                 hit->handler(req, &res, &st);
             } else if (method_exists) {
                 res.status = 405;
