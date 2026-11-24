@@ -372,12 +372,18 @@ std::string snap_probe(const std::string& host, int port, int timeout_ms) {
 }
 
 // 试探绑定：能 bind 说明端口空闲（不 listen，直接关）。
+// Linux 设 SO_REUSEADDR：服务刚停时其已接受连接会留 TIME_WAIT/FIN_WAIT_2
+// 残留（内核保留约 60 秒），裸 bind 会把它们误判为"占用"；reuse 只放过这类
+// 残留，对活跃 LISTEN 仍 bind 失败。Windows 不动：该平台 SO_REUSEADDR 语义
+// 不同，会允许后启动实例抢绑同一端口。
 bool port_free(int port) {
     sock_t s = sock_open();
 #ifdef _WIN32
     if (s == INVALID_SOCKET) return true;
 #else
     if (s < 0) return true;
+    int reuse = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 #endif
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
