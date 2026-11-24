@@ -69,10 +69,15 @@ static void test_cvec_fused() {
             k_gr_scatter_norm_b_hc_bf16<<<P*br, 256>>>(dw4, dr16, dy, dw, dh16, n, br, P, 1e-6f, dir, scale);
           else if (variant == 1)
             k_gr_scatter_norm_b_hc_bf16_f4<<<P, 256>>>(dw4, dr16, dy, dw, dh16, n, br, P, 1e-6f, dir, scale);
-          else if (variant == 2)
-            k_gr_scatter_norm_inj_bf16<1><<<P*br, 256>>>(dw4, nullptr, dr16, dy, dw, dh16, dwi, dout, n, P, 1e-6f, nullptr, dir, scale);
+          else if (variant == 2) {
+            if (dir)
+              k_gr_scatter_norm_inj_bf16<1, true, true><<<P*br, 256>>>(dw4, nullptr, dr16, dy, dw, dh16, dwi, dout, n, P, 1e-6f, nullptr, dir, scale);
+            else
+              k_gr_scatter_norm_inj_bf16<1><<<P*br, 256>>>(dw4, nullptr, dr16, dy, dw, dh16, dwi, dout, n, P, 1e-6f, nullptr, nullptr, 0.f);
+          } else if (dir)
+            k_gr_scatter_norm_inj_bf16<4, true, true><<<br*((P+3)/4), 256>>>(dw4, nullptr, dr16, dy, dw, dh16, dwi, dout, n, P, 1e-6f, nullptr, dir, scale);
           else
-            k_gr_scatter_norm_inj_bf16<4><<<br*((P+3)/4), 256>>>(dw4, nullptr, dr16, dy, dw, dh16, dwi, dout, n, P, 1e-6f, nullptr, dir, scale);
+            k_gr_scatter_norm_inj_bf16<4><<<br*((P+3)/4), 256>>>(dw4, nullptr, dr16, dy, dw, dh16, dwi, dout, n, P, 1e-6f, nullptr, nullptr, 0.f);
         } else if (variant == 4)
           k_gr_scatter_norm_b<<<P*br, 1024>>>(dw4, dr, dy, dw, dh, n, br, P, 1e-6f, nullptr, dir, scale);
         else
