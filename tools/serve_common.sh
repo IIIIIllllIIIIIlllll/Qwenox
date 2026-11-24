@@ -27,6 +27,18 @@ serve_init() {
   # 旧版 service.conf 没有这几项时的缺省值（与 service.conf 相同）
   KV_PAGED="${KV_PAGED:-1}"
   KV_TYPE="${KV_TYPE:-bf16}"
+  # MTP 投机草稿总开关：0 = 导出 QWENOX_NOSPEC=1，引擎完全不跑 MTP 草稿轮
+  # （chain 退化为纯 ngram 轮 + 串行，见 51_host_cfg.inc 的 chain_mtp/use_spec）。
+  # 引擎只查 QWENOX_NOSPEC 的存在性，用户已 export 的值不覆盖（同名环境变量优先）。
+  MTP="${MTP:-1}"
+  if (( ! MTP )); then export QWENOX_NOSPEC="${QWENOX_NOSPEC:-1}"; fi
+  # n-gram 草稿轮开关：0 = 导出 QWENOX_DRAFTER=mtp，chain 不跑 ngram 轮、只留
+  # MTP 轮（引擎 env_default_drafter 返回 -1 走 use_spec 纯 MTP 投机循环）。
+  # PLE n-gram 表照常映射，只是不用于起草。NGRAM=0 + MTP=0 语义自洽：
+  # DRAFTER=mtp + NOSPEC=1 → use_spec 被 NOSPEC 关掉 → 纯串行解码。
+  # 引擎只查 QWENOX_DRAFTER 的存在性，用户已 export 的值不覆盖（同名环境变量优先）。
+  NGRAM="${NGRAM:-1}"
+  if (( ! NGRAM )); then export QWENOX_DRAFTER="${QWENOX_DRAFTER:-mtp}"; fi
   # 控制向量（CVEC，见 docs/CVEC.md）：留空 = 关闭。
   CVEC="${CVEC-}"
   CVEC_MODE="${CVEC_MODE:-project}"
@@ -93,6 +105,8 @@ serve_init() {
       fail "CVEC_LAYERS 范围为 1–47 且起<=止（当前 $cvec_lo..$cvec_hi）"
   fi
   [[ "$KV_PAGED" =~ ^[01]$ ]] || fail 'KV_PAGED 必须为 0 或 1'
+  [[ "$MTP" =~ ^[01]$ ]] || fail 'MTP 必须为 0 或 1'
+  [[ "$NGRAM" =~ ^[01]$ ]] || fail 'NGRAM 必须为 0 或 1'
   [[ "$PARALLEL" =~ ^[1-8]$ ]] || fail 'PARALLEL 范围为 1–8'
   [[ "${MOE_A4:-0}" =~ ^[0-3]$ ]] || fail 'MOE_A4 范围为 0–3'
   [[ "$MAX_IMAGES" =~ ^[1-9][0-9]*$ && "$MAX_IMAGES" -le 256 ]] || fail 'MAX_IMAGES 范围为 1–256'

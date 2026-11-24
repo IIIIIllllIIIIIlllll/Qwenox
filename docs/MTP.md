@@ -15,7 +15,7 @@ MTP_GAMMA=1 bash start_hgn.sh    # GGUF 权重用 start_gguf.sh
 
 ## 请求参数
 
-MTP 权重在 `service.conf` 的 `MTP_FILE`（默认指向独立的 8-bit sidecar `qwen38-flash-next-mtp.hgn`；设 `MTP_FILE=""` 退回 overlay 内置的 4-bit 草稿头）。默认 drafter 是 chain（ngram 优先、MTP 兜底，贪心/采样都生效；采样时 ngram 轮按 llama.cpp 语义从目标分布重采样、按 token id 比对接受，MTP 轮维持精确拒绝采样，输出分布与串行采样一致）；`QWENOX_DRAFTER=mtp` 纯 MTP，`QWENOX_DRAFTER=ngram` 纯 ngram，`QWENOX_DRAFTER=serial` 串行基线。drafter 选择不由请求控制：HTTP API 不接受 `drafter` 字段（静默忽略）。未填写 temperature 时 API 默认 `temperature=1.0, top_k=20, top_p=0.95, min_p=0`，是采样模式。
+MTP 权重在 `service.conf` 的 `MTP_FILE`（只对 v1/w4b 有意义：默认指向独立的 8-bit sidecar `qwen38-flash-next-mtp.hgn`；设 `MTP_FILE=""` 用基座内置的 4-bit 草稿头。v2 主模型已内嵌同样的 8-bit 草稿头，此文件不适用，网页启动器在 v2 下保存时固定写空）。整体开关是 `service.conf` 的 `MTP`（默认 1）：设为 0 时启动器导出 `QWENOX_NOSPEC=1`，引擎完全不跑 MTP（chain 退化为纯 ngram 轮 + 串行解码，ngram 轮保留）。默认 drafter 是 chain（ngram 优先、MTP 兜底，贪心/采样都生效；采样时 ngram 轮按 llama.cpp 语义从目标分布重采样、按 token id 比对接受，MTP 轮维持精确拒绝采样，输出分布与串行采样一致）；`QWENOX_DRAFTER=mtp` 纯 MTP，`QWENOX_DRAFTER=ngram` 纯 ngram，`QWENOX_DRAFTER=serial` 串行基线。drafter 选择不由请求控制：HTTP API 不接受 `drafter` 字段（静默忽略）。未填写 temperature 时 API 默认 `temperature=1.0, top_k=20, top_p=0.95, min_p=0`，是采样模式。
 
 对照测试在相同 prompt 上固定这些字段，比较不同 gamma（改 `MTP_GAMMA` 重启）：
 

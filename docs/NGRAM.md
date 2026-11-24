@@ -10,6 +10,18 @@
 ngram speculative decoding 思路与参数实践（草稿长度、接受比对等），
 特此致谢。llama.cpp 的 MIT 许可证与本项目的 AGPL-3.0 分发兼容。
 
+## 开关（service.conf `NGRAM`）
+
+n-gram 草稿轮默认关闭（`NGRAM=0`）。设 `NGRAM=1`（service.conf 或同名
+环境变量）恢复 chain 的 ngram 轮；关闭时启动器导出 `QWENOX_DRAFTER=mtp`，
+只留 MTP 轮，PLE n-gram 表文件照常映射、只是不用于起草。实测 ngram 轮
+在思考/分析类文本上接受率仅 3~24%、每轮耗时约 106~131 ms（≈3.5 个串行
+token），几乎纯亏；连重复性内容（日志、样板代码）上 v2 内嵌 MTP 草稿头
+也覆盖得很好（接受率 0.92~0.99，纯 MTP 反而快 10~20%）——只有合成周期
+序列等 MTP 学不了的内容才值得开启。与 `MTP=0` 同时设置时语义自洽：
+`QWENOX_DRAFTER=mtp` + `QWENOX_NOSPEC=1` → 纯串行解码。用户已
+export `QWENOX_DRAFTER` 时启动器不覆盖它。
+
 ## 2026-09-22 更新：自适应 ngram 门（NgGate）+ 默认阈值放宽
 
 **问题**：旧默认 match=24/min=48/max=64 在真实内容上形同关闭——草稿不

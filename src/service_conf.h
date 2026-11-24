@@ -27,7 +27,7 @@ inline const char* kManagedKeys[] = {
     "MODEL_FILE", "NGRAM_FILE", "OVERLAY_FILE", "MTP_FILE", "VISION_FILE",
     "GGUF_FILE", "GGUF_MTP_FILE", "GGUF_VISION_FILE", "GGUF_PLE_FILE",
     "TOKENIZER_DIR", "MAX_CONTEXT", "PARALLEL", "KV_POOL_TOKENS", "KV_PAGED", "KV_TYPE",
-    "PREFILL_CHUNK", "ROPE_FACTOR",
+    "PREFILL_CHUNK", "ROPE_FACTOR", "MTP", "NGRAM",
     "KVSNAP_MAX_GB", "KVSNAP_DIR", "MOE_A4", "QSA_INDEXER_BUDGET", "AFFINITY",
     "CVEC", "CVEC_MODE", "CVEC_SCALE", "CVEC_LAYERS",
     "ENGINE_HOST", "ENGINE_PORT", "API_HOST", "API_PORT",
@@ -358,6 +358,12 @@ inline bool validate_conf(const Conf& conf, std::string* err) {
         return false;
     }
     if (!get_int("KV_PAGED", 1, 0, 1, &kv_paged)) return false;
+    long mtp;
+    if (!get_int("MTP", 1, 0, 1, &mtp)) return false;
+    (void)mtp;  // 只校验范围；语义在 serve_common.sh（QWENOX_NOSPEC）
+    long ngram;
+    if (!get_int("NGRAM", 1, 0, 1, &ngram)) return false;
+    (void)ngram;  // 只校验范围；语义在 serve_common.sh（QWENOX_DRAFTER=mtp）
     if (!get_int("KV_POOL_TOKENS", 0, 0, 1 << 24, &kv_pool_tokens)) return false;
     if (!get_int("PREFILL_CHUNK", 0, 0, 1 << 20, &prefill_chunk)) return false;
     if (!get_int("KVSNAP_MAX_GB", 20, 0, 1 << 16, &kvsnap_max_gb)) return false;

@@ -195,7 +195,7 @@ const std::pair<const char*, const char*> kDefaults[] = {
     {"PREFILL_CHUNK", "0"}, {"CONC_PREFILL_CHUNK", "8192"},
     {"ROPE_FACTOR", "1"}, {"QSA_INDEXER_BUDGET", "0"},
     {"KVSNAP_MAX_GB", "20"}, {"KVSNAP_DIR", ""}, {"RCKPT_MAX", "8"},
-    {"MTP_GAMMA", "0"}, {"MOE_A4", "0"}, {"MAX_IMAGES", "32"},
+    {"MTP_GAMMA", "0"}, {"MOE_A4", "0"}, {"MAX_IMAGES", "32"}, {"MTP", "1"}, {"NGRAM", "0"},
     {"CVEC", ""}, {"CVEC_MODE", "project"}, {"CVEC_SCALE", "1.0"}, {"CVEC_LAYERS", "4 44"},
     {"VIZ", "0"}, {"AFFINITY", ""}, {"PLE_URING", "1"},
     {"MEMORY_CAP_GB", "86"}, {"MIN_AVAILABLE_GB", "100"},
@@ -871,7 +871,8 @@ void do_start_windows(uint64_t gen) {
     } else {
         files_ok = need_file("MODEL_FILE", false) &&
                    (wv == "v1" || need_file("NGRAM_FILE", false)) &&
-                   need_file("OVERLAY_FILE", true) && need_file("MTP_FILE", false) &&
+                   need_file("OVERLAY_FILE", true) &&
+                   (wv == "v2" || need_file("MTP_FILE", false)) &&  // v2 草稿头内嵌，不查
                    need_file("VISION_FILE", false);
     }
     // GGUF 权重自带 tokenizer，不查词表目录（API 仍按 conf 的 TOKENIZER_DIR 启动，
@@ -1131,7 +1132,8 @@ void do_start_linux(uint64_t gen) {
     } else {
         files_ok = need_file("MODEL_FILE", false) &&
                    (wv == "v1" || need_file("NGRAM_FILE", false)) &&
-                   need_file("OVERLAY_FILE", true) && need_file("MTP_FILE", false) &&
+                   need_file("OVERLAY_FILE", true) &&
+                   (wv == "v2" || need_file("MTP_FILE", false)) &&  // v2 草稿头内嵌，不查
                    need_file("VISION_FILE", false);
     }
     // GGUF 权重自带 tokenizer，不查词表目录（同上）
@@ -1271,7 +1273,7 @@ const char* kProfileKeys[] = {
     // 推理设置
     "MAX_CONTEXT", "PARALLEL", "KV_PAGED", "KV_POOL_TOKENS", "KV_TYPE", "PREFILL_CHUNK",
     "CONC_PREFILL_CHUNK", "QSA_INDEXER_BUDGET", "KVSNAP_MAX_GB", "KVSNAP_DIR",
-    "MOE_A4", "MAX_IMAGES", "VIZ", "AFFINITY", "PLE_URING", "MEMORY_CAP_GB",
+    "MOE_A4", "MTP", "NGRAM", "MAX_IMAGES", "VIZ", "AFFINITY", "PLE_URING", "MEMORY_CAP_GB",
     "MIN_AVAILABLE_GB", "START_TIMEOUT", "STALL_TIMEOUT",
     "CVEC", "CVEC_MODE", "CVEC_SCALE", "CVEC_LAYERS",
 };
@@ -1666,6 +1668,8 @@ bool extra_validate(const svcconf::Conf& conf, std::string* err) {
         // CVEC_LAYERS 的区间校验在 svcconf::validate_conf 里（同一 POST 已先调用）。
     }
     if (!int_range("MTP_GAMMA", "0", 0, 8)) return false;
+    if (!int_range("MTP", "1", 0, 1)) return false;
+    if (!int_range("NGRAM", "0", 0, 1)) return false;
     if (!int_range("MOE_A4", "0", 0, 3)) return false;
     if (!int_range("MAX_IMAGES", "8", 1, 256)) return false;
     if (!int_range("VIZ", "0", 0, 1)) return false;
@@ -1723,7 +1727,7 @@ void handle_config_post(const http::Request& q, http::Response* r, http::Stream*
             "GGUF_PLE_FILE"};
         static const std::vector<std::string> kVerKeys[] = {
             /* v1 */ {"MODEL_FILE", "OVERLAY_FILE", "MTP_FILE", "VISION_FILE"},
-            /* v2 */ {"MODEL_FILE", "NGRAM_FILE", "MTP_FILE", "VISION_FILE"},
+            /* v2 */ {"MODEL_FILE", "NGRAM_FILE", "VISION_FILE"},
             /* gguf */ {"GGUF_FILE", "GGUF_MTP_FILE", "GGUF_VISION_FILE", "GGUF_PLE_FILE"},
         };
         const auto& allow = kVerKeys[wv == "v2" ? 1 : wv == "gguf" ? 2 : 0];
@@ -1739,6 +1743,9 @@ void handle_config_post(const http::Request& q, http::Response* r, http::Stream*
         }
         if (wv == "v1") vals["NGRAM_FILE"] = "$MODEL_FILE";
         if (wv == "v2") vals["OVERLAY_FILE"] = "";
+        // v2 主模型内嵌 8-bit MTP 草稿头：独立 MTP_FILE 只对 v1 有意义，v2 保存固定写空
+        // （与 OVERLAY_FILE 同理）；是否做 MTP 由 MTP 开关决定。
+        if (wv == "v2") vals["MTP_FILE"] = "";
     }
     std::string err;
     json envov = json::array();

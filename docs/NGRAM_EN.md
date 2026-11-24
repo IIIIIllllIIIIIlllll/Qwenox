@@ -12,6 +12,23 @@ comparison, etc.) from the ngram speculative decoding of
 MIT license of llama.cpp is compatible with this project's AGPL-3.0
 distribution.
 
+## Switch (`NGRAM` in service.conf)
+
+The n-gram draft round is off by default (`NGRAM=0`). Set `NGRAM=1` (in
+service.conf or as an environment variable of the same name) to restore
+chain's ngram rounds; when off, the launcher exports `QWENOX_DRAFTER=mtp`:
+chain keeps only MTP rounds. The PLE n-gram table file is still mapped,
+just not used for drafting. Measured acceptance of ngram rounds is only
+~3–24% on thinking/analysis text, where each round costs ~106–131 ms
+(≈3.5 serial tokens) — nearly a pure loss; and even on repetitive content
+(logs, boilerplate code) the v2 built-in MTP head covers it well
+(acceptance 0.92–0.99, pure MTP is 10–20% faster) — only synthetic
+periodic sequences that MTP cannot learn are worth enabling it for.
+Combined with `MTP=0` the semantics are consistent:
+`QWENOX_DRAFTER=mtp` + `QWENOX_NOSPEC=1` → plain serial decoding. If the
+user has already exported `QWENOX_DRAFTER`, the launcher does not override
+it.
+
 ## 2026-09-19 update: chunked verify (fixes ngram-round output stalls)
 
 **Problem**: an ngram round submits a draft of up to 64 tokens as a single 65-row atomic verify (~350ms), and on partial acceptance it must replay the entire accepted prefix (~150ms); the client receives no tokens during this time, which shows up in production logs as ~1.5s streaming gaps ("stalls").

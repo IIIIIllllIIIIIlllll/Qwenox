@@ -327,6 +327,7 @@ zh:{
   wv_v2:"V2", wv_v2s:"主模型 + 独立 n-gram 表",
   wv_gguf:"GGUF", wv_ggufs:"分片 GGUF，内嵌词表",
   gguf_tok:"GGUF 权重内嵌词表，不需要 tokenizer 目录。",
+  mtp_v2_note:"v2 主模型已内嵌 8-bit MTP 草稿头，无需单独文件；是否做 MTP 由推理页的「启用 MTP 投机草稿」开关决定。",
   browse:"浏览…", enable:"启用", env_tag:"环境变量",
   env_help:"该项被同名环境变量覆盖，这里改了也不生效",
   ex_ok:"✓ 已找到", ex_no:"找不到", ex_nodir:"目录不存在", ex_notok:"目录里没有 tokenizer.json",
@@ -401,6 +402,7 @@ en:{
   wv_v2:"V2", wv_v2s:"main model + separate n-gram table",
   wv_gguf:"GGUF", wv_ggufs:"sharded GGUF, embedded tokenizer",
   gguf_tok:"GGUF embeds the tokenizer; no tokenizer directory needed.",
+  mtp_v2_note:"The v2 main model embeds an 8-bit MTP draft head — no separate file needed. Whether MTP runs is controlled by the inference tab's MTP switch.",
   browse:"Browse…", enable:"Enable", env_tag:"env",
   env_help:"Overridden by an environment variable; edits here have no effect",
   ex_ok:"✓ found", ex_no:"not found", ex_nodir:"directory missing", ex_notok:"no tokenizer.json in this directory",
@@ -470,8 +472,9 @@ const FIELDS = [
   {k:"MODEL_FILE", tab:"w", wv:["v1","v2"], type:"file", ext:[".hgn"], req:1, nameZh:"主模型", nameEn:"Main model"},
   {k:"NGRAM_FILE", tab:"w", wv:["v2"], type:"file", ext:[".hgn"], req:1, nameZh:"n-gram 表", nameEn:"n-gram table"},
   {k:"OVERLAY_FILE", tab:"w", wv:["v1"], type:"file", opt:1, ext:[".hgn"], nameZh:"overlay", nameEn:"Overlay"},
-  {k:"MTP_FILE", tab:"w", wv:["v1","v2"], type:"file", opt:1, ext:[".hgn"], nameZh:"MTP 草稿", nameEn:"MTP draft",
-   helpZh:"推测解码草稿头；关闭后不做 MTP", helpEn:"Speculative-decoding draft head; off = no MTP"},
+  {k:"MTP_FILE", tab:"w", wv:["v1"], type:"file", opt:1, ext:[".hgn"], nameZh:"MTP 草稿", nameEn:"MTP draft",
+   helpZh:"独立 8-bit 草稿头；关闭 = 用基座内置的 4-bit 草稿头（仍做 MTP，要关 MTP 用推理页的「启用 MTP 投机草稿」）",
+   helpEn:"Standalone 8-bit draft head; off = the base model's built-in 4-bit head (MTP still runs — use the inference tab's MTP switch to disable)"},
   {k:"VISION_FILE", tab:"w", wv:["v1","v2"], type:"file", opt:1, ext:[".hgn"], nameZh:"视觉塔", nameEn:"Vision tower",
    helpZh:"关闭后不支持图片输入", helpEn:"Off = no image input"},
   {k:"GGUF_FILE", tab:"w", wv:["gguf"], type:"file", ext:[".gguf"], req:1, nameZh:"主模型", nameEn:"Main model",
@@ -522,6 +525,11 @@ const FIELDS = [
   {k:"MOE_A4", tab:"i", grp:"misc", type:"select", nameZh:"prefill 4-bit 加速", nameEn:"Prefill 4-bit act",
    helpZh:"仅 hgn v2；快约 9%，精度略降", helpEn:"hgn v2 only; ~9% faster, slightly less precise",
    opts:[["0","关闭","Off"],["1","gate/up","gate/up"],["2","down","down"],["3","两者","Both"]]},
+  {k:"MTP", tab:"i", grp:"misc", type:"check", nameZh:"启用 MTP 投机草稿", nameEn:"MTP speculative draft",
+   helpZh:"关闭后完全不跑 MTP（ngram 轮保留，重启生效）", helpEn:"Off = no MTP at all (ngram rounds kept; applies after restart)"},
+  {k:"NGRAM", tab:"i", grp:"misc", type:"check", nameZh:"启用 n-gram 草稿", nameEn:"n-gram draft",
+   helpZh:"默认关闭：v2 内嵌 MTP 草稿头已覆盖重复性内容（纯 MTP 实测更快）；仅合成周期序列等 MTP 学不了的内容才值得开（重启生效）",
+   helpEn:"Off by default: v2's built-in MTP head already covers repetitive content (pure MTP measured faster); only enable for synthetic periodic sequences MTP cannot learn (applies after restart)"},
   {k:"MAX_IMAGES", tab:"i", grp:"misc", type:"int", nameZh:"单请求图片上限", nameEn:"Images per request", helpZh:"1–256", helpEn:"1–256"},
   {k:"VIZ", tab:"i", grp:"misc", type:"check", nameZh:"运行时可视化", nameEn:"Runtime viz",
    helpZh:"开启后局域网可看到生成内容", helpEn:"LAN can see generated content when on"},
@@ -560,7 +568,7 @@ const RANGES = {ENGINE_PORT:[1,65535], API_PORT:[1,65535], MAX_CONTEXT:[1024,104
 const PF_CVEC = ["CVEC","CVEC_MODE","CVEC_SCALE","CVEC_LAYERS"];
 const PF_WKEYS = {
   v1:["MODEL_FILE","OVERLAY_FILE","MTP_FILE","VISION_FILE","TOKENIZER_DIR",...PF_CVEC],
-  v2:["MODEL_FILE","NGRAM_FILE","MTP_FILE","VISION_FILE","TOKENIZER_DIR",...PF_CVEC],
+  v2:["MODEL_FILE","NGRAM_FILE","VISION_FILE","TOKENIZER_DIR",...PF_CVEC],
   gguf:["GGUF_FILE","GGUF_MTP_FILE","GGUF_VISION_FILE","GGUF_PLE_FILE","TOKENIZER_DIR",...PF_CVEC],
 };
 const PF_IKEYS = FIELDS.filter(f => f.tab === "i").map(f => f.k);
@@ -845,6 +853,7 @@ function renderPane(){
     pane.append(cards);
     pane.append(el("h3", {text: LANG === "zh" ? "权重文件" : "Weight files"}));
     for (const f of FIELDS) if (f.tab === "w" && fieldVisible(f, S.draft.wv)) pane.append(mkRow(f));
+    if (S.draft.wv === "v2") pane.append(el("div", {class:"fhelp", style:"margin-top:8px", text:t("mtp_v2_note")}));
     if (S.draft.wv === "gguf") pane.append(el("div", {class:"fhelp", style:"margin-top:8px", text:t("gguf_tok")}));
   } else {
     pane.append(el("div", {class:"note", text:t(S.tab + "_note")}));
