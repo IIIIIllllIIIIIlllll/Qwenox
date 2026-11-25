@@ -17,6 +17,55 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+#ifdef _WIN32
+// QWENOX_PURGE_STANDBY=1: 每个 prefill 采样前清空系统 Standby 页缓存
+// （NtSetSystemInformation(SystemMemoryListInformation, MemoryPurgeStandbyList)，
+// 等同 RAMMap "Empty Standby List"），把 PLE 行打回真冷态——bench 默认量的是
+// 热缓存，连续运行时首轮/次轮可差 ±6~8%（dev-docs/RESULT-WIN-PREFILL-FIX）。
+// 注意： purge 是全局的（影响整机所有缓存页），且需要
+// SeProfileSingleProcessPrivilege（管理员默认持有）；失败打警告后继续。
+static void purge_standby_maybe() {
+  static const int on = [] {
+    const char* e = getenv("QWENOX_PURGE_STANDBY");
+    return e && strcmp(e, "0") != 0 ? 1 : 0;
+  }();
+  if (!on) return;
+  typedef LONG NTSTATUS;
+  typedef NTSTATUS(NTAPI* NtSetSystemInformation_t)(ULONG, PVOID, ULONG);
+  HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+  auto NtSetSystemInformation = ntdll ? (NtSetSystemInformation_t)GetProcAddress(
+                                            ntdll, "NtSetSystemInformation")
+                                      : nullptr;
+  if (NtSetSystemInformation) {
+    HANDLE token = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(),
+                         TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+      LUID luid;
+      if (LookupPrivilegeValueA(nullptr, "SeProfileSingleProcessPrivilege",
+                                &luid)) {
+        TOKEN_PRIVILEGES tp{};
+        tp.PrivilegeCount = 1;
+        tp.Privileges[0].Luid = luid;
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        AdjustTokenPrivileges(token, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+      }
+      CloseHandle(token);
+    }
+    ULONG cmd = 4;  // MemoryPurgeStandbyList
+    if (NtSetSystemInformation(0x50, &cmd, sizeof(cmd)) >= 0) return;
+  }
+  static bool warned = false;
+  if (!warned) {
+    warned = true;
+    fprintf(stderr, "bench: standby purge failed (need admin privilege), "
+                    "continuing without it\n");
+  }
+}
+#else
+static void purge_standby_maybe() {}
+#endif
+
+
 struct BenchConfig {
   std::filesystem::path root;
   std::unordered_map<std::string, std::string> values;
@@ -507,6 +556,7 @@ static void run_prefill(GpuModel& model, const BenchConfig& config, int maxctx,
     for (int sample = 0; sample < repeats; sample++) {
       model.mtp_tap_capture = false;
       model.reset_state();
+      purge_standby_maybe();
       const auto start = Clock::now();
       // quiet=false：长 prompt 需要 2-flight PLE 跨块预取（quiet 曾把它误降为
       // 1-flight）；日志静默由 model.bench_quiet 承担。
