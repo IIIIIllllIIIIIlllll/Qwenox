@@ -37,19 +37,30 @@ static void purge_standby_maybe() {
                                             ntdll, "NtSetSystemInformation")
                                       : nullptr;
   if (NtSetSystemInformation) {
-    HANDLE token = nullptr;
-    if (OpenProcessToken(GetCurrentProcess(),
-                         TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
-      LUID luid;
-      if (LookupPrivilegeValueA(nullptr, "SeProfileSingleProcessPrivilege",
-                                &luid)) {
-        TOKEN_PRIVILEGES tp{};
-        tp.PrivilegeCount = 1;
-        tp.Privileges[0].Luid = luid;
-        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-        AdjustTokenPrivileges(token, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+    HMODULE adv = GetModuleHandleA("advapi32.dll");
+    if (!adv) adv = LoadLibraryA("advapi32.dll");
+    auto OpenProcessToken_ =
+        (BOOL(WINAPI*)(HANDLE, DWORD, PHANDLE))GetProcAddress(adv, "OpenProcessToken");
+    auto LookupPrivilegeValueA_ =
+        (BOOL(WINAPI*)(LPCSTR, LPCSTR, PLUID))GetProcAddress(adv, "LookupPrivilegeValueA");
+    auto AdjustTokenPrivileges_ =
+        (BOOL(WINAPI*)(HANDLE, BOOL, PTOKEN_PRIVILEGES, DWORD, PTOKEN_PRIVILEGES,
+                       PDWORD))GetProcAddress(adv, "AdjustTokenPrivileges");
+    if (OpenProcessToken_ && LookupPrivilegeValueA_ && AdjustTokenPrivileges_) {
+      HANDLE token = nullptr;
+      if (OpenProcessToken_(GetCurrentProcess(),
+                            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+        LUID luid;
+        if (LookupPrivilegeValueA_(nullptr, "SeProfileSingleProcessPrivilege",
+                                   &luid)) {
+          TOKEN_PRIVILEGES tp{};
+          tp.PrivilegeCount = 1;
+          tp.Privileges[0].Luid = luid;
+          tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+          AdjustTokenPrivileges_(token, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+        }
+        CloseHandle(token);
       }
-      CloseHandle(token);
     }
     ULONG cmd = 4;  // MemoryPurgeStandbyList
     if (NtSetSystemInformation(0x50, &cmd, sizeof(cmd)) >= 0) return;
