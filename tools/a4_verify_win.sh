@@ -4,7 +4,7 @@
 #
 #   BIN_OLD=<engine before the change> bash tools/a4_verify_win.sh
 #
-#   CHUNK=8192 overrides the prefill chunk (default 6144 = Windows default).
+#   CHUNK=8192 overrides the prefill chunk (unset = engine default).
 # 1. old engine, A4 unset: a4_conc.py seq                       (reference)
 # 2. new engine, A4 unset: seq -> tokens must equal 1 (default path unchanged);
 #    then 2-way concurrent -> must equal seq (multi-chunk prefill + decode on

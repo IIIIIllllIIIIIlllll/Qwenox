@@ -379,8 +379,8 @@ MTP on, vision tower on, prefill chunk 8192):
   multimodal requests allocate more at run time, so 2–4 slots are recommended at 512K.
 - **UD-IQ4_XS with MTP uses ~1.3 GiB more than v2**; at a 512K pool use at most 2–4 slots.
 - **w4b is limited to 256K.**
-- The table was measured at prefill chunk 8192; the default 6144 uses about 1.7 GiB less in every row, with PP
-  within ~0.5% of 8192. 16384 does not fit.
+- The table was measured at prefill chunk 8192; the then-default 6144 uses about 1.7 GiB less in every row
+  (the default is 8192 now). 16384 does not fit.
 - The launcher refuses pools above 512K.
 - UD-Q4_K_XL is 77 GiB resident; extrapolating from the table, 256K alone would need ~97 GiB, so it is not
   supported on Windows.
