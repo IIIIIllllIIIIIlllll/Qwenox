@@ -224,7 +224,7 @@ bash build_win.sh    # 引擎、benchmark、API 托盘程序、根目录入口 s
 | `MAX_CONTEXT` | `262144` | 单条请求的输入 + 输出上限 |
 | `KV_POOL_TOKENS` | `0` | 所有并发请求共用的 KV 总量，0 表示等于 `MAX_CONTEXT`；每多 256K 约多占 9.6 GiB |
 | `PARALLEL` | `4` | 同时运行的请求数，1–8 |
-| `PREFILL_CHUNK` | `0` | 长 prompt 每段多少 token，0 表示 Linux 16384、Windows 6144 |
+| `PREFILL_CHUNK` | `0` | 长 prompt 每段多少 token，0 表示 Linux 16384、Windows 8192 |
 | `ROPE_FACTOR` | `1` | 1 为原生 256K；设为 2 并把 `MAX_CONTEXT` 改为 `524288` 即 YaRN 512K |
 | `MTP_GAMMA` | `0` | 草稿长度，0 表示自动，1–8 表示固定 |
 | `MOE_A4` | `0` | prefill 4-bit 加速（只对 hgn v2 生效），见下文；0 关，3 开 |
