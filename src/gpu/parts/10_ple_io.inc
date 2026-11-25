@@ -295,6 +295,40 @@ struct PleWin {
   void run(const uint64_t* addrs, uint8_t* staging, uint64_t table_va,
            size_t n) {
     std::lock_guard<std::mutex> lk(run_mu);
+    // 热行直连映射 memcpy，比 160B ReadFile+IOCP 快两个数量级（98304 行热态
+    // 实测：IOCP 254-354K rows/s 且 4 线程即饱和——每条小读 ~4us 的内核 I/O
+    // 路径是硬顶，加线程无用；mapped 软缺页 506K/s、工作集热后 57-84M/s，
+    // 见 dev-docs/RESULT-WIN-PREFILL-FIX-20261125.md）。prefill 的 8 个泵线程
+    // 各自映射读自己的分片，天然并行。按 512 行一批计时：批均值 >100us/行
+    // 说明在硬缺页（冷集，Phison 需要 QD=512 的深队列才跑得出 IOPS，同步
+    // 缺页页内串行），连续两批冷即把剩余行交回 IOCP。QWENOX_PLE_MAP=0 关。
+    static const bool map_mode = [] {
+      const char* e = getenv("QWENOX_PLE_MAP");
+      return !(e && !strcmp(e, "0"));
+    }();
+    size_t mdone = 0;
+    if (map_mode) {
+      constexpr size_t MB = 512;
+      int cold = 0;
+      while (mdone < n) {
+        const size_t m = std::min(MB, n - mdone);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < m; i++) mapped_row(addrs, staging, mdone + i);
+        const double us = std::chrono::duration<double, std::micro>(
+                              std::chrono::steady_clock::now() - t0).count() / m;
+        mdone += m;
+        if (us > 100.0) {
+          if (++cold >= 2) break;
+        } else cold = 0;
+      }
+    }
+    if (mdone < n)
+      run_iocp(addrs + mdone, staging + mdone * g_ple_rb, table_va, n - mdone);
+  }
+
+private:
+  void run_iocp(const uint64_t* addrs, uint8_t* staging, uint64_t table_va,
+                size_t n) {
     // decode 每 token 只读 16 行：槽位数按需收缩，避免每 token 分配 512 槽
     const size_t depth = std::min(DEPTH, n);
     std::vector<OVERLAPPED> ovs(depth);
@@ -396,6 +430,7 @@ struct PleWin {
     }
   }
 
+public:
   // Split form of run() for one small batch (n <= DEPTH): issue() posts reads
   // now, wait_all() collects every submitted completion later. Rows that could
   // not be submitted are copied from the mapped table immediately. Same bytes
