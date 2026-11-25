@@ -9052,7 +9052,11 @@ struct GpuModel {
     // overlaps layer compute; otherwise gather now (first chunk, quiet
     // re-ingest, or a flight mismatch). Either way the gather fills a
     // rotating staging buffer and its GPU consumer stays ordered after L0.
-    const bool ple_lookahead = ple_on && P >= 64 && !quiet;
+    // quiet 只表示"spec-verify 小块重灌/离线 bench 静默日志"，不再参与
+    // 预取决策：bench_main 曾对整段长 prompt 传 quiet=true，把跨块双缓冲
+    // 预取（nxt+nxt2，可提前两块盖住 7-17 s 读盘）误降为单块。verify 小块
+    // 本就被 P >= 64 挡在门外，无需 quiet 兜底。
+    const bool ple_lookahead = ple_on && P >= 64;
     if (ple_on) {
       if (!ple_lookahead) ple_drop_one(ple_next());  // small/quiet: one flight only
       if (!ple_flight_hit(ple_cur(), tokens, base)) {
@@ -9240,13 +9244,15 @@ struct GpuModel {
     }
     phase("argmax_d2h", TP);
     KP("end");
-    if (g_kprof_on) g_kprof_ring.flush(base, P, quiet);
+    if (g_kprof_on) g_kprof_ring.flush(base, P, quiet || bench_quiet);
     double sec =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - T0).count();
-    // quiet: spec-verify re-ingest chunks (<= gamma+1 tokens each round).
+    // quiet: spec-verify re-ingest chunks (<= gamma+1 tokens each round);
+    // bench_quiet: offline bench（自带汇总输出，不再需要逐 chunk 静默——
+    // quiet 已不再关 ple_lookahead，bench 传 quiet=false 以获得双块预取）。
     // Serve-mode prompt chunks use the live progress and request summary logs;
     // keep this legacy line only for offline prefill benchmarks.
-    if (!quiet && prog_total <= 0)
+    if (!quiet && !bench_quiet && prog_total <= 0)
       fprintf(stderr, "\n%s prefill: %d tokens in %.2f s = %.1f tok/s\n", log_ts(),
               P, sec, P / sec);
     if (prog_total > 0) prog_base += P;  // live progress: chunk complete

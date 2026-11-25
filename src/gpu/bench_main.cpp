@@ -508,7 +508,9 @@ static void run_prefill(GpuModel& model, const BenchConfig& config, int maxctx,
       model.mtp_tap_capture = false;
       model.reset_state();
       const auto start = Clock::now();
-      model.prefill_batch(tokens, 0, true, /*quiet=*/true);
+      // quiet=false：长 prompt 需要 2-flight PLE 跨块预取（quiet 曾把它误降为
+      // 1-flight）；日志静默由 model.bench_quiet 承担。
+      model.prefill_batch(tokens, 0, true, /*quiet=*/false);
       CK(hipDeviceSynchronize());
       elapsed += seconds_since(start);
     }
@@ -571,7 +573,7 @@ static void run_increment(GpuModel& model, const BenchConfig& config, int maxctx
   model.reset_state();
   model.prefill_batch(
       std::vector<int>(corpus.begin(), corpus.begin() + base_size), 0, true,
-      /*quiet=*/true);
+      /*quiet=*/false);
   CK(hipDeviceSynchronize());
   printf("\nIncrement prefill benchmark (KV continuation, base %d tokens, corpus %s)\n",
          base_size, largest.stem().string().c_str());
@@ -584,7 +586,7 @@ static void run_increment(GpuModel& model, const BenchConfig& config, int maxctx
         inc[i] = corpus[(pos + (size_t)i) % corpus.size()];
       pos += (size_t)L;
       const auto start = Clock::now();
-      model.prefill_batch(inc, (int)base, true, /*quiet=*/true);
+      model.prefill_batch(inc, (int)base, true, /*quiet=*/false);
       CK(hipDeviceSynchronize());
       const double ms = seconds_since(start) * 1000.0;
       printf("  %-10zu %7d %10.1f %12.1f\n", base, L, ms, L * 1000.0 / ms);
