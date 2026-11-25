@@ -126,10 +126,13 @@ struct GpuModel {
     }
   };
   NgGate ng_gate;
-  // Request start (serve): fresh gate and chunk level.
+  // Request start (serve): fresh gate, chunk level and joint-draft history.
   void ng_reset() {
     ng_gate = NgGate{};
     ng_cs = 0;
+    // The short-window table is slot-local too: reusing a slot must not let
+    // an earlier request change this request's proposals or sampling stream.
+    jx_ngram.reset();
   }
 
   // device state
@@ -473,7 +476,8 @@ struct GpuModel {
   // post (optional, sampled spec loops): run by the executor right after the
   // batched verify, still holding the GPU, with this segment's first row in
   // d_logits_b — the worker's logits rows are only valid until the next
-  // batch, so their sampling prep (top-k / D2H) happens there.
+  // batch, so their sampling prep (top-k / D2H) happens there. A non-null
+  // post requests logits only; the executor does not fill the int* output.
   bool (*vseg_pool_fn)(GpuModel&, const VSeg&, int*,
                        const std::function<void(int)>*) = nullptr;
   int (*vseg_active_fn)() = nullptr;
@@ -523,11 +527,15 @@ struct GpuModel {
   bool qsa_wmma = getenv("QWENOX_QSA_WMMA") != nullptr;
   // Keep the established row-major cache for decode, MTP, snapshots, and
   // the default WMMA path; this second cache is a prefill-only opt-in.
-  bool qsa_wmma_btv = !qsa_kv_q8 && !qsa_kv_fp16 && qsa_wmma && !qsa_kv_fp32 &&
+  // The transposed V twin holds the cache's native 16-bit encoding: bf16
+  // bits for KvType::BF16, fp16 bits for KvType::F16 (readers are the
+  // KVT-templated k_qsa_wmma<true> / k_qsa_wmma_u).
+  bool qsa_wmma_btv = !qsa_kv_q8 && qsa_wmma && !qsa_kv_fp32 &&
                       getenv("QWENOX_QSA_WMMA_BTV") != nullptr;
   // QWENOX_QSA_WMMA6=1: dim-split 128-thread rewrite (k_qsa_wmma6); layered on
   // the transposed-V path since it reads B fragments from that cache.
-  bool qsa_wmma6 = g_index_budget == 512 && qsa_wmma_btv &&
+  // k_qsa_wmma6 is bf16-typed; keep it off the FP16 cache.
+  bool qsa_wmma6 = !qsa_kv_fp16 && g_index_budget == 512 && qsa_wmma_btv &&
                    getenv("QWENOX_QSA_WMMA6") != nullptr;
   // QWENOX_QSA_UNION=1: 4-query 块并集 WMMA prefill（k_qsa_union_merge +
   // k_qsa_wmma_u），叠加在转置 V 路径上；组边缘回退 k_qsa_wmma<true>。
@@ -876,6 +884,7 @@ struct GpuModel {
   // the per-depth cost gate; the default keeps the old gate rule.
   bool msc_on = false;
   bool msc_cost_rule = false;
+  bool msc_sample_cost_rule = false;
   // Built-in defaults = halogen 0.20.7's embedded table (reversed 2026-11-19),
   // measured on the pre-r2 head.
   float msc_cal[2][50] = {
@@ -1415,7 +1424,7 @@ struct GpuModel {
                 "on-demand alloc=%s, kv=%s\n",
                 kv_pool_pages, KV_PAGE,
                 mode == 2 ? "scrambled+fifo(self-test)" : "lowest-first",
-                qsa_kv_q8 ? "q8g32 (no BF16 twin)" : (qsa_kv_fp16 ? "fp16" : (qsa_kv_fp32 ? "fp32" : (qsa_wmma_btv ? "bf16+btv" : "bf16"))));
+                qsa_kv_q8 ? "q8g32 (no BF16 twin)" : (qsa_kv_fp16 ? (qsa_wmma_btv ? "fp16+btv" : "fp16") : (qsa_kv_fp32 ? "fp32" : (qsa_wmma_btv ? "bf16+btv" : "bf16"))));
         if (kv_pool_pages > kv_lpages)
           fprintf(stderr, "[kvpage] pool enlarged: %d pages = %.2fx one sequence "
                           "(QWENOX_KV_POOL_TOKENS)\n",
@@ -1467,8 +1476,9 @@ struct GpuModel {
       DALLOC(&d_kcb, (size_t)kv_nl * kv_layer_rows * 512 * 2);
       DALLOC(&d_vcb, (size_t)kv_nl * kv_layer_rows * 512 * 2);
       if (qsa_kv_fp16)
-        fprintf(stderr, "kv: fp16, K+V %.3f GiB; native FP16 WMMA, FP32 decode\n",
-                2.0 * kv_nl * kv_layer_rows * 512 * 2 / (1ull << 30));
+        fprintf(stderr, "kv: fp16, K+V %.3f GiB; native FP16 WMMA%s, FP32 decode\n",
+                2.0 * kv_nl * kv_layer_rows * 512 * 2 / (1ull << 30),
+                qsa_wmma_btv ? " + transposed V twin (btv)" : "");
       if (qsa_wmma_btv) {
         // paged: kv_layer_rows = (pool + 1) * 256 -> (pool + 1) * 64 blocks,
         // and physical page p owns physical blocks [p*64, p*64+64)
@@ -1819,8 +1829,9 @@ struct GpuModel {
         // instead, then stop at n if prev*abar_s[n+1]*Ts < T[n+2]-T[n+1]+H_s.
         const char* msc_rule = getenv("QWENOX_MTP_GATE_RULE");
         const char* msc_srule = getenv("QWENOX_SAMPLED_GATE");
-        msc_cost_rule = (msc_rule && !strcmp(msc_rule, "cost")) ||
-                        (msc_srule && !strcmp(msc_srule, "cost"));
+        msc_cost_rule = msc_rule && !strcmp(msc_rule, "cost");
+        msc_sample_cost_rule = msc_cost_rule ||
+                               (msc_srule && !strcmp(msc_srule, "cost"));
         auto read_msc = [&](const char* n, float* dst, uint64_t cnt) {
           const Tensor* t = ckpt.find(n);
           if (!t || t->dtype != 1 || t->numel() != cnt) return 0;
@@ -1858,8 +1869,9 @@ struct GpuModel {
                 "max_g greedy %d sampled %d)%s\n",
                 msc_src, msc_t[0], msc_t[1], msc_scale, msc_max_g(false),
                 msc_max_g(true),
-                msc_cost_rule ? "; cost rule on"
-                              : "; set QWENOX_MTP_GATE_RULE=cost to use");
+                msc_cost_rule ? "; cost rule on (greedy and sampled)"
+                : msc_sample_cost_rule ? "; cost rule on (sampled only)"
+                                       : "; cost rule off");
       }
     }
     // DFlash2 verify rollback snapshots (per-row GDN/conv/indexer state) are
@@ -2822,7 +2834,8 @@ struct GpuModel {
     } else if (qsa_kv_fp16) {
       auto* kc = fp16_kc((size_t)qi * kv_layer_rows * 512);
       auto* vc = fp16_vc((size_t)qi * kv_layer_rows * 512);
-      k_store_kv_fp16<<<2, 256, 0, g_str>>>(d_kb, d_vb, kc, vc, 1, 0, kvpt(), d_pos);
+      k_store_kv_fp16<<<2, 256, 0, g_str>>>(d_kb, d_vb, kc, vc, 1, 0, kvpt(), d_pos,
+                                            vct_layer(qi));
       qsa_attn(kc, vc, kvpt());
     } else if (qsa_kv_fp32) {
       float* kc = d_kc + (size_t)qi * kv_layer_rows * 512;
@@ -5309,6 +5322,11 @@ struct GpuModel {
                    int base = 0, const uint16_t* vt = nullptr,
                    const int* pt = nullptr, const int* db = nullptr,
                    int row0 = 0, int spec = -1) {
+    // FP16 KV + BTV：走模板化主路径（转置 V / union kernel 均为 KVT 模板实例）。
+    if (vt) {
+      qsa_flash_b<__half>(kc, vc, P, dense_P, base, vt, pt, db, row0, spec);
+      return;
+    }
     qsa_flash_native(kc, vc, P, dense_P, base, vt, pt, db, row0, spec);
   }
   void qsa_flash_b(const KvQ8Block* kc, const KvQ8Block* vc, int P, int dense_P,
@@ -5413,11 +5431,11 @@ struct GpuModel {
                 iselb, ga, d_ublk, d_umask, d_ucount, QSA_UCAP, base, P,
                 dvb);
             if (ptab)
-              k_qsa_wmma_u<true><<<dim3(ngroups, 2), 256, 0, g_str>>>(
+              k_qsa_wmma_u<true, KVT><<<dim3(ngroups, 2), 256, 0, g_str>>>(
                   qsb, kc, vc_transposed, attnb, 256, 2, 24, d_ublk, d_umask,
                   d_ucount, QSA_UCAP, ga, base, ptab, P, dvb);
             else
-              k_qsa_wmma_u<<<dim3(ngroups, 2), 256, 0, g_str>>>(
+              k_qsa_wmma_u<false, KVT><<<dim3(ngroups, 2), 256, 0, g_str>>>(
                   qsb, kc, vc_transposed, attnb, 256, 2, 24, d_ublk, d_umask,
                   d_ucount, QSA_UCAP, ga, base, nullptr, P, dvb);
           }
@@ -5450,10 +5468,15 @@ struct GpuModel {
             if (base + P > ge && ge >= ga) edge(ge, base + P - ge);
           }
         }
-        else if (qsa_wmma6 && vc_transposed)
-          k_qsa_wmma6<<<dim3(nsparse, 2), 128, 0, g_str>>>(
-              qsb, kc, vc, vc_transposed, attnb, P, 256, 2, 24, sel,
-              first_abs, base);
+        else if (qsa_wmma6 && vc_transposed) {
+          // k_qsa_wmma6 is bf16-typed; the FP16 cache never sets qsa_wmma6,
+          // so this branch is unreachable for KVT=__half (constexpr-guarded
+          // to keep the bf16-only kernel out of the __half instantiation).
+          if constexpr (!std::is_same<KVT, __half>::value)
+            k_qsa_wmma6<<<dim3(nsparse, 2), 128, 0, g_str>>>(
+                qsb, kc, vc, vc_transposed, attnb, P, 256, 2, 24, sel,
+                first_abs, base);
+        }
         else if ((qsa_wmma_btv || expanded_q8) && vc_transposed) {
           if (ptab)  // A1c paged instantiation (never taken unpaged)
             k_qsa_wmma<true, true><<<dim3(nsparse, 2), 256, 0, g_str>>>(
@@ -6321,13 +6344,39 @@ struct GpuModel {
       } else if (qsa_kv_fp16) {
         auto* kc = fp16_kc(qsa_off);
         auto* vc = fp16_vc(qsa_off);
+        uint16_t* vct = vct_layer(qi);
         k_qsa_kprep<false><<<dim3(2, P), 256, 0, g_str>>>(
             kbb, knw, kbb, nullptr, g_cfg.norm_eps, base, ropecs);
         k_store_kv_fp16<<<P * 2, 256, 0, g_str>>>(kbb, vbb, kc, vc, P, base, ptabc, dvb);
+        if (vct) {
+          // BTV 孪生：fp16 位流的转置 V，与 bf16 路径同布局同边缘语义
+          // （部分块 slot < base 保留、>= base+P 清零）。
+          if (dvb) {  // P3-B graph capture: baked worst-case grid, in-kernel mask
+            k_f32_to_bf16_v4_bt_pd<__half><<<(unsigned)(((((size_t)P + 6) / 4 + 1) *
+                                                     512 + 255) /
+                                                    256),
+                                          256, 0, g_str>>>(vbb, vct, ptabc, P,
+                                                           512, dvb);
+          } else if (!kv_paged) {
+            const int btb = (base + P + 3) / 4 - base / 4;
+            k_f32_to_bf16_v4_bt<__half><<<(unsigned)(((size_t)btb * 512 + 255) / 256),
+                                        256, 0, g_str>>>(vbb, vct, 512, P, 512,
+                                                         base);
+          } else {
+            kv_runs_seq(seq, base, base + P, KV_PAGE, [&](int lr, size_t prz, int n) {
+              const int pr = (int)prz;
+              const size_t so = (size_t)(lr - base) * 512;
+              k_f32_to_bf16_v4_bt<__half>
+                  <<<(unsigned)(((size_t)((pr + n + 3) / 4 - pr / 4) * 512 + 255) /
+                                 256),
+                    256, 0, g_str>>>(vbb + so, vct, 512, n, 512, pr);
+            });
+          }
+        }
         KP_SUB_END();
         KP_SUB("qsa:flash");
         if (!defer_attn)
-          qsa_flash_b(kc, vc, P, dense_P, base, nullptr, ptabc, dvb, r0, sovr);
+          qsa_flash_b(kc, vc, P, dense_P, base, vct, ptabc, dvb, r0, sovr);
         KP_SUB_END();
       } else if (qsa_kv_fp32) {
         float* kc = d_kc + qsa_off;
@@ -6524,7 +6573,8 @@ struct GpuModel {
         } else if (qsa_kv_fp16) {
           auto* kc = fp16_kc(qsa_off);
           auto* vc = fp16_vc(qsa_off);
-          k_store_kv_fp16<<<2, 256, 0, g_str>>>(kb, vb, kc, vc, 1, 0, ptabc, pabs);
+          k_store_kv_fp16<<<2, 256, 0, g_str>>>(kb, vb, kc, vc, 1, 0, ptabc, pabs,
+                                                vct_layer(qi));
           k_qsa_step<__half><<<24, 256, 0, g_str>>>(
               qs, kc, vc, att, pabs, 256, 2, 24,
               qsa_dense ? nullptr : iselb + (size_t)t * g_index_budget, false, ptabc);
@@ -9173,8 +9223,10 @@ struct GpuModel {
                         hipMemcpyDeviceToDevice, g_str));
     pos = base + P;
     ple_ringpos = (base + P) % 9;
-    CK(hipMemcpyAsync(d_pos, &pos, 4, hipMemcpyHostToDevice, g_str));
-    CK(hipMemcpyAsync(d_ringpos, &ple_ringpos, 4, hipMemcpyHostToDevice, g_str));
+    // Match the multi-segment tail: pass scalar values in kernel arguments
+    // so pageable host copies do not drain the stream before the lm_head.
+    I32Set iset{{d_pos, d_ringpos}, {pos, ple_ringpos}, 2};
+    k_set_i32<<<1, 32, 0, g_str>>>(iset);
     // Verify consumes batch logits; do not compute and synchronously read
     // the last row's lm_head a second time.
     if (final) enq_final();
@@ -9231,6 +9283,7 @@ struct GpuModel {
   // is the last committed token, the rest are the drafts; base = absolute
   // position of toks[0]. nseg==1 on the bound slot keeps the S1a path: exactly
   // prefill_batch(toks, base, final=false, quiet=true) + batch_argmax(P, vout)
+  // (or batch_logits_device(P) when vout is null).
   // (a verify chunk never exceeds maxbatch_cap, so prefill_batch degenerates
   // to one prefill_chunk with no tap capture, no PLE next-chunk prefetch and
   // no inter-chunk yield). nseg>1 (or a non-bound slot) goes through
@@ -9410,6 +9463,7 @@ struct GpuModel {
     return true;
   }
 
+  // vout == nullptr requests logits only (sampled verify callbacks).
   bool verify_segments(const VSeg* segs, int nseg, int* vout) {
     if (!segs || nseg < 1) return false;
     if (nseg == 1 && segs[0].toks && segs[0].slot == bound_) {
@@ -9418,7 +9472,8 @@ struct GpuModel {
       const int P = (int)sg.toks->size();
       if (P < 1 || P > maxbatch_cap) return false;
       prefill_chunk(*sg.toks, sg.base, false, true, nullptr);
-      batch_argmax(P, vout);
+      if (vout) batch_argmax(P, vout);
+      else batch_logits_device(P);
       return true;
     }
     // D2-S1c: multi-segment (or non-bound slot) batched pass. vout receives
@@ -9442,8 +9497,10 @@ struct GpuModel {
     // the wall time: equal means the pass is launch-bound, not GPU-bound
     g_vseg_enq_ms += std::chrono::duration<double, std::milli>(
                          std::chrono::steady_clock::now() - te0).count();
-    argmax_rows(d_logits_b, g_cfg.vocab, R, d_amx_cand, d_argmax_arr, g_str);
-    CK(hipMemcpy(vout, d_argmax_arr, R * 4, hipMemcpyDeviceToHost));
+    if (vout) {
+      argmax_rows(d_logits_b, g_cfg.vocab, R, d_amx_cand, d_argmax_arr, g_str);
+      CK(hipMemcpy(vout, d_argmax_arr, R * 4, hipMemcpyDeviceToHost));
+    }
     KP("end");
     if (g_kprof_on) g_kprof_ring.flush(segs[0].base, R, true);
     return true;
@@ -9806,11 +9863,14 @@ struct GpuModel {
     // B0: row mtp_pos is in the shared pool; drafts run ahead of the trunk
     // (rows pos-1 .. pos+gamma-2), so map / un-share the page first
     kv_prepare(mtp_pos, mtp_pos + 1);
+    I32Set iset{{d_mpos}, {mtp_pos}, 1};
     if (d_tok_in)
       CK(hipMemcpyAsync(d_mtok, d_tok_in, 4, hipMemcpyDeviceToDevice, g_str));
-    else
-      CK(hipMemcpyAsync(d_mtok, &tok, 4, hipMemcpyHostToDevice, g_str));
-    CK(hipMemcpyAsync(d_mpos, &mtp_pos, 4, hipMemcpyHostToDevice, g_str));
+    else {
+      iset.p[iset.n] = d_mtok;
+      iset.v[iset.n++] = tok;
+    }
+    k_set_i32<<<1, 32, 0, g_str>>>(iset);
     mtp_input_1(tap);
     win_kick();
     mtp_gr_read("mtp.layers.0.attn_hyper_connection", d_x);
@@ -10464,7 +10524,8 @@ struct GpuModel {
     // 10-05: output diverged from plain greedy until this reset).
     xf16_src = nullptr;
     mtp_pos = base + P;
-    CK(hipMemcpyAsync(d_mpos, &mtp_pos, 4, hipMemcpyHostToDevice, g_str));
+    I32Set iset{{d_mpos}, {mtp_pos}, 1};
+    k_set_i32<<<1, 32, 0, g_str>>>(iset);
   }
 
   // Acceptance-rate harness: after prefill_batch(prompt) with tap capture,
@@ -11184,7 +11245,7 @@ struct GpuModel {
   // QWENOX_SAMPLED_GATE=t1[,t2]（上游 HALOGEN_SAMPLED_GATE 口径，默认
   // 0.95,0.98 与上游一致）：第二个草稿需第一次抽中的概率 >= t1，第三个起
   // 各需前一次抽中 >= t2。显式 0 = 关（退回 spec_conf 的 top-1 阈值）。
-  // 值 "cost" 等价于 QWENOX_MTP_GATE_RULE=cost。
+  // 值 "cost" 只启用采样 cost 门；QWENOX_MTP_GATE_RULE=cost 两种模式都启用。
   static float sampled_gate(int k) {
     static const std::pair<float, float> v = [] {
       float a = 0.95f, b = 0.98f;
@@ -11205,7 +11266,7 @@ struct GpuModel {
                       const std::vector<float>& dense, float& msc_prev,
                       float qlp) {
     if (j + 1 >= g) return false;
-    if (msc_on && msc_cost_rule) {
+    if (msc_on && msc_sample_cost_rule) {
       // 上游采样回路的单判定（见加载处注释）：链积先并入当前草稿——抽中 token
       // 的 q（50 分箱查 cal_s），再与前瞻 abar_s[n+1]、ΔT+H 比较。无 greedy
       // 的 check1。
@@ -11533,7 +11594,8 @@ struct GpuModel {
   // emit (optional): called with each committed token as it lands; returning
   // false aborts the loop early (serve: eos/cancel/streaming).
   std::vector<int> spec_loop(int cur, int gen, int gamma,
-                             const std::function<bool(int)>& emit = nullptr) {
+                             const std::function<bool(int)>& emit = nullptr,
+                             bool limit_gamma = true) {
     last_spec_rounds = last_spec_commit = last_spec_rollbacks = 0;
     last_ng_rounds = last_ng_proposed = last_ng_accepted = 0;
     live_spec_rounds = live_spec_commits = live_spec_proposed = 0;
@@ -11557,7 +11619,10 @@ struct GpuModel {
       yield_point();  // round top: mtp_pos == pos-1, d_R == h_{pos-1}
       int q = pos - 1;  // trunk processed through q
       if (d_iraw) vg_dump_buf("irT", 2, d_iraw, 512 * 4);  // P3-B bisect
-      int g = std::min((msc_on && msc_cost_rule) ? msc_max_g(false) : gctl.cur,
+      int g = std::min((msc_on && msc_cost_rule)
+                           ? (gamma > 0 && limit_gamma ? std::min(gctl.cur, msc_max_g(false))
+                                        : msc_max_g(false))
+                           : gctl.cur,
                        gen - (int)out.size());
       // D2-S2a row budget + D2 阶段 3 occupancy γ (round-top snapshot of the
       // rendezvous membership; may return 0 = batched AR round).
@@ -11786,7 +11851,7 @@ struct GpuModel {
   // next round. Round-start invariant (same as spec_loop): mtp_pos = pos-1,
   // MTP KV covers 0..pos-2, d_R = h_{pos-1} pending pairing with cur.
   std::vector<int> spec_loop_chain(int cur, int gen, int gamma,
-      const std::function<bool(int)>& emit = nullptr) {
+      const std::function<bool(int)>& emit = nullptr, bool limit_gamma = true) {
     last_spec_rounds = last_spec_commit = last_spec_rollbacks =
         last_spec_proposed = 0;
     last_ng_rounds = last_ng_proposed = last_ng_accepted = 0;
@@ -12049,8 +12114,10 @@ struct GpuModel {
         // ---- (same machinery as spec_loop). This worker is counted by the
         // ---- loop-scope VrLoop; the rendezvous happens at the verify below.
         int q = pos - 1;
-        int g = std::min({(msc_on && msc_cost_rule) ? msc_max_g(false)
-                                                    : gctl.cur,
+        int g = std::min({(msc_on && msc_cost_rule)
+                              ? (gamma > 0 && limit_gamma ? std::min(gctl.cur, msc_max_g(false))
+                                           : msc_max_g(false))
+                              : gctl.cur,
                           gen - (int)out.size(), maxctx - pos - 1});
         if (g < 1) break;  // context edge: no room for even one draft
         // Shared row budget + occupancy γ, as spec_loop (may return 0: the
@@ -12259,7 +12326,8 @@ struct GpuModel {
   template <typename Sampler>
   std::vector<int> spec_loop_sample(
       int cur, int gen, int gamma, Sampler& sampler,
-      const std::function<bool(int, float)>& emit = nullptr) {
+      const std::function<bool(int, float)>& emit = nullptr,
+      bool limit_gamma = true) {
     last_spec_rounds = last_spec_commit = last_spec_rollbacks = 0;
     last_ng_rounds = last_ng_proposed = last_ng_accepted = 0;
     live_spec_rounds = live_spec_commits = live_spec_proposed = 0;
@@ -12279,8 +12347,10 @@ struct GpuModel {
     while ((int)out.size() < gen) {
       yield_point();  // round top: mtp_pos == pos-1, d_R == h_{pos-1}
       int q = pos - 1;
-      int g = std::min(((msc_on && msc_cost_rule) ? msc_max_g(true)
-                                                  : (spec_conf() > 0 ? kSpecConfMax : gctl.cur)),
+      int plan = (msc_on && msc_sample_cost_rule) ? msc_max_g(true)
+                    : (spec_conf() > 0 ? kSpecConfMax : gctl.cur);
+      if (gamma > 0 && limit_gamma) plan = std::min(plan, gctl.cur);
+      int g = std::min(plan,
                        gen - (int)out.size());
       size_t chist_sz = chist.size();
       mtp_ckpt_save();
@@ -12544,7 +12614,8 @@ struct GpuModel {
   template <typename Sampler>
   std::vector<int> spec_loop_chain_sample(
       int cur, int gen, int gamma, Sampler& sampler, bool mtp_ok,
-      const std::function<bool(int, float)>& emit = nullptr, bool seeded = false) {
+      const std::function<bool(int, float)>& emit = nullptr, bool seeded = false,
+      bool limit_gamma = true) {
     last_spec_rounds = last_spec_commit = last_spec_rollbacks =
         last_spec_proposed = 0;
     last_ng_rounds = last_ng_proposed = last_ng_accepted = 0;
@@ -12914,9 +12985,10 @@ struct GpuModel {
         // ---- MTP round (ngram table missed): spec_loop_sample's round ----
         rp_lap(RP_TOP);
         int q = pos - 1;
-        int g = std::min({((msc_on && msc_cost_rule)
-                               ? msc_max_g(true)
-                               : (spec_conf() > 0 ? kSpecConfMax : gctl.cur)),
+        int plan = (msc_on && msc_sample_cost_rule) ? msc_max_g(true)
+                      : (spec_conf() > 0 ? kSpecConfMax : gctl.cur);
+        if (gamma > 0 && limit_gamma) plan = std::min(plan, gctl.cur);
+        int g = std::min({plan,
                           gen - (int)out.size(), maxctx - pos - 1});
         if (g < 1) break;  // context edge: no room for even one draft
         // Row budget + occupancy γ. A sampled round's γ shapes its RNG draws:
@@ -13024,8 +13096,12 @@ struct GpuModel {
         // 仍封顶 8（kVSnapRows 9 行不变）；与其他槽会合验证时封顶 7（同 greedy
         // 路径：合批每段至多 8 行）。
         const int g_mtp = g;
-        const int jcap =
-            (vr_on && vseg_active_fn && vseg_active_fn() > 1) ? 7 : 8;
+        // A seeded request must use the same joint-extension limit whenever
+        // its occupancy policy fixes the peer count. Otherwise peers entering
+        // or leaving the rendezvous can change how many ngram tokens are
+        // verified, and hence the request's sampling stream.
+        const int joint_live = vr_on && vseg_active_fn ? vseg_active_fn() : 0;
+        const int jcap = occ.eff_b(joint_live) > 1 ? 7 : 8;
         if (joint_sampled_on() && g >= 1 && g < jcap && ng_open && want > g) {
           std::vector<int64_t> ext(chist.begin(), chist.end());
           ext.push_back(cur);

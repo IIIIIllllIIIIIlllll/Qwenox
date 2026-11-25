@@ -184,7 +184,7 @@ static size_t devarena_estimate(const Checkpoint& ck, int maxctx) {
   const bool kv_fp16 = kv_type_env() == KvType::F16;
   const bool kv_fp32 = kv_type_env() == KvType::F32;
   const bool index_f32 = getenv("QWENOX_INDEX_BF16") == nullptr;
-  const bool btv = !kv_q8 && !kv_fp16 && getenv("QWENOX_QSA_WMMA") && !kv_fp32 &&
+  const bool btv = !kv_q8 && getenv("QWENOX_QSA_WMMA") && !kv_fp32 &&
                    getenv("QWENOX_QSA_WMMA_BTV");
   const bool fused = getenv("QWENOX_PREFILL_UNFUSED") == nullptr;
   const char* cut_off = getenv("QWENOX_CUT_INPASS");

@@ -17,6 +17,16 @@ __device__ inline float bf2f(uint16_t b) {
   return f;
 }
 
+// fp32 -> KV-cache 16-bit encoding (RNE): bf16 bits by default, fp16 bits
+// when KVT is __half. Lets the bf16-oriented conversion kernels below serve
+// the FP16 KV cache as raw-bits writers.
+template <class KVT>
+__device__ __forceinline__ uint16_t cvt_f2bits(float f) { return f2bf(f); }
+template <>
+__device__ __forceinline__ uint16_t cvt_f2bits<__half>(float f) {
+  return __half_as_ushort(__float2half_rn(f));
+}
+
 __global__ void k_bf16_to_f32(const uint16_t* __restrict__ x,
                               float* __restrict__ out, uint64_t n) {
   uint64_t i = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
@@ -202,6 +212,8 @@ __global__ void k_sigmoid_gate_bf16_v4(const float* __restrict__ a,
 // the group load (a verify batch of P+1 writes a real V where a batch of P
 // wrote 0); this store-side zero stays as belt-and-braces for the
 // k_qsa_wmma6 / union readers.
+// KVT = uint16_t: bf16 bits; KVT = __half: fp16 bits (same layout).
+template <class KVT = uint16_t>
 __global__ void k_f32_to_bf16_v4_bt(const float* __restrict__ x,
                                     uint16_t* __restrict__ out, uint64_t xs,
                                     int P, int n, int base,
@@ -223,7 +235,7 @@ __global__ void k_f32_to_bf16_v4_bt(const float* __restrict__ x,
   for (int slot = 0; slot < 4; ++slot) {
     int abs = b * 4 + slot;
     if (abs >= base) {
-      if (abs < base + P) v[slot] = f2bf(x[(size_t)(abs - base) * xs + kvh * (n / 2) + dim]);
+      if (abs < base + P) v[slot] = cvt_f2bits<KVT>(x[(size_t)(abs - base) * xs + kvh * (n / 2) + dim]);
       valid |= 1 << slot;
     }
   }
@@ -297,6 +309,7 @@ __global__ void k_f32_to_bf16_v4_pd(const float* __restrict__ x,
 // holds whole 4-token blocks, so all four slots of a logical block land in
 // one physical block; the partial-edge keep/zero rules match
 // k_f32_to_bf16_v4_bt exactly (slots < base keep, slots >= base+P zero).
+template <class KVT = uint16_t>
 __global__ void k_f32_to_bf16_v4_bt_pd(const float* __restrict__ x,
                                        uint16_t* __restrict__ out,
                                        const int* __restrict__ ptab, int P,
@@ -318,7 +331,7 @@ __global__ void k_f32_to_bf16_v4_bt_pd(const float* __restrict__ x,
   for (int slot = 0; slot < 4; ++slot) {
     int abs = b * 4 + slot;
     if (abs >= base) {
-      if (abs < base + P) v[slot] = f2bf(x[(size_t)(abs - base) * n + kvh * dims + dim]);
+      if (abs < base + P) v[slot] = cvt_f2bits<KVT>(x[(size_t)(abs - base) * n + kvh * dims + dim]);
       valid |= 1 << slot;
     }
   }
@@ -2390,9 +2403,11 @@ __global__ void __launch_bounds__(128)
 // __syncthreads()，K 描述符与 fragment 软件流水预取。
 // Paged (aggr 10-05): K rows / vct blocks go through the page table (logical
 // block ids in ublk; the own-block causal check stays logical).
-template <bool Paged = false>
+// KVT = uint16_t（bf16 位流，默认）或 __half（fp16 位流）；vct 转置 cache
+// 与 K 行主序 cache 同为 KVT 编码，WMMA 走对应的 bf16/f16 指令。
+template <bool Paged = false, class KVT = uint16_t>
 __global__ void __launch_bounds__(256)
-    k_qsa_wmma_u(const float* __restrict__ q, const uint16_t* __restrict__ kc,
+    k_qsa_wmma_u(const float* __restrict__ q, const KVT* __restrict__ kc,
                  const uint16_t* __restrict__ vct, float* __restrict__ out,
                  int dh, int hkv, int hq,
                  const uint16_t* __restrict__ ublk,
@@ -2420,7 +2435,7 @@ __global__ void __launch_bounds__(256)
   const int tok0 = g0_ + 4 * g - kb;  // 组首 token 的 batch 行
   const int hqk = hq / hkv;             // 12
 
-  // Q stage：warp w 负责全部 48 行的 [32w,+32) 维切片（fp32 -> bf16 RNE）
+  // Q stage：warp w 负责全部 48 行的 [32w,+32) 维切片（fp32 -> KVT RNE）
   uint16_t* stage = reinterpret_cast<uint16_t*>(&part[0][0][0]) + w * (48 * 32);
 #pragma unroll
   for (int c = 0; c < 12; ++c) {
@@ -2429,8 +2444,8 @@ __global__ void __launch_bounds__(256)
     const float4 v = *(const float4*)(q + ((size_t)(tok0 + qi) * hq +
                                            kvh * hqk + h) * dh + 32 * w + dq);
     uint2 pk;
-    pk.x = pack_bf2(v.x, v.y);
-    pk.y = pack_bf2(v.z, v.w);
+    pk.x = qw_pack2<KVT>(v.x, v.y);
+    pk.y = qw_pack2<KVT>(v.z, v.w);
     *(uint2*)(stage + row * 32 + dq) = pk;
   }
   __syncthreads();
@@ -2467,7 +2482,7 @@ __global__ void __launch_bounds__(256)
   auto load_k = [&](const uint32_t b01, const uint32_t b23, qw_shortx16* kf) {
     int src = 4 * blk_of(b01, b23, r >> 2) + (r & 3);
     if constexpr (Paged) src = kv_row(ptab, src);
-    const uint16_t* krow = kc + ((size_t)src * hkv + kvh) * dh + w * 32;
+    const KVT* krow = kc + ((size_t)src * hkv + kvh) * dh + w * 32;
 #pragma unroll
     for (int t = 0; t < 2; ++t) kf[t] = qw_ld16(krow + 16 * t);
   };
@@ -2488,7 +2503,7 @@ __global__ void __launch_bounds__(256)
       for (int e = 0; e < 8; ++e) sc[i][e] = 0.f;
 #pragma unroll
       for (int t = 0; t < 2; ++t)
-        sc[i] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(kf[t], qf[i][t], sc[i]);
+        sc[i] = qw_mma<KVT>(kf[t], qf[i][t], sc[i]);
     }
     // V：vct 转置 cache，lane r 持有维 32w+16t+r 的 4 块 x 4 slot（16 key）
     qw_shortx16 vf[2];
@@ -2581,11 +2596,11 @@ __global__ void __launch_bounds__(256)
       ls += __shfl_xor_sync(~0ull, ls, 16);
       l = l * alpha + ls;
       m = mnew;
-      // P 量化 bf16 并按自然 key 序摆进 ptile（WMMA C 布局回不去 A，LDS 回转）
+      // P 量化（KVT 编码）并按自然 key 序摆进 ptile（WMMA C 布局回不去 A，LDS 回转）
       uint32_t pp[4], po[4];
 #pragma unroll
       for (int e2 = 0; e2 < 4; ++e2) {
-        pp[e2] = (uint32_t)f2bf(p[2 * e2]) | ((uint32_t)f2bf(p[2 * e2 + 1]) << 16);
+        pp[e2] = (uint32_t)qw_f2bits<KVT>(p[2 * e2]) | ((uint32_t)qw_f2bits<KVT>(p[2 * e2 + 1]) << 16);
         po[e2] = (uint32_t)__shfl_xor_sync(~0ull, (int)pp[e2], 16);
       }
       uint16_t ph[16];
@@ -2629,7 +2644,7 @@ __global__ void __launch_bounds__(256)
       const qw_shortx16 pf = qw_ld16((const uint16_t*)&ptile[i][0] + r * 16);
 #pragma unroll
       for (int t = 0; t < 2; ++t)
-        O[i][t] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(vf[t], pf, O[i][t]);
+        O[i][t] = qw_mma<KVT>(vf[t], pf, O[i][t]);
     }
     kf[0] = kfn[0];
     kf[1] = kfn[1];
