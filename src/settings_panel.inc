@@ -2720,8 +2720,8 @@ PanelResult panel_run() {
     g_pc.prefill = pctl(1, h, L"Edit", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kEdX, y2, 120,
                         22, L"", kEdPrefill);
     set_edit(g_pc.prefill, init.prefill_chunk);
-    plabel(1, h, kHintX, y2, TR(L"0 = 默认 6144（≈5.2 GiB 工作区）",
-                                L"0 = default 6144 (≈5.2 GiB workspace)"),
+    plabel(1, h, kHintX, y2, TR(L"0 = 默认 8192（≈6.9 GiB 工作区）",
+                                L"0 = default 8192 (≈6.9 GiB workspace)"),
            kHintW);
     y2 += 26;
     g_pc.qsa_budget = pctl(1, h, L"Button", BS_AUTOCHECKBOX | WS_TABSTOP, kEdX, y2, 434, 20,

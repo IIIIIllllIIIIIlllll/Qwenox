@@ -169,8 +169,8 @@ if [[ "${1:-}" == --check ]]; then
 fi
 
 # 生产选项与 Linux start.sh 一致，唯独不设 QWENOX_PREFILL_CHUNK：
-# Windows 默认 6144（256K 下 16384 会顶破 95 GiB arena 上限；6144 与 8192 的 PP 差
-# 约 0.5%，工作区少约 1.7 GiB，实测见 PORTING-WINDOWS.md）。
+# Windows 默认 8192（8K 单块无尾块，比 6144 快 +5.3%/+0.7%，工作区多 ~1.7 GiB；
+# 256K 下 16384 会顶破 95 GiB arena 上限，实测见 PORTING-WINDOWS.md）。
 export QWENOX_KV_TYPE="$KV_TYPE"
 # 控制向量（CVEC）：留空时清掉外部残留，其余参数只在开启时导出。
 unset QWENOX_CVEC QWENOX_CVEC_MODE QWENOX_CVEC_SCALE QWENOX_CVEC_LAYERS

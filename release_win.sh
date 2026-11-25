@@ -297,7 +297,7 @@ else
     KVPOOL_DESC="全部并发槽位共享的 KV 页池"
 fi
 if [[ "$PREFILL_V" == 0 ]]; then
-    PREFILL_DESC="0 = 引擎默认（Windows 6144 / Linux 16384）"
+    PREFILL_DESC="0 = 引擎默认（Windows 8192 / Linux 16384）"
 else
     PREFILL_DESC="每段 $PREFILL_V token"
 fi
