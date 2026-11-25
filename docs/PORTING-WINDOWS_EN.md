@@ -128,10 +128,10 @@ Key implementation points (differences relative to the Linux version):
   of GpuModel's allocation formulas; reservation = estimate + slack
   (`GDEC_ARENA_SLACK_GB`, default 4 GiB), capped at `GDEC_ARENA_CAP_GB`
   (default **95.0**, matching the measured upper bound of the 96 GiB BIOS
-  split). Windows defaults to prefill chunk 6144 (`eff_maxbatch`; Linux
-  32768): 64K steady-state PP is within ~0.5% of 8192, the workspace is
-  ~1.7 GiB smaller, and the B3 split-K (only at P >= 8192) stays off
-  (4096 is ~5% slower). **Do not set `GDEC_PREFILL_CHUNK=16384` at 256K** (it triggers
+  split). Windows defaults to prefill chunk 8192 (`eff_maxbatch`; Linux
+  32768): 8K is exactly one tail-free chunk, measured +5.3% (8K) / +0.7%
+  (32K) over 6144 for only ~1.7 GiB more workspace (11-26 three-way
+  controlled comparison, dev-docs/RESULT-WIN-PREFILL-FIX-20261125.md). **Do not set `GDEC_PREFILL_CHUNK=16384` at 256K** (it triggers
   truncation + overflow fallback); with maxctx ≤ 40K, 16384 fits and PP is
   ~6% faster (see the measurements in the verification matrix).
 - **New weight loader** (`load_arena` Windows branch): CreateFile

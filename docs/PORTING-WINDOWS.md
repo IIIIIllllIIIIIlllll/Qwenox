@@ -109,8 +109,9 @@ OpenAI 接口）。Git Bash 下 `start_win.sh` 与 Linux `start.sh` 并列。
   装进进程第一笔分配。`devarena_estimate` 镜像 GpuModel 全部分配公式，
   预留 = 估算 + slack（`GDEC_ARENA_SLACK_GB`，默认 4 GiB），封顶
   `GDEC_ARENA_CAP_GB`（默认 **95.0**，对应 96 GiB BIOS 划分的实测上限）。
-  Windows 默认 prefill chunk 6144（`eff_maxbatch`；Linux 32768）：64K 稳态 PP 与 8192 差约 0.5%，
-  工作区少约 1.7 GiB，也不触发 P≥8192 才开的 B3 split-K（4096 慢约 5%）。
+  Windows 默认 prefill chunk 8192（`eff_maxbatch`；Linux 32768）：8K 单块无尾块，
+  实测比 6144 快 +5.3%（8K）/+0.7%（32K），工作区仅多 ~1.7 GiB（11-26 三档
+  受控对比，dev-docs/RESULT-WIN-PREFILL-FIX-20261125.md 补记4）。
   **256K 下不要设 `GDEC_PREFILL_CHUNK=16384`**（会触发截断 + 溢出回退）；
   maxctx ≤ 40K 时 16384 放得下且 PP 快 ~6%（见验证矩阵实测）。
 - **新权重加载器**（`load_arena` Windows 分支）：CreateFile

@@ -52,8 +52,11 @@ static size_t devarena_free_bytes() { return 0; }
 
 // 与 devarena_estimate 共享的 maxbatch 决策。32K 是 Linux 上实测能与 68 GiB
 // 模型及长上下文 KV 共存的最大批（QWENOX_PREFILL_CHUNK 可压低）；Windows 受
-// 96 GiB VRAM 硬门槛限制，默认 6144：64K 稳态 PP 1598 vs 8192 的 1606（−0.5%），
-// 工作区少约 1.7 GiB，且不触发 P>=8192 才开的 B3 split-K（见 PORTING-WINDOWS.md）。
+// 96 GiB VRAM 硬门槛限制，默认 8192（2026-11-26 三档受控对比，见
+// dev-docs/RESULT-WIN-PREFILL-FIX-20261125.md 补记4）：8K 恰为单块无尾块，
+// 比 6144 快 +5.3%（8K）/+0.7%（32K），工作区仅多 ~1.7 GiB（256K ctx 带
+// 视觉塔仍留 ~11 GiB 余量）；16384 再快 ~3% 但多占 ~6.9 GiB，256K 下
+// devarena 达 92.1 GiB 余量过薄，只建议 bench 用。
 // 并发 serve 的 prefill 分段覆盖（D1a）：main 的 serve 分支在 eff_parallel()>1 且
 // QWENOX_CONC_PREFILL_CHUNK>0 时设置为 min(它, 单路分段)，之后取代单路值。prefill 只在层间把 GPU
 // 让给别的会话（D1b），分段越小每层越短、别的会话卡得越短。0 = 不覆盖。
@@ -67,7 +70,7 @@ static int eff_maxbatch(int maxctx) {
     return maxctx;
   }
 #ifdef _WIN32
-  return std::min(maxctx, 6144);
+  return std::min(maxctx, 8192);
 #else
   return std::min(maxctx, 32768);
 #endif
