@@ -3057,9 +3057,9 @@ static int vseg_active() {
 
 // Executor half. Runs on the promoting worker's thread; acquires the GPU
 // turn (FIFO behind the peers, so their drafts finish first), runs the
-// batched verify, scatters the per-segment argmax rows into each worker's
-// vout, and wakes everyone. Call with the turn NOT held; returns with it
-// released again.
+// batched verify, prepares sampled logits through post or scatters greedy
+// ids into vout, and wakes everyone. Call with the turn NOT held; returns
+// with it released again.
 static void vr_execute(GpuModel& m) {
   tl_turn_tag = TT_VR;
   const uint64_t my_ticket = g_turn.acquire();
@@ -3089,11 +3089,16 @@ static void vr_execute(GpuModel& m) {
   }
   if (!segs.empty()) {
     std::vector<int> v((size_t)rows);
-    if (m.verify_segments(segs.data(), (int)segs.size(), v.data())) {
+    // Sampled callers consume logits in post; none uses the greedy ids.
+    // Skip both the argmax kernels and their blocking D2H for such batches.
+    const bool need_ids = std::any_of(run.begin(), run.end(),
+                                     [](const VrReq* r) { return !r->post; });
+    if (m.verify_segments(segs.data(), (int)segs.size(), need_ids ? v.data() : nullptr)) {
       int off = 0;
       for (size_t i = 0; i < segs.size(); i++) {
         const int P = (int)segs[i].toks->size();
-        memcpy(run[i]->vout, v.data() + off, (size_t)P * sizeof(int));
+        if (!run[i]->post)
+          memcpy(run[i]->vout, v.data() + off, (size_t)P * sizeof(int));
         if (run[i]->post) (*run[i]->post)(off);  // rows still in d_logits_b
         // 10-13: record this segment's shared row window before the turn is
         // released (see GpuModel::vr_rows_each).
@@ -3116,7 +3121,7 @@ static void vr_execute(GpuModel& m) {
       // save each window right after its own verify (10-13).
       for (size_t i = 0; i < segs.size(); i++) {
         m.bind(segs[i].slot);
-        if (!m.verify_segments(&segs[i], 1, run[i]->vout)) {
+        if (!m.verify_segments(&segs[i], 1, run[i]->post ? nullptr : run[i]->vout)) {
           run[i]->dropped = true;  // worker re-runs prefill_batch+batch_argmax
           continue;
         }
@@ -3151,8 +3156,9 @@ static void vr_execute(GpuModel& m) {
 }
 
 // Worker half (GpuModel::vseg_pool_fn), called from spec_loop holding the
-// GPU turn, drafts done. Returns true with vout filled, or false when the
-// pool could not run this segment (caller runs the serial verify).
+// GPU turn, drafts done. Returns true after post ran (sampled) or vout was
+// filled (greedy), or false when the pool could not run this segment
+// (caller runs the serial verify).
 static bool vseg_pool(GpuModel& m, const GpuModel::VSeg& self, int* vout,
                       const std::function<void(int)>* post) {
   {
@@ -3950,8 +3956,10 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     hist = g.ids;  // prompt fully ingested on both paths
     if (use_spec || chain_mtp || df2_hyb) mtp_live = true;  // MTP KV complete & in lockstep
     if (g.sample) {  // d_logits still holds the last position's logits
-      m.get_logits(lbuf);
-      cur = smp.sample(lbuf, &cur_lp);
+      if (!m.sms_sample_serial(smp, &cur, &cur_lp)) {
+        m.get_logits(lbuf);
+        cur = smp.sample(lbuf, &cur_lp);
+      }
     } else if (repeat_greedy) {
       m.get_logits(lbuf);
       cur = smp.greedy(lbuf);
@@ -4078,8 +4086,10 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       cur = m.forward(pause_tok);
       hist.push_back(pause_tok);
       if (g.sample) {
-        m.get_logits(lbuf);
-        cur = smp.sample(lbuf, &cur_lp);
+        if (!m.sms_sample_serial(smp, &cur, &cur_lp)) {
+          m.get_logits(lbuf);
+          cur = smp.sample(lbuf, &cur_lp);
+        }
       }
       m.yield_point();
       if (eos.count(cur)) {
@@ -4127,8 +4137,8 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
           pause_tok = -1;
           if (g.sample)
             m.spec_loop_chain_sample(cur, g.max_tokens - 1, spec_gamma, smp,
-                                     chain_mtp, emit_ng_smp, g.seeded);
-          else if (chain) m.spec_loop_chain(cur, g.max_tokens - 1, spec_gamma, emit_ng);
+                                     chain_mtp, emit_ng_smp, g.seeded, sg_env != nullptr);
+          else if (chain) m.spec_loop_chain(cur, g.max_tokens - 1, spec_gamma, emit_ng, sg_env != nullptr);
           else m.spec_loop_ngram(cur, g.max_tokens - 1, m.ngram.n_max, emit_ng);
           spec_r += m.last_spec_rounds;
           spec_c += m.last_spec_commit;
@@ -4214,7 +4224,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
               dl_tick();
               return !cancel;
             };
-            m.spec_loop_sample(cur, g.max_tokens - 1, spec_gamma, smp, emit);
+            m.spec_loop_sample(cur, g.max_tokens - 1, spec_gamma, smp, emit, sg_env != nullptr);
           } else {
             auto emit = [&](int tok) -> bool {
               if (ngen >= g.max_tokens) return false;
@@ -4233,7 +4243,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
               // discipline. dr_worker_ok is the submit predicate too, so the
               // count never includes a worker that cannot submit.
               DrActive dr_act(m.dr_worker_ok());
-              m.spec_loop(cur, g.max_tokens - 1, spec_gamma, emit);
+              m.spec_loop(cur, g.max_tokens - 1, spec_gamma, emit, sg_env != nullptr);
             }
           }
           spec_r += m.last_spec_rounds;

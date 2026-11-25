@@ -10703,12 +10703,9 @@ struct GpuModel {
   // distribution is unchanged; candidate order is (value desc, id asc)
   // instead of nth_element's arbitrary order, so same-seed draws can differ
   // from the dense path (allowed: nth_element never promised an order).
+  // Bias-list eligibility for the GPU correction phase (k-independent).
   template <typename Sampler>
-  bool sms_gpu_active(const Sampler& s) const {
-    static const bool off =
-        getenv("QWENOX_SMS_GPU") && atoi(getenv("QWENOX_SMS_GPU")) == 0;
-    if (off) return false;
-    if (s.top_k <= 0 || s.top_k > 64 || s.top_k >= g_cfg.vocab) return false;
+  bool sms_bias_ok(const Sampler& s) const {
     if ((int)s.bias.size() > SMS_BIAS_CAP) return false;
     if (s.bias.size() > 1) {
       // The GPU bias phase applies entries in parallel; duplicate ids would
@@ -10721,6 +10718,31 @@ struct GpuModel {
         if (ids[i] == ids[i - 1]) return false;
     }
     return true;
+  }
+
+  template <typename Sampler>
+  bool sms_gpu_active(const Sampler& s) const {
+    static const bool off =
+        getenv("QWENOX_SMS_GPU") && atoi(getenv("QWENOX_SMS_GPU")) == 0;
+    if (off) return false;
+    if (s.top_k <= 0 || s.top_k > 64 || s.top_k >= g_cfg.vocab) return false;
+    return sms_bias_ok(s);
+  }
+
+  // Effective sparse-k for the serial sampled path: an explicit top_k is
+  // honored up to the candidate-buffer cap; unset (<=0) or larger values use
+  // a 256-wide prefilter, which still covers the temperature/top_p/min_p
+  // nucleus in practice and avoids the dense 993 KB D2H + full-vocab host
+  // scan. (Approximation vs the dense path only when the nucleus would
+  // extend past the prefilter; same accept rule as the spec sparse rows.)
+  template <typename Sampler>
+  int sms_serial_k(const Sampler& s) const {
+    static const bool off =
+        getenv("QWENOX_SMS_GPU") && atoi(getenv("QWENOX_SMS_GPU")) == 0;
+    if (off || !sms_bias_ok(s)) return 0;
+    if (s.top_k > 0 && s.top_k < g_cfg.vocab)
+      return std::min(s.top_k, SMS_TCAP);
+    return std::min(256, g_cfg.vocab);
   }
 
   // Upload the round-shared correction lists (bias, then hist penalties).
@@ -10923,29 +10945,36 @@ struct GpuModel {
 
   // sms_serial: one sampled serial decode token from d_logits through the
   // GPU top-k path (draft-row semantics: round-shared corrections only).
-  // False -> caller takes the dense host path (top_k unset/>64, overflow,
-  // QWENOX_SMS_SERIAL=0). Same distribution; candidate order (value desc,
-  // id asc) differs from nth_element, as on the spec rows.
+  // False -> caller takes the dense host path (buffer overflow, duplicate
+  // bias ids, QWENOX_SMS_SERIAL=0). Same distribution; candidate order
+  // (value desc, id asc) differs from nth_element, as on the spec rows.
   template <typename Sampler>
   bool sms_sample_serial(Sampler& s, int* out, float* lp) {
     static const bool off = env_zero("QWENOX_SMS_SERIAL");
-    if (off || !sms_gpu_active(s) || !sms_round_shared(s)) return false;
-    if (!sms_topk_rows(d_logits, g_cfg.vocab, 1, s.top_k, false,
+    if (off) return false;
+    const int k = sms_serial_k(s);
+    if (!k || !sms_round_shared(s)) return false;
+    if ((int)sms_out_ids.size() < SMS_ROWS * k) {
+      sms_out_ids.resize((size_t)SMS_ROWS * k);
+      sms_out_vals.resize((size_t)SMS_ROWS * k);
+    }
+    if (!sms_topk_rows(d_logits, g_cfg.vocab, 1, k, false,
                        sms_out_ids.data(), sms_out_vals.data()))
       return false;
     typename Sampler::SDist sd;
-    sms_prep(s, 0, true, sd);
+    sms_prep(s, 0, true, sd, k);
     *out = s.draw_sparse(sd, lp, true);
     return true;
   }
 
   // prepare_sparse on candidate row `row` (draft: row 0 of the d_logits
-  // pass). QWENOX_SMS_CHECK=1 also replays the dense prepare() on the raw
-  // logits row and compares the two distributions (support + probabilities).
+  // pass). k <= 0 means the sampler's own top_k. QWENOX_SMS_CHECK=1 also
+  // replays the dense prepare() on the raw logits row and compares the two
+  // distributions (support + probabilities).
   template <typename Sampler>
   void sms_prep(Sampler& s, int row, bool draft,
-                typename Sampler::SDist& out) {
-    const int k = s.top_k;
+                typename Sampler::SDist& out, int k_eff = 0) {
+    const int k = k_eff > 0 ? k_eff : s.top_k;
     s.prepare_sparse(sms_out_ids.data() + (size_t)row * k,
                      sms_out_vals.data() + (size_t)row * k, k, out);
     static const bool chk = getenv("QWENOX_SMS_CHECK") != nullptr;
@@ -13355,9 +13384,14 @@ struct GpuModel {
         forward(cur);
         if (!ple_on) chist.push_back(cur);
         ple_ringpos = pos % 9;  // graph advances the device scalar
-        get_logits(p_row);
+        // GPU corrections + top-k prefilter first (as the pure serial loop
+        // does); dense host sampling only when SMS is ineligible.
         float lp_s = 0.0f;
-        int nx = sampler.sample(p_row, &lp_s);
+        int nx = -1;
+        if (!sms_sample_serial(sampler, &nx, &lp_s)) {
+          get_logits(p_row);
+          nx = sampler.sample(p_row, &lp_s);
+        }
         if (emit && !emit(nx, lp_s)) break;
         out.push_back(nx);
         cur = nx;
