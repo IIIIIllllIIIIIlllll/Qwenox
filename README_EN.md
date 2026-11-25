@@ -41,15 +41,23 @@ Linux (ROCm 10.1, production config, prefill with MOE_A4=3, PREFILL_CHUNK=16384)
 | Average power draw | ~120 W |
 | Peak (instantaneous) power draw | ~130 W (bursts for a few seconds, then settles back to ~120 W) |
 
-Windows (same machine, 96 GiB GPU memory set in the BIOS, tray production config, prefill chunk 8192, measured
-10-13):
+Windows (same machine, 96 GiB GPU memory set in the BIOS, production config, MOE_A4=3,
+PREFILL_CHUNK=16384, measured 11-25):
 
 | Metric | hgn v2 | GGUF UD-IQ4_XS + MTP |
 | --- | --- | --- |
-| Prefill (32K) | ~1560 tok/s | ~1440 tok/s |
-| Decode (speculative, 2K prompt) | 58.5 tok/s | 46.8 tok/s |
-| Decode (no speculation) | 31.4 tok/s | 27.7 tok/s |
+| Prefill (2K) | 1641.4 tok/s | |
+| Prefill (8K) | 1828.3 tok/s | |
+| Prefill (32K) | 1888.1 tok/s | ~1440 tok/s (10-13) |
+| Decode (speculative, 2K prompt) | 58.5 tok/s (10-13) | 46.8 tok/s (10-13) |
+| Decode (no speculation) | 31.4 tok/s (10-13) | 27.7 tok/s (10-13) |
 | Cold start (whole weight file read into VRAM) | ~35 s | ~50–60 s |
+
+After the 11-25 fixes for three long-standing Windows prefill drags (the PLE file's standby page
+cache being purged by `FILE_FLAG_NO_BUFFERING`, the BLAS kernel-db lazy load stalling the first
+request under `NOWARMUP`, and the bench losing 2-flight PLE prefetch to a `quiet` mix-up — see
+`dev-docs/RESULT-WIN-PREFILL-FIX-20261125.md`), Windows prefill is on par with Linux; 32K used to
+be ~1200–1600 tok/s and dropped to 500–1000 tok/s on cache-cold text.
 
 Speculative decode speed depends heavily on how repetitive the text is. The tables use real-text prompts;
 highly repetitive content such as code or templates gets a high draft hit rate and exceeds 60 tok/s in the

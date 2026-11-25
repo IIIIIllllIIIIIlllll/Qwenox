@@ -37,14 +37,21 @@ Linux（ROCm 10.1，生产配置，prefill 开 MOE_A4=3，PREFILL_CHUNK=16384）
 | 平均功耗 | 约 120 W |
 | 瞬时最大功耗 | 约 130 W（爆发持续几秒后回落至 120 W 左右） |
 
-Windows（同一台机器，BIOS 划分 96 GiB 显存，托盘程序生产配置，prefill chunk 8192，10-13 实测）：
+Windows（同一台机器，BIOS 划分 96 GiB 显存，生产配置，prefill 开 MOE_A4=3，PREFILL_CHUNK=16384，11-25 实测）：
 
 | 指标 | hgn v2 | GGUF UD-IQ4_XS + MTP |
 | --- | --- | --- |
-| Prefill（32K） | 约 1560 tok/s | 约 1440 tok/s |
-| Decode（投机，2K prompt） | 58.5 tok/s | 46.8 tok/s |
-| Decode（不投机） | 31.4 tok/s | 27.7 tok/s |
+| Prefill（2K） | 1641.4 tok/s | |
+| Prefill（8K） | 1828.3 tok/s | |
+| Prefill（32K） | 1888.1 tok/s | 约 1440 tok/s（10-13） |
+| Decode（投机，2K prompt） | 58.5 tok/s（10-13） | 46.8 tok/s（10-13） |
+| Decode（不投机） | 31.4 tok/s（10-13） | 27.7 tok/s（10-13） |
 | 冷启动（整份权重读进显存） | 约 35 s | 约 50–60 s |
+
+11-25 修复了三个长期拖累 Windows prefill 的问题后（PLE 文件被 `FILE_FLAG_NO_BUFFERING`
+冲刷页缓存、`NOWARMUP` 下 BLAS kernel db 懒加载卡首请求、bench 误关 2-flight PLE 预取，
+见 `dev-docs/RESULT-WIN-PREFILL-FIX-20261125.md`），Windows prefill 已与 Linux 打平：
+此前 32K 只有约 1200–1600 tok/s、冷读新文本时跌到 500–1000 tok/s。
 
 投机 decode 的速度随文本重复度变化很大。上表用真实文本 prompt 测得；代码、模板这类高重复内容
 草稿命中率高，同配置可达 60 tok/s 以上；采样（自适应 γ）比 greedy 略低。表中日期均为 2026 年；
