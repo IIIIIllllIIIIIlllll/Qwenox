@@ -499,7 +499,7 @@ const FIELDS = [
   {k:"KV_POOL_TOKENS", tab:"i", grp:"ctx", type:"int", unit:"tokens", nameZh:"KV 池总量", nameEn:"KV pool size",
    helpZh:"全部并发共享；0 = 一条最大上下文，小于最大上下文时按最大上下文算", helpEn:"Shared by all requests; 0 = one max context; smaller values round up"},
   {k:"PREFILL_CHUNK", tab:"i", grp:"ctx", type:"int", unit:"tokens", nameZh:"prefill 分段", nameEn:"Prefill chunk",
-   helpZh:"0 = 引擎默认（Windows 6144 / Linux 16384）", helpEn:"0 = engine default (Windows 6144 / Linux 16384)"},
+   helpZh:"0 = 引擎默认（Windows 8192 / Linux 16384）", helpEn:"0 = engine default (Windows 8192 / Linux 16384)"},
   {k:"CONC_PREFILL_CHUNK", tab:"i", grp:"ctx", type:"int", unit:"tokens", plat:"linux", nameZh:"并发 prefill 分段", nameEn:"Concurrent prefill chunk",
    helpZh:"0 = 不另设", helpEn:"0 = unset"},
   {k:"QSA_INDEXER_BUDGET", tab:"i", grp:"ctx", type:"select", nameZh:"QSA 检索预算", nameEn:"QSA indexer budget",
