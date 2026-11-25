@@ -817,8 +817,9 @@ static void load_arena(const Checkpoint& ck) {
   uint8_t* arena = nullptr;
   DALLOC(&arena, total);
 
-  // src = host view (mmap / synthetic). Windows: os_handle + foff = the file
-  // range behind src for the unbuffered ReadFile path; nullptr = host memory
+  // src = host view (mmap / synthetic). Windows: path + foff = the file range
+  // behind src for the unbuffered ReadFile path (os_handle gets retargeted to
+  // a dedicated NO_BUFFERING handle below); empty path = host memory
   // (gguf_map synthetic tensors), copied with memcpy.
   struct Job {
     std::string name;
@@ -827,6 +828,7 @@ static void load_arena(const Checkpoint& ck) {
     size_t size;
     void* os_handle = nullptr;
     uint64_t foff = 0;
+    std::string path;
   };
   std::vector<Job> jobs;
   size_t off = 0;
@@ -843,6 +845,7 @@ static void load_arena(const Checkpoint& ck) {
       if (t.data >= mp.base && t.data < mp.base + mp.len) {
         j.os_handle = mp.os_handle;
         j.foff = (uint64_t)(t.data - mp.base);
+        j.path = mp.path;
         break;
       }
     jobs.push_back(j);
@@ -857,6 +860,7 @@ static void load_arena(const Checkpoint& ck) {
       Job j{t->name, t->data, arena + off, (size_t)t->nbytes};
       j.os_handle = f->mappings()[t->shard].os_handle;
       j.foff = t->file_off;
+      j.path = f->mappings()[t->shard].path;
       jobs.push_back(j);
       *ptrs[i] = arena + off;
       off += (t->nbytes + 255) & ~255ull;
@@ -865,6 +869,27 @@ static void load_arena(const Checkpoint& ck) {
   // big tensors first so stragglers don't serialize at the end
   std::sort(jobs.begin(), jobs.end(),
             [](const Job& a, const Job& b) { return a.size > b.size; });
+#ifdef _WIN32
+  // Windows: hgn.h / gguf.h 的映射句柄不再带 NO_BUFFERING（该标志会让 NTFS
+  // 清空此文件的 Standby 页缓存——纯 PLE 文件如 ngram.hgn 从不进本函数，
+  // 由此彻底免于被冲刷）。这里只给真正有直灌任务的文件各开一个专用
+  // OVERLAPPED|NO_BUFFERING 句柄，worker join 后统一关闭。
+  std::unordered_map<std::string, HANDLE> nb_files;
+  for (auto& j : jobs) {
+    if (!j.os_handle) continue;
+    auto [it, ins] = nb_files.try_emplace(j.path, (HANDLE) nullptr);
+    if (ins) {
+      HANDLE h = CreateFileA(j.path.c_str(), GENERIC_READ,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                             nullptr, OPEN_EXISTING,
+                             FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING, nullptr);
+      if (h == INVALID_HANDLE_VALUE)
+        throw std::runtime_error("pload: open direct-read handle " + j.path);
+      it->second = h;
+    }
+    j.os_handle = (void*)it->second;
+  }
+#endif
 
   const int NW = 4;
   std::atomic<size_t> next{0}, done_bytes{0};
@@ -988,6 +1013,7 @@ static void load_arena(const Checkpoint& ck) {
     }
     CK(hipStreamDestroy(st[i]));
   }
+  for (auto& kv : nb_files) CloseHandle(kv.second);  // 专用直读句柄，灌完即关
 #else
   const size_t STAGE = 64ull << 20;
   uint8_t* stage[NW];

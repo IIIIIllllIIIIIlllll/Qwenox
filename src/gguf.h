@@ -135,9 +135,12 @@ class File {
     size_t len = 0;
     std::string path;
     int fd = -1;
-    // Windows: the file handle stays open (OVERLAPPED | NO_BUFFERING, like
-    // hgn.h) so the weight loader can ReadFile shard ranges straight into
-    // pinned staging, bypassing the page cache (32 GiB host RAM).
+    // Windows: the file handle stays open as a plain read handle (file-backed
+    // marker). Never FILE_FLAG_NO_BUFFERING here: opening an already-cached
+    // file with that flag makes NTFS purge the file's standby cache pages
+    // (CcPurgeCacheSection), which would destroy the PLE table's warm page
+    // cache on every process start. load_arena opens its own dedicated
+    // NO_BUFFERING handles for the files it actually direct-reads.
     void* os_handle = nullptr;
   };
 
@@ -281,7 +284,7 @@ class File {
 #ifdef _WIN32
     HANDLE fh = CreateFileA(path.c_str(), GENERIC_READ,
                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                            OPEN_EXISTING, FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING, nullptr);
+                            OPEN_EXISTING, 0, nullptr);
     if (fh == INVALID_HANDLE_VALUE) throw std::runtime_error("gguf: open " + path);
     LARGE_INTEGER sz;
     if (!GetFileSizeEx(fh, &sz)) {

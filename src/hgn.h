@@ -271,7 +271,7 @@ public:
   struct Mapping {
     const uint8_t* base;
     size_t len;
-    void* os_handle = nullptr;  // Windows: 保持打开的句柄（OVERLAPPED|NO_BUFFERING，pload 直读用）
+    void* os_handle = nullptr;  // Windows: 保持打开的普通只读句柄（file-backed 标记）
     std::string path;           // as given to the constructor / add_overlay
   };
   // mapping that holds p (tensor data pointer), or nullptr
@@ -303,13 +303,15 @@ private:
     // MapViewOfFile 等价 mmap：映射整个文件（64 位 VA，115 GiB 无压力），
     // 页按需从文件调入，不由 pagefile 支撑。os_map_ro 语义与
     // mmap(PROT_READ, MAP_PRIVATE) 一致（对只读场景逐字节相同）。
-    // 句柄保持打开并带 OVERLAPPED|NO_BUFFERING：pload 的 ReadFile 直读路径
-    // 用它绕过 page cache（映射 memcpy 缺页读在主机 RAM 紧张时退化严重）；
-    // NO_BUFFERING 只影响 ReadFile，不影响映射本身。
+    // 注意：绝不能在这里加 FILE_FLAG_NO_BUFFERING——只要有句柄以该标志
+    // 打开一个已被缓存的文件，NTFS 会 CcPurgeCacheSection 强制清空它在
+    // Standby Cache 里的全部缓存页。对纯 PLE 文件（ngram.hgn，从不进
+    // load_arena）这等于每次启动自毁 22-24 GiB 热页缓存。pload 的
+    // ReadFile 直读路径改由 load_arena 按需自开专用 NO_BUFFERING 句柄
+    //（30_host_util.inc），只触碰真正有直灌任务的文件。
     HANDLE fh = CreateFileA(path, GENERIC_READ,
                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                            nullptr, OPEN_EXISTING,
-                            FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING, nullptr);
+                            nullptr, OPEN_EXISTING, 0, nullptr);
     if (fh == INVALID_HANDLE_VALUE)
       throw std::runtime_error(os_last_error((std::string("open ") + path).c_str()));
     LARGE_INTEGER sz;
