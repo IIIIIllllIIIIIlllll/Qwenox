@@ -378,9 +378,16 @@ bool start(const std::string& root, const svcconf::Conf& conf, std::string* err)
     // 经 QWENOX_GGUF_PLE=<path> 传给引擎。
     const std::string gguf_ple_file =
         gguf ? svcconf::cfg_optional(conf, "GGUF_PLE_FILE", "") : "";
+    // MTP/NGRAM 设置页开关（此前只被网页保存、Windows 启动路径无人消费——
+    // 开关关了引擎照样加载并运行 MTP 的 bug 根源）。语义对齐
+    // tools/serve_common.sh：MTP=0 → HGN 不传 sidecar、GGUF 走 "none"，
+    // 并导出 QWENOX_NOSPEC=1（连 v2 内嵌草稿头也不跑）；NGRAM=0 →
+    // QWENOX_DRAFTER=mtp（PLE 表照常映射，只是不用于起草）。
+    const bool mtp_off = svcconf::cfg(conf, "MTP", "1") == "0";
+    const bool ngram_off = svcconf::cfg(conf, "NGRAM", "1") == "0";
     const std::string mtp_file =
-        gguf ? svcconf::cfg_optional(conf, "GGUF_MTP_FILE", "")
-             : svcconf::cfg_optional(conf, "MTP_FILE", model_dir + "\\heretic-mtp.hgn");
+        mtp_off ? "" : gguf ? svcconf::cfg_optional(conf, "GGUF_MTP_FILE", "")
+                            : svcconf::cfg_optional(conf, "MTP_FILE", model_dir + "\\heretic-mtp.hgn");
     const std::string vision_file =
         gguf ? svcconf::cfg_optional(conf, "GGUF_VISION_FILE", "")
              : svcconf::cfg_optional(conf, "VISION_FILE", model_dir + "\\heretic-vision.hgn");
@@ -546,12 +553,30 @@ bool start(const std::string& root, const svcconf::Conf& conf, std::string* err)
     if (!getenv("QWENOX_CRASH_DUMP"))
         SetEnvironmentVariableA("QWENOX_CRASH_DUMP",
                                 svcconf::cfg(conf, "CRASH_DUMP", "1") == "0" ? "0" : nullptr);
+    // 开关 → 引擎环境变量（引擎只查存在性）。API 进程长存、start 可反复调
+    // 用：只清理由我们设置的变量，用户预先 export 的同名变量不动。
+    static bool s_nospec_by_us = false, s_drafter_by_us = false;
+    auto env_toggle = [](const char* key, const char* val, bool on, bool* by_us) {
+      if (on) {
+        if (!getenv(key)) {
+          SetEnvironmentVariableA(key, val);
+          *by_us = true;
+        }
+      } else if (*by_us) {
+        SetEnvironmentVariableA(key, nullptr);
+        *by_us = false;
+      }
+    };
+    env_toggle("QWENOX_NOSPEC", "1", mtp_off, &s_nospec_by_us);
+    env_toggle("QWENOX_DRAFTER", "mtp", ngram_off, &s_drafter_by_us);
     // GGUF：MTP sidecar 不是位置参数而是 QWENOX_GGUF_MTP。conf 里没有
     // GGUF_MTP_FILE 键 = 不设（引擎在分片目录自动找唯一的 mtp-*.gguf）；键显式
-    // 置空 = "none"（引擎不投机；Windows 环境变量无法可靠地传空串）。
+    // 置空或 MTP 开关关闭 = "none"（引擎不投机；Windows 环境变量无法可靠地传空串）。
     const bool mtp_key = getenv("GGUF_MTP_FILE") || conf.count("GGUF_MTP_FILE");
     SetEnvironmentVariableA("QWENOX_GGUF_MTP",
-                            !gguf || !mtp_key ? nullptr
+                            !gguf ? nullptr
+                            : mtp_off ? "none"
+                            : !mtp_key ? nullptr
                             : mtp_file.empty() ? "none"
                                                : mtp_file.c_str());
     for (const char* k : {"QWENOX_GGUF", "QWENOX_GGUF_DENSE", "QWENOX_GGUF_EXPERTS"})
