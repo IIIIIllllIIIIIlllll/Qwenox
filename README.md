@@ -41,17 +41,18 @@ Windows（同一台机器，BIOS 划分 96 GiB 显存，生产配置，prefill �
 
 | 指标 | hgn v2 | GGUF UD-IQ4_XS + MTP |
 | --- | --- | --- |
-| Prefill（2K） | 1641.4 tok/s | |
-| Prefill（8K） | 1828.3 tok/s | |
-| Prefill（32K） | 1888.1 tok/s | 约 1440 tok/s（10-13） |
+| Prefill（2K） | 1705.1 tok/s | |
+| Prefill（8K） | 1963.5 tok/s | |
+| Prefill（32K） | 1964.5 tok/s | 约 1440 tok/s（10-13） |
 | Decode（投机，2K prompt） | 58.5 tok/s（10-13） | 46.8 tok/s（10-13） |
 | Decode（不投机） | 31.4 tok/s（10-13） | 27.7 tok/s（10-13） |
 | 冷启动（整份权重读进显存） | 约 35 s | 约 50–60 s |
 
-11-25 修复了三个长期拖累 Windows prefill 的问题后（PLE 文件被 `FILE_FLAG_NO_BUFFERING`
-冲刷页缓存、`NOWARMUP` 下 BLAS kernel db 懒加载卡首请求、bench 误关 2-flight PLE 预取，
-见 `dev-docs/RESULT-WIN-PREFILL-FIX-20261125.md`），Windows prefill 已与 Linux 打平：
-此前 32K 只有约 1200–1600 tok/s、冷读新文本时跌到 500–1000 tok/s。
+11-25 修复了四个长期拖累 Windows prefill 的问题后（PLE 文件被 `FILE_FLAG_NO_BUFFERING`
+冲刷页缓存、`NOWARMUP` 下 BLAS kernel db 懒加载卡首请求、bench 误关 2-flight PLE 预取、
+PLE 热读受 160B ReadFile 内核路径 ~250K 行/秒硬顶——改走映射 memcpy 后热读提速两个
+数量级，见 `dev-docs/RESULT-WIN-PREFILL-FIX-20261125.md`），Windows prefill 已追平甚至
+略超 Linux：此前 32K 只有约 1200–1600 tok/s、冷读新文本时跌到 500–1000 tok/s。
 
 投机 decode 的速度随文本重复度变化很大。上表用真实文本 prompt 测得；代码、模板这类高重复内容
 草稿命中率高，同配置可达 60 tok/s 以上；采样（自适应 γ）比 greedy 略低。表中日期均为 2026 年；

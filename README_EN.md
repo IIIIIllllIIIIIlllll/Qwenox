@@ -46,18 +46,20 @@ PREFILL_CHUNK=16384, measured 11-25):
 
 | Metric | hgn v2 | GGUF UD-IQ4_XS + MTP |
 | --- | --- | --- |
-| Prefill (2K) | 1641.4 tok/s | |
-| Prefill (8K) | 1828.3 tok/s | |
-| Prefill (32K) | 1888.1 tok/s | ~1440 tok/s (10-13) |
+| Prefill (2K) | 1705.1 tok/s | |
+| Prefill (8K) | 1963.5 tok/s | |
+| Prefill (32K) | 1964.5 tok/s | ~1440 tok/s (10-13) |
 | Decode (speculative, 2K prompt) | 58.5 tok/s (10-13) | 46.8 tok/s (10-13) |
 | Decode (no speculation) | 31.4 tok/s (10-13) | 27.7 tok/s (10-13) |
 | Cold start (whole weight file read into VRAM) | ~35 s | ~50–60 s |
 
-After the 11-25 fixes for three long-standing Windows prefill drags (the PLE file's standby page
+After the 11-25 fixes for four long-standing Windows prefill drags (the PLE file's standby page
 cache being purged by `FILE_FLAG_NO_BUFFERING`, the BLAS kernel-db lazy load stalling the first
-request under `NOWARMUP`, and the bench losing 2-flight PLE prefetch to a `quiet` mix-up — see
-`dev-docs/RESULT-WIN-PREFILL-FIX-20261125.md`), Windows prefill is on par with Linux; 32K used to
-be ~1200–1600 tok/s and dropped to 500–1000 tok/s on cache-cold text.
+request under `NOWARMUP`, the bench losing 2-flight PLE prefetch to a `quiet` mix-up, and the
+PLE hot-read path being capped at ~250K rows/s by per-160B-ReadFile kernel overhead — mapped
+reads are two orders of magnitude faster; see `dev-docs/RESULT-WIN-PREFILL-FIX-20261125.md`),
+Windows prefill now matches or slightly beats Linux; 32K used to be ~1200–1600 tok/s and dropped
+to 500–1000 tok/s on cache-cold text.
 
 Speculative decode speed depends heavily on how repetitive the text is. The tables use real-text prompts;
 highly repetitive content such as code or templates gets a high draft hit rate and exceeds 60 tok/s in the
