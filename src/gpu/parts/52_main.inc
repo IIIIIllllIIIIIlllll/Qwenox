@@ -560,12 +560,18 @@ int main(int argc, char** argv) {
     m.ple_on = ple_on;
     m.build_graphs();
     if (!vision_tower.empty()) m.load_vision(vision_tower.c_str());
-    if (!getenv("QWENOX_NOWARMUP")) {
-      // one dummy chunk moves first-call costs (Tensile library load,
-      // hipBLASLt algo selection, kernel module loads) out of the first
-      // served prefill; reset_state is the KV-split self-test path, proven
-      // output-identical to a fresh model.
-      std::vector<int> warm((size_t)m.maxbatch, 0);
+    // one dummy chunk moves first-call costs (Tensile library load,
+    // hipBLASLt algo selection, kernel module loads) out of the first
+    // served prefill; reset_state is the KV-split self-test path, proven
+    // output-identical to a fresh model.
+    // NOWARMUP=1 只把预热缩到 P=1024 的小 chunk（不跳过）：Windows 上
+    // hipBLASLt/rocBLAS 首次调用要扫盘读 build\*\library\gfx1151\ 的数百个
+    // kernel db 小文件，若推迟到首个请求会撞上 PleWin 的读盘风暴（实测
+    // gdn:proj 卡 41.6 s、qsa:idx 卡 4.9 s）。启动时磁盘空闲，扫盘 <1 s；
+    // P>=1024 同时覆盖 iproj 的 rocBLAS solutions 查询与 GEMM_WMMA 分支。
+    {
+      const int warm_p = getenv("QWENOX_NOWARMUP") ? 1024 : m.maxbatch;
+      std::vector<int> warm((size_t)std::min(warm_p, m.maxbatch_cap), 0);
       m.prefill_batch(warm);
       m.reset_state();
     }
@@ -662,10 +668,13 @@ int main(int argc, char** argv) {
   std::vector<int> all = tokens;
   std::vector<float> logits;
 
-  if (!getenv("QWENOX_NOWARMUP") && !vseg_selftest_spec && mtp_test == 0 && spec_gen == 0) {
+  if (!vseg_selftest_spec && mtp_test == 0 && spec_gen == 0) {
     // warmup: one dummy chunk prefill, then reset (see serve path above).
-    // Skipped for mtp/spec modes: tap capture would ingest warmup rows.
-    std::vector<int> warm((size_t)m.maxbatch, 0);
+    // NOWARMUP=1 缩到 P=1024 而非跳过（Windows BLAS kernel db 懒加载会在
+    // 首个请求上卡几十秒，见 serve 路径注释）。mtp/spec 模式仍跳过：
+    // tap capture would ingest warmup rows.
+    const int warm_p = getenv("QWENOX_NOWARMUP") ? 1024 : m.maxbatch;
+    std::vector<int> warm((size_t)std::min(warm_p, m.maxbatch_cap), 0);
     m.prefill_batch(warm);
     m.reset_state();
   }
