@@ -17,6 +17,14 @@ struct ReqCancelled : std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
+// Zero-copy pinned-host write on unified memory: stays on the compute queue
+// (g_str) instead of bouncing Compute <-> SDMA per GDN layer on Windows WDDM.
+__global__ void k_cut_copy_f32x4(float4* __restrict__ dst,
+                                 const float4* __restrict__ src, size_t n4) {
+  const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n4) dst[i] = src[i];
+}
+
 #ifdef _WIN32
 // QWENOX_WIN_KICK (default on): submit the null stream's queued kernels now
 // instead of at the next sync / 256th command (no direct dispatch on Windows).
@@ -1081,12 +1089,31 @@ struct GpuModel {
   // splitting the fused scan at the cut row, conv / PLE ring / indexer rings
   // by replaying their update with the first r rows, d_R = stream row cc-1,
   // MTP ring at cc-1); with_cut_state() swaps them in for rckpt / kvsnap.
-  int cut_abs = -1;   // absolute cut position, -1 = off
-  int cut_r_ = 0;     // chunk-local cut row this chunk (0 = none)
+  static constexpr int kMaxChunkCuts = 16;
+  struct CutShadow {
+    int idx = -1;               // index in cut_plan_
+    int abs = -1;               // absolute cut position (>0)
+    int r = 0;                  // chunk-local cut row in [1, P]
+    bool hit = false;
+    bool mtp_hit = false;
+    float* h_S = nullptr;       // pinned host buffer [ngdn * 48 * 128 * 128]
+    float* d_hS = nullptr;      // device-mapped alias of h_S (hipHostGetDevicePointer)
+    float* d_cconvst = nullptr; // carved out of slot's d_ckpt
+    float* d_cring = nullptr;
+    float* d_ciraw = nullptr;
+    float* d_cR = nullptr;
+    float* d_cmiraw = nullptr;
+  };
+  int cut_abs = -1;   // legacy scalar guard (-1 = off)
+  int cut_r_ = 0;     // non-zero while chunk_cuts_ is active in this chunk
   bool cut_hit = false, cut_mtp_hit = false;
+  std::vector<int> cut_plan_;  // sorted absolute cut positions for current prompt
+  std::function<float*(int, size_t)> cut_alloc_s_fn;
+  std::function<void(int, int, bool, bool)> cut_done_fn;
+  std::vector<CutShadow> chunk_cuts_;
   float *d_cS = nullptr, *d_cconvst = nullptr, *d_cring = nullptr, *d_ciraw = nullptr,
         *d_cR = nullptr, *d_cmiraw = nullptr;
-  bool cut_busy = false;  // NOT per slot: one shadow set, one owner at a time
+  bool cut_busy = false;
   hipGraphExec_t g1_exec = nullptr, g2_exec = nullptr, gall_exec = nullptr;  // per-slot decode graphs
 
   // ---- Sequence slots (concurrent serve, QWENOX_PARALLEL) ----
@@ -1109,7 +1136,8 @@ struct GpuModel {
   X(mrope_active_) X(rope_delta_) X(mrope_pos_) X(mrope_grids_) X(d_rdelta)   \
   X(img_inj) X(img_hash_) X(d_img_emb) X(img_emb_rows) X(img_emb_cap)         \
   X(mtp_tap_capture) X(spec_snap) X(vsnap_row0_) X(ngram_verify_active)       \
-  X(cut_abs) X(cut_r_) X(cut_hit) X(cut_mtp_hit) X(d_mR)                      \
+  X(cut_abs) X(cut_r_) X(cut_hit) X(cut_mtp_hit) X(cut_plan_)                 \
+  X(cut_alloc_s_fn) X(cut_done_fn) X(d_mR)                                    \
   X(prog_total) X(prog_base) X(prog_last_est) X(prog_req) X(prog_t0) X(pf_end) \
   X(prog_last) X(prog_snap_last) X(prog_snap_last_est) X(last_spec_rounds) X(last_spec_commit) X(last_spec_rollbacks) \
   X(last_spec_proposed) X(last_ng_rounds) X(last_ng_proposed)                \
@@ -5269,9 +5297,11 @@ struct GpuModel {
             d_csnap + ((size_t)vrow0 * ngdn + gi) * 3 * 10240, P, 10240,
             (size_t)ngdn * 3 * 10240);
       }
-      if (cutr)  // in-pass cut: conv state after the first r rows
-        k_convst_update<<<(10240 + 255) / 256, 256, 0, g_str>>>(
-            d_cconvst + (size_t)gi * 3 * 10240, qkvb, cutr, 10240);
+      if (cutr && bs == bound_) {  // in-pass cuts: conv state after first r rows
+        for (const auto& cs : chunk_cuts_)
+          k_convst_update<<<(10240 + 255) / 256, 256, 0, g_str>>>(
+              cs.d_cconvst + (size_t)gi * 3 * 10240, qkvb, cs.r, 10240);
+      }
       k_convst_update<<<(10240 + 255) / 256, 256, 0, g_str>>>(convst, qkvb, P,
                                                               10240);
       if (!cl2)
@@ -5322,23 +5352,36 @@ struct GpuModel {
         k_gdn_chunk<<<48, GDN_NT, 0, g_str>>>(convb, g48b, beta48b, S, convb,
                                               d_gdn_ws, P, 10240);
       } else if (gdn_fused) {
-        // one launch for all of P: no window, no workspace; S in/out via global
-        const int r = cutr;
-        float* const cS = d_cS ? d_cS + (size_t)gi * 48 * 128 * 128 : nullptr;
-        if (r > 0 && r < P) {
-          // in-pass cut: scan [0, r), keep S(cut), scan [r, P) (chunk grid
-          // restarts at r -> not bit-identical to the single launch)
-          k_gdn_fused<<<48, 1024, 0, g_str>>>(convb, g48b, beta48b, S,
-                                              convb, r, 10240);
-          CK(hipMemcpyAsync(cS, S, (size_t)48 * 128 * 128 * 4, hipMemcpyDeviceToDevice, g_str));
-          k_gdn_fused<<<48, 1024, 0, g_str>>>(
-              convb + (size_t)r * 10240, g48b + (size_t)r * 48, beta48b + (size_t)r * 48,
-              S, convb + (size_t)r * 10240, P - r, 10240);
+        // one launch for all of P unless in-pass cuts split the recurrent scan
+        if (cutr && bs == bound_ && !chunk_cuts_.empty()) {
+          int prev = 0;
+          for (const auto& cs : chunk_cuts_) {
+            const int seg = cs.r - prev;
+            if (seg > 0)
+              k_gdn_fused<<<48, 1024, 0, g_str>>>(
+                  convb + (size_t)prev * 10240, g48b + (size_t)prev * 48,
+                  beta48b + (size_t)prev * 48, S, convb + (size_t)prev * 10240,
+                  seg, 10240);
+            if (cs.d_hS) {
+              constexpr size_t n4 = (size_t)48 * 128 * 128 / 4;
+              k_cut_copy_f32x4<<<(unsigned)((n4 + 255) / 256), 256, 0, g_str>>>(
+                  (float4*)(cs.d_hS + (size_t)gi * 48 * 128 * 128),
+                  (const float4*)S, n4);
+            } else if (cs.h_S) {
+              CK(hipMemcpyAsync(cs.h_S + (size_t)gi * 48 * 128 * 128, S,
+                                (size_t)48 * 128 * 128 * 4,
+                                hipMemcpyDeviceToHost, g_str));
+            }
+            prev = cs.r;
+          }
+          if (prev < P)
+            k_gdn_fused<<<48, 1024, 0, g_str>>>(
+                convb + (size_t)prev * 10240, g48b + (size_t)prev * 48,
+                beta48b + (size_t)prev * 48, S, convb + (size_t)prev * 10240,
+                P - prev, 10240);
         } else {
           k_gdn_fused<<<48, 1024, 0, g_str>>>(convb, g48b, beta48b, S,
                                               convb, P, 10240);
-          if (r == P)
-            CK(hipMemcpyAsync(cS, S, (size_t)48 * 128 * 128 * 4, hipMemcpyDeviceToDevice, g_str));
         }
       } else {
         // Keep producer and consumer close; S carries the exact recurrence
@@ -6190,9 +6233,12 @@ struct GpuModel {
                                                  vb, keys16);
       k_index_ring<<<min(P, 4), 128, 0, g_str>>>(iproj, iraw + qi * 512, P, base,
                                                  vb);
-      if (cutr)  // in-pass cut: raw ring after the first r rows
-        k_index_ring<<<min(cutr, 4), 128, 0, g_str>>>(iproj, d_ciraw + qi * 512,
-                                                      cutr, base, vb);
+      if (cutr && bs == bound_) {  // in-pass cuts: raw ring after first r rows
+        for (const auto& cs : chunk_cuts_)
+          if (cs.d_ciraw)
+            k_index_ring<<<min(cs.r, 4), 128, 0, g_str>>>(
+                iproj, cs.d_ciraw + qi * 512, cs.r, base, vb);
+      }
       if (usnap)
         k_iproj_snap<<<P, 128, 0, g_str>>>(
             iproj, d_iproj_snap + ((size_t)qi * kVSnapRows + vrow0) * 128,
@@ -6819,63 +6865,124 @@ struct GpuModel {
   // Returns true when the HC write-back of the moe output was fused into the
   // reduce (B2-1; only on the LUT sg_fuse paths with try_hcw set): R is
   // updated, acc/d_yb are not written and the caller skips gr_write_b.
-  // ---- in-pass snapshot cut (see cut_abs) ----
-  bool cut_snap_supported() const {
-    static const bool off = env_zero("QWENOX_CUT_INPASS");
-    return !off && gdn_fused && !gdn_loop && !gdn_nosplit && gr_bf16 && !ple_loop;
+  // ---- in-pass snapshot cuts (multi-cut, see cut_plan_ / chunk_cuts_) ----
+  int cut_inpass_mode() const {
+    // QWENOX_CUT_INPASS: unset / >=2 = all cuts in-pass; 1 = last cut only; 0 = off
+    static const int mode = [] {
+      const char* e = getenv("QWENOX_CUT_INPASS");
+      return e ? atoi(e) : 2;
+    }();
+    return (mode > 0 && gdn_fused && !gdn_loop && !gdn_nosplit && gr_bf16 && !ple_loop)
+               ? mode
+               : 0;
   }
-  void cut_alloc() {
-    // Prompt ingest and speculative verify are mutually exclusive on a slot,
-    // so the cut shadow can reuse that slot's verifier checkpoint. Rebind on
-    // every cut: cut_busy serializes owners, but the bound slot may differ.
-    d_cS = d_ckpt;
-    d_cconvst = d_ckpt + ckpt_S / 4;
-    d_cring = d_cconvst + ckpt_convst / 4;
-    d_ciraw = ckpt_iraw ? d_cring + ckpt_ring / 4 : nullptr;
+  bool cut_snap_supported() const { return cut_inpass_mode() > 0; }
+  int clamp_chunk_for_cuts(int c0, int n) const {
+    if (cut_plan_.empty() || n <= 0) return n;
+    int cnt = 0;
+    for (int cc : cut_plan_) {
+      if (cc <= c0) continue;
+      if (cc > c0 + n) break;
+      if (++cnt == kMaxChunkCuts) return cc - c0;
+    }
+    return n;
   }
-  // chunk start: r = chunk-local cut row in (0, P], else 0. Copies the
-  // pre-chunk rings / conv state; the per-site replays below update them.
+  // chunk start: carve per-cut shadow state from the bound slot's d_ckpt and
+  // acquire pinned host S buffers for every cut in (base, base + P].
   void cut_begin_chunk(int base, int P) {
-    cut_r_ = (cut_abs > base && cut_abs <= base + P) ? cut_abs - base : 0;
-    if (!cut_r_) return;
+    chunk_cuts_.clear();
+    cut_r_ = 0;
+    if (cut_plan_.empty()) return;
     const int nqsa = g_cfg.layers / 4, ngdn = g_cfg.layers - nqsa;
-    CK(hipMemcpyAsync(d_cconvst, d_convst, (size_t)ngdn * 3 * 10240 * 4,
-                      hipMemcpyDeviceToDevice, g_str));
-    CK(hipMemcpyAsync(d_cring, d_ring, (size_t)9 * 10240 * 4, hipMemcpyDeviceToDevice, g_str));
-    if (d_iraw)
-      CK(hipMemcpyAsync(d_ciraw, d_iraw, (size_t)nqsa * 4 * 128 * 4, hipMemcpyDeviceToDevice,
-                        g_str));
+    const size_t conv_f = (size_t)ngdn * 3 * 10240;
+    const size_t ring_f = (size_t)9 * 10240;
+    const size_t iraw_f = d_iraw ? (size_t)nqsa * 4 * 128 : 0;
+    const size_t cR_f = (size_t)g_cfg.branches * g_cfg.d;
+    const size_t mir_f = d_miraw ? (size_t)4 * 128 : 0;
+    const size_t stride_f = conv_f + ring_f + iraw_f + cR_f + mir_f;
+    const size_t cap_f = (ckpt_S + ckpt_convst + ckpt_ring + ckpt_iraw) / 4;
+    for (size_t i = 0; i < cut_plan_.size(); i++) {
+      const int cc = cut_plan_[i];
+      if (cc <= base) continue;
+      if (cc > base + P) break;
+      if ((chunk_cuts_.size() + 1) * stride_f > cap_f) break;
+      CutShadow cs;
+      cs.idx = (int)i;
+      cs.abs = cc;
+      cs.r = cc - base;
+      float* p = d_ckpt + chunk_cuts_.size() * stride_f;
+      cs.d_cconvst = p;
+      p += conv_f;
+      cs.d_cring = p;
+      p += ring_f;
+      cs.d_ciraw = iraw_f ? p : nullptr;
+      p += iraw_f;
+      cs.d_cR = p;
+      p += cR_f;
+      cs.d_cmiraw = mir_f ? p : nullptr;
+      if (cut_alloc_s_fn) {
+        cs.h_S = cut_alloc_s_fn((int)i, (size_t)ngdn * 48 * 128 * 128);
+        if (cs.h_S) {
+          void* dp = nullptr;
+          if (hipHostGetDevicePointer(&dp, cs.h_S, 0) == hipSuccess)
+            cs.d_hS = (float*)dp;
+          else
+            (void)hipGetLastError();
+        }
+      }
+      auto copy4 = [](float* dst, const float* src, size_t nf) {
+        const size_t n4 = nf / 4;
+        k_cut_copy_f32x4<<<(unsigned)((n4 + 255) / 256), 256, 0, g_str>>>(
+            (float4*)dst, (const float4*)src, n4);
+      };
+      copy4(cs.d_cconvst, d_convst, conv_f);
+      copy4(cs.d_cring, d_ring, ring_f);
+      if (cs.d_ciraw) copy4(cs.d_ciraw, d_iraw, iraw_f);
+      chunk_cuts_.push_back(cs);
+    }
+    if (!chunk_cuts_.empty()) cut_r_ = chunk_cuts_[0].r;
   }
-  // Run fn with the cut-point state swapped in (pos = cut_abs). mtp: the MTP
-  // ring snapshot was taken, so the lockstep invariant mtp_pos == pos-1 holds.
-  template <class F>
-  void with_cut_state(bool mtp, F&& fn) {
-    const int sv_pos = pos, sv_ring = ple_ringpos, sv_mpos = mtp_pos;
-    auto swp = [&] {
-      std::swap(d_S, d_cS);
-      std::swap(d_convst, d_cconvst);
-      std::swap(d_ring, d_cring);
-      if (d_iraw) std::swap(d_iraw, d_ciraw);
-      std::swap(d_R, d_cR);
-      if (mtp && d_miraw) std::swap(d_miraw, d_cmiraw);
-    };
-    swp();
-    pos = cut_abs;
-    ple_ringpos = cut_abs % 9;
-    if (mtp) mtp_pos = cut_abs - 1;
-    try {
-      fn();
-    } catch (...) {
+  void cut_abort_chunk() noexcept {
+    cut_r_ = 0;
+    chunk_cuts_.clear();
+  }
+  void cut_finish_chunk() {
+    cut_r_ = 0;
+    if (chunk_cuts_.empty()) return;
+    std::vector<CutShadow> done = std::move(chunk_cuts_);
+    chunk_cuts_.clear();
+    for (auto& cs : done) {
+      if (!cs.hit || !cut_done_fn) {
+        if (cut_done_fn) cut_done_fn(cs.idx, cs.abs, false, false);
+        continue;
+      }
+      const int sv_pos = pos, sv_ring = ple_ringpos, sv_mpos = mtp_pos;
+      const bool mtp = cs.mtp_hit;
+      auto swp = [&] {
+        std::swap(d_convst, cs.d_cconvst);
+        std::swap(d_ring, cs.d_cring);
+        if (d_iraw && cs.d_ciraw) std::swap(d_iraw, cs.d_ciraw);
+        std::swap(d_R, cs.d_cR);
+        if (mtp && d_miraw && cs.d_cmiraw) std::swap(d_miraw, cs.d_cmiraw);
+      };
+      swp();
+      pos = cs.abs;
+      ple_ringpos = cs.abs % 9;
+      if (mtp) mtp_pos = cs.abs - 1;
+      try {
+        cut_done_fn(cs.idx, cs.abs, true, mtp);
+      } catch (...) {
+        swp();
+        pos = sv_pos;
+        ple_ringpos = sv_ring;
+        mtp_pos = sv_mpos;
+        throw;
+      }
       swp();
       pos = sv_pos;
       ple_ringpos = sv_ring;
       mtp_pos = sv_mpos;
-      throw;
     }
-    swp();
-    pos = sv_pos;
-    ple_ringpos = sv_ring;
-    mtp_pos = sv_mpos;
   }
 
   // d_routerb [P][512] -> d_topidsb/d_topwb. wave-per-token kernel (bit-
@@ -8426,8 +8533,10 @@ struct GpuModel {
     k_add2<<<(unsigned)((tot + 255) / 256), 256, 0, g_str>>>(d_Rb, d_Ub, d_convoutb,
                                                              (int)tot);
     k_ple_ring_wr<<<9, 256, 0, g_str>>>(d_Unb, d_ring, P, 10240, base, vbptr());
-    if (cut_r_)  // in-pass cut: PLE ring after the first r rows
-      k_ple_ring_wr<<<9, 256, 0, g_str>>>(d_Unb, d_cring, cut_r_, 10240, base, vbptr());
+    if (cut_r_) {  // in-pass cuts: PLE ring after first r rows
+      for (const auto& cs : chunk_cuts_)
+        k_ple_ring_wr<<<9, 256, 0, g_str>>>(d_Unb, cs.d_cring, cs.r, 10240, base, vbptr());
+    }
   }
 
   // D2-S1c: one segment of a multi-segment verify batch's PLE device phase.
@@ -9143,7 +9252,8 @@ struct GpuModel {
       int rem = N - off;
       // Absorb a small tail into this chunk instead of running a tiny final
       // chunk whose per-chunk fixed cost (~0.9 s) dwarfs its token count.
-      int n = ple_prefetch::chunk_size(rem, maxbatch, maxbatch_cap);
+      int n = clamp_chunk_for_cuts(base + off,
+                                   ple_prefetch::chunk_size(rem, maxbatch, maxbatch_cap));
       // D1b: while the GPU is lent mid-chunk, only light rounds may start;
       // a heavy chunk requeues behind the owner and retries. 10-13: it also
       // requeues while a heavy waiter has less prompt left (heavy_gate_fn).
@@ -9160,15 +9270,22 @@ struct GpuModel {
       std::vector<int> nxt, nxt2;
       if (off + n < N) {
         int rem2 = N - (off + n);
-        int n2 = ple_prefetch::chunk_size(rem2, maxbatch, maxbatch_cap);
+        int n2 = clamp_chunk_for_cuts(
+            base + off + n, ple_prefetch::chunk_size(rem2, maxbatch, maxbatch_cap));
         nxt.assign(tokens.begin() + off + n, tokens.begin() + off + n + n2);
         if (off + n + n2 < N) {
           int rem3 = N - (off + n + n2);
-          int n3 = ple_prefetch::chunk_size(rem3, maxbatch, maxbatch_cap);
+          int n3 = clamp_chunk_for_cuts(
+              base + off + n + n2, ple_prefetch::chunk_size(rem3, maxbatch, maxbatch_cap));
           nxt2.assign(tokens.begin() + off + n + n2,
                       tokens.begin() + off + n + n2 + n3);
         }
       }
+      struct CutChunkGuard {
+        GpuModel& m;
+        bool committed = false;
+        ~CutChunkGuard() { if (!committed) m.cut_abort_chunk(); }
+      } cut_guard{*this};
       id = prefill_chunk(
           std::vector<int>(tokens.begin() + off, tokens.begin() + off + n),
           base + off, final, quiet, nxt.empty() ? nullptr : &nxt,
@@ -9199,6 +9316,8 @@ struct GpuModel {
           }
         }
       }
+      cut_guard.committed = true;
+      cut_finish_chunk();
       off += n;
       // 客户端已断连/取消：不再为已断开的请求预填剩余分段（长 prompt 可能还有
       // 几万 token）。段间取消延迟 ≤ 一个分段；抛点状态语义同 yield_point。
@@ -9412,15 +9531,16 @@ struct GpuModel {
                           hipMemcpyDeviceToDevice, g_str));
       }
     }
-    if (cut_r_) {  // in-pass cut: d_R(cut) = final stream row cut-1
-      if (gr_bf16)
-        k_bf16_to_f32<<<(10240 + 255) / 256, 256, 0, g_str>>>(
-            (const uint16_t*)d_Rb + (size_t)(cut_r_ - 1) * 10240, d_cR, 10240);
-      else
-        CK(hipMemcpyAsync(d_cR, d_Rb + (size_t)(cut_r_ - 1) * 10240, 10240 * 4,
-                          hipMemcpyDeviceToDevice, g_str));
-      cut_hit = true;
-      cut_r_ = 0;
+    if (cut_r_) {  // in-pass cuts: d_R(cut) = final stream row cut-1
+      for (auto& cs : chunk_cuts_) {
+        if (gr_bf16)
+          k_bf16_to_f32<<<(10240 + 255) / 256, 256, 0, g_str>>>(
+              (const uint16_t*)d_Rb + (size_t)(cs.r - 1) * 10240, cs.d_cR, 10240);
+        else
+          CK(hipMemcpyAsync(cs.d_cR, d_Rb + (size_t)(cs.r - 1) * 10240, 10240 * 4,
+                            hipMemcpyDeviceToDevice, g_str));
+        cs.hit = (cs.h_S != nullptr);
+      }
     }
     // hand off last row to the single-token decode state
     if (gr_bf16)
@@ -9544,7 +9664,8 @@ struct GpuModel {
       if (P < 1 || P > 8 || b < 0 || b + P > maxctx) return rej("P/base range");
       if (t < 0 || t >= nslots) return rej("slot id");
       for (int q = 0; q < s; q++) if (sl[q] == t) return rej("dup slot");
-      if (slot_mrope_active_(t) || slot_cut_abs(t) >= 0 || slot_cut_r_(t) ||
+      if (slot_mrope_active_(t) || slot_cut_abs(t) >= 0 ||
+          !slot_cut_plan_(t).empty() || slot_cut_r_(t) ||
           slot_prog_total(t) > 0 || slot_mtp_tap_capture(t) ||
           slot_ngram_verify_active(t))
         return rej("slot flags");
@@ -10439,7 +10560,11 @@ struct GpuModel {
     // the inline fp64 path it replaces).
     ensure_rope_tab(g_cfg.rope_theta, 64);
     ensure_rope_cs(base, P);
-    if (!qsa_dense) {
+    if (qsa_dense) {
+      for (auto& cs : chunk_cuts_)
+        if (cs.abs > 0 && cs.abs - 1 >= base && cs.abs - 1 <= base + P)
+          cs.mtp_hit = true;
+    } else {
       if (index_f32) {
         iproj_sgemm(d_miw, d_xb, d_iproj, P);
       } else {
@@ -10460,13 +10585,16 @@ struct GpuModel {
                                                  g_cfg.norm_eps,
                                                  g_cfg.rope_theta, base, d_miraw,
                                                  d_ropecs, kvpt(), nullptr, mikh);
-      if (cut_abs > 0 && d_cmiraw && cut_abs - 1 >= base && cut_abs - 1 <= base + P) {
-        // in-pass cut: MTP lockstep at the cut = rows [0, cut-1) ingested
-        CK(hipMemcpyAsync(d_cmiraw, d_miraw, 4 * 128 * 4, hipMemcpyDeviceToDevice, g_str));
-        const int rr = cut_abs - 1 - base;
-        if (rr > 0)
-          k_index_ring<<<min(rr, 4), 128, 0, g_str>>>(d_iproj, d_cmiraw, rr, base);
-        cut_mtp_hit = true;
+      for (auto& cs : chunk_cuts_) {
+        if (cs.abs > 0 && cs.d_cmiraw && cs.abs - 1 >= base && cs.abs - 1 <= base + P) {
+          // in-pass cut: MTP lockstep at the cut = rows [0, cut-1) ingested
+          k_cut_copy_f32x4<<<2, 256, 0, g_str>>>((float4*)cs.d_cmiraw,
+                                                 (const float4*)d_miraw, 128);
+          const int rr = cs.abs - 1 - base;
+          if (rr > 0)
+            k_index_ring<<<min(rr, 4), 128, 0, g_str>>>(d_iproj, cs.d_cmiraw, rr, base);
+          cs.mtp_hit = true;
+        }
       }
       k_index_ring<<<min(P, 4), 128, 0, g_str>>>(d_iproj, d_miraw, P, base);
       // paged: gather the keys contiguous for the scores (as trunk qsa_b)
@@ -13796,7 +13924,8 @@ struct GpuModel {
     if ((dbg && !getenv("QWENOX_VGRAPH_DBG")) || perf || g_kprof_on)
       return false;
     if (P < 2 || P > kVGMaxP || base < g_index_first || base + P > maxctx) return false;
-    if (mrope_active_ || cut_abs >= 0 || qsa_dense || qsa_loop || qsa_wmma6)
+    if (mrope_active_ || cut_abs >= 0 || !cut_plan_.empty() || qsa_dense ||
+        qsa_loop || qsa_wmma6)
       return false;
     if (ple_on && ple_loop) return false;
     if (ngram_verify_active || ws_lent_ || prog_total > 0) return false;

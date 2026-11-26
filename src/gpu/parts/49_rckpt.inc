@@ -70,7 +70,7 @@ static std::vector<std::pair<float*, size_t>>& pin_pool() {
   static std::vector<std::pair<float*, size_t>> v;
   return v;
 }
-static size_t g_pool_per_size = 10;
+static size_t g_pool_per_size = 12;
 bool PinBuf::get(size_t cnt) {
   put();
   {
@@ -113,6 +113,17 @@ static bool d2h(PinBuf& b, const void* src, size_t cnt) {
   static const bool sync = getenv("QWENOX_RCKPT_SYNC") != nullptr;
   if (!b.get(cnt)) return false;
   if (sync) return hipMemcpy(b.p, src, cnt * 4, hipMemcpyDeviceToHost) == hipSuccess;
+  if (cnt % 4 == 0 && (((uintptr_t)src & 15) == 0)) {
+    void* dp = nullptr;
+    if (hipHostGetDevicePointer(&dp, b.p, 0) == hipSuccess && dp &&
+        (((uintptr_t)dp & 15) == 0)) {
+      const size_t n4 = cnt / 4;
+      k_cut_copy_f32x4<<<(unsigned)((n4 + 255) / 256), 256, 0, g_str>>>(
+          (float4*)dp, (const float4*)src, n4);
+      return true;
+    }
+    (void)hipGetLastError();
+  }
   return hipMemcpyAsync(b.p, src, cnt * 4, hipMemcpyDeviceToHost, g_str) == hipSuccess;
 }
 
@@ -186,9 +197,9 @@ static bool prefix_of(const std::vector<int>& t,
 }
 
 bool enabled() { return g_on; }
+size_t cap() { return g_on ? g_cap : 0; }
 
-// Background-fill the pinned pool with g_cap + 2 buffer sets (the LRU keeps at
-// most g_cap checkpoints; +2 covers a save before the evicted one is freed).
+// Background-fill the pinned pool with enough buffer sets for g_cap + in-pass chunk cuts.
 void prewarm(bool with_mtp) {
   if (!g_on || getenv("QWENOX_RCKPT_SYNC")) return;
   const int nqsa = g_cfg.layers / 4, ngdn = g_cfg.layers - nqsa;
@@ -198,7 +209,7 @@ void prewarm(bool with_mtp) {
     sizes.push_back((size_t)g_cfg.branches * g_cfg.d);
     sizes.push_back(4 * 128);
   }
-  const size_t sets = g_cap + 2;
+  const size_t sets = std::max<size_t>(g_cap + 4, 12);
   g_pool_per_size = sets;
   std::thread([sizes, sets] {
     hip_use_selected_device();
@@ -225,9 +236,11 @@ void prune(const std::vector<int64_t>& chist) {
 }
 
 // `mtp`: the caller ingested the MTP layer in lockstep with this prefix.
+// `pre_s`: optional pre-captured GDN S buffer (in-pass cut DMA'd directly into PinBuf).
 // Returns true when a checkpoint for exactly these tokens is cached after
 // the call (stored now, or already present).
-bool save(GpuModel& m, const std::vector<int>& toks, bool mtp = false) {
+static bool save_impl(GpuModel& m, const std::vector<int>& toks, bool mtp,
+                      PinBuf* pre_s) {
   if (!g_on || toks.size() < g_min_tokens || toks.size() != (size_t)m.pos)
     return false;
   crashdiag::note("rckpt save %zu tokens (mtp %d)", toks.size(), (int)mtp);
@@ -258,7 +271,15 @@ bool save(GpuModel& m, const std::vector<int>& toks, bool mtp = false) {
   ck.toks = toks;
   ck.pos = m.pos;
   ck.ringpos = m.ple_ringpos;
-  const bool ok = d2h(ck.s, m.d_S, (size_t)ngdn * 48 * 128 * 128) &&
+  const size_t s_cnt = (size_t)ngdn * 48 * 128 * 128;
+  bool s_ok = false;
+  if (pre_s && pre_s->size() == s_cnt) {
+    ck.s = std::move(*pre_s);
+    s_ok = true;
+  } else {
+    s_ok = d2h(ck.s, m.d_S, s_cnt);
+  }
+  const bool ok = s_ok &&
                   d2h(ck.convst, m.d_convst, (size_t)ngdn * 3 * 10240) &&
                   d2h(ck.ring, m.d_ring, 9 * 10240) &&
                   d2h(ck.iraw, m.d_iraw, (size_t)nqsa * 512);
@@ -293,6 +314,36 @@ bool save(GpuModel& m, const std::vector<int>& toks, bool mtp = false) {
   if (g_pin) ck.pages = m.kv_pin(m.pos);
   g_list.push_back(std::move(ck));
   while (g_list.size() > g_cap) drop_front();
+  return true;
+}
+
+bool save(GpuModel& m, const std::vector<int>& toks, bool mtp = false) {
+  return save_impl(m, toks, mtp, nullptr);
+}
+
+bool save_pre_s(GpuModel& m, const std::vector<int>& toks, bool mtp,
+                PinBuf&& pre_s) {
+  return save_impl(m, toks, mtp, &pre_s);
+}
+
+// Populate a transient Ck asynchronously on g_str (for kvsnap when rckpt is
+// disabled or capped below the prompt's cut count).
+bool fill_temp(GpuModel& m, int cut_pos, bool mtp, PinBuf&& pre_s, Ck& ck) {
+  const int nqsa = g_cfg.layers / 4, ngdn = g_cfg.layers - nqsa;
+  const bool mtp_ok = mtp && m.kv_nl > nqsa && m.mtp_pos == cut_pos - 1;
+  ck.pos = cut_pos;
+  ck.ringpos = m.ple_ringpos;
+  ck.s = std::move(pre_s);
+  if (ck.s.size() != (size_t)ngdn * 48 * 128 * 128) return false;
+  if (!d2h(ck.convst, m.d_convst, (size_t)ngdn * 3 * 10240) ||
+      !d2h(ck.ring, m.d_ring, 9 * 10240) ||
+      !d2h(ck.iraw, m.d_iraw, (size_t)nqsa * 512))
+    return false;
+  if (mtp_ok) {
+    ck.mtp_ok = d2h(ck.mR, m.d_R, (size_t)g_cfg.branches * g_cfg.d);
+    if (ck.mtp_ok && m.d_miraw) ck.mtp_ok = d2h(ck.miraw, m.d_miraw, 4 * 128);
+    ck.mtp_pos = m.mtp_pos;
+  }
   return true;
 }
 

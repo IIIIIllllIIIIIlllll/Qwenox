@@ -210,7 +210,7 @@ struct HBuf {
 static std::mutex g_pool_mtx;
 static std::vector<HBuf> g_pool;
 static size_t g_pool_bytes = 0;
-static const size_t g_pool_max = 512ull << 20;
+static const size_t g_pool_max = 1280ull << 20;
 static HBuf buf_get(size_t n) {
   {
     std::lock_guard<std::mutex> lk(g_pool_mtx);
@@ -931,7 +931,7 @@ static void capture_impl(GpuModel& m, const std::vector<int>& toks, bool mtp,
   crashdiag::note("kvsnap capture %zu tokens (mtp %d, from rckpt %d)", toks.size(), (int)mtp,
                   (int)(rc != nullptr));
   const int n = (int)toks.size();
-  if (n <= 0 || (rc ? (n >= m.pos || rc->pos != n) : n != m.pos)) {
+  if (n <= 0 || (rc ? (n > m.pos || rc->pos != n) : n != m.pos)) {
     fprintf(stderr, "kvsnap: save skipped: %d tokens but live pos %d\n", n, m.pos);
     return;
   }
@@ -943,7 +943,7 @@ static void capture_impl(GpuModel& m, const std::vector<int>& toks, bool mtp,
       fprintf(stderr, "kvsnap: pause checkpoint of %d tokens skipped (RAM copy layout)\n", n);
       return;
     }
-    mtp = rc->mtp_ok && m.kv_nl > G.nqsa && rc->mtp_pos == n - 1 &&
+    mtp = mtp && rc->mtp_ok && m.kv_nl > G.nqsa && rc->mtp_pos == n - 1 &&
           rc->mR.size() == (size_t)g_cfg.branches * g_cfg.d &&
           rc->miraw.size() == (m.d_miraw ? (size_t)4 * 128 : 0);
   } else {
@@ -1039,6 +1039,10 @@ static void capture_impl(GpuModel& m, const std::vector<int>& toks, bool mtp,
 static void capture(GpuModel& m, const std::vector<int>& toks, bool mtp,
                     std::vector<Pending>& out) {
   capture_impl(m, toks, mtp, nullptr, out);
+}
+static void capture_rc(GpuModel& m, const std::vector<int>& toks, bool mtp,
+                       const rckpt::Ck* rc, std::vector<Pending>& out) {
+  capture_impl(m, toks, mtp, rc, out);
 }
 // End of turn, before commit(): the RAM checkpoint of hist[0, n) (a pause of
 // this turn) for this tier too. Without one -- evicted for pool space, not
@@ -3556,6 +3560,10 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     m.cut_abs = -1;
     m.cut_r_ = 0;
     m.cut_hit = m.cut_mtp_hit = false;
+    m.cut_plan_.clear();
+    m.chunk_cuts_.clear();
+    m.cut_alloc_s_fn = nullptr;
+    m.cut_done_fn = nullptr;
     if (owns_cut) {
       m.cut_busy = false;
       owns_cut = false;
@@ -3897,14 +3905,58 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       cut_tp = now;
     };
     cut_lap("pre-cuts");
-    // aggr 10-05: the LAST cut is taken in-pass (no separate tiny tail pass);
-    // earlier cuts keep the split path. QWENOX_CUT_INPASS=0 disables.
-    size_t inpass_cc = 0;
-    if (!cuts.empty() && m.cut_snap_supported() && g.mrope_grids.empty() && !m.cut_busy) {
-      inpass_cc = cuts.back();
+    // Multi-cut in-pass snapshot: capture all cuts inside the unsplit prefill
+    // chunks instead of splitting prefill_batch into tiny segments per cut.
+    // QWENOX_CUT_INPASS=1 restores last-cut-only; QWENOX_CUT_INPASS=0 disables.
+    struct InpassCutRec {
+      size_t cc = 0;
+      rckpt::PinBuf s_buf;
+      bool saved_rckpt = false;
+      bool has_extra = false;
+      bool mtp_cut = false;
+      rckpt::Ck extra_ck;
+    };
+    std::vector<InpassCutRec> inpass_recs;
+    const int cut_mode = (!cuts.empty() && g.mrope_grids.empty()) ? m.cut_inpass_mode() : 0;
+    if (cut_mode >= 2) {
+      inpass_recs.resize(cuts.size());
+      m.cut_plan_.reserve(cuts.size());
+      for (size_t i = 0; i < cuts.size(); i++) {
+        inpass_recs[i].cc = cuts[i];
+        m.cut_plan_.push_back((int)cuts[i]);
+      }
+      cuts.clear();
+    } else if (cut_mode == 1) {
+      inpass_recs.resize(1);
+      inpass_recs[0].cc = cuts.back();
+      m.cut_plan_.push_back((int)cuts.back());
       cuts.pop_back();
-      m.cut_busy = true;  // released after the save below
-      owns_cut = true;
+    }
+    if (!inpass_recs.empty()) {
+      const bool want_mtp = (use_spec || chain_mtp);
+      m.cut_alloc_s_fn = [&](int idx, size_t cnt) -> float* {
+        auto& rec = inpass_recs[(size_t)idx];
+        return rec.s_buf.get(cnt) ? rec.s_buf.data() : nullptr;
+      };
+      m.cut_done_fn = [&](int idx, int abs, bool hit, bool mtp_hit) {
+        auto& rec = inpass_recs[(size_t)idx];
+        if (!hit) {
+          rec.s_buf.put();
+          fprintf(stderr, "%s cut: in-pass snapshot at %d missed (req %lld)\n",
+                  log_ts(), abs, (long long)g.req);
+          return;
+        }
+        const bool mtp_cut = want_mtp && mtp_hit;
+        rec.mtp_cut = mtp_cut;
+        std::vector<int> chist(g.ids.begin(), g.ids.begin() + abs);
+        const bool will_evict = rckpt::enabled() &&
+                                (inpass_recs.size() - (size_t)idx > rckpt::cap());
+        if (!will_evict)
+          rec.saved_rckpt = rckpt::save_pre_s(m, chist, mtp_cut, std::move(rec.s_buf));
+        if (!rec.saved_rckpt && !kvs.dir.empty() && rec.s_buf.data())
+          rec.has_extra = rckpt::fill_temp(m, abs, mtp_cut, std::move(rec.s_buf), rec.extra_ck);
+        rec.s_buf.put();
+      };
     }
     for (size_t cc : cuts) {
       std::vector<int> seg(g.ids.begin() + done_upto, g.ids.begin() + cc);
@@ -3927,24 +3979,18 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       cut_lap("mtp+yield");
     }
     std::vector<int> seg(g.ids.begin() + done_upto, g.ids.end());
-    if (inpass_cc) {
-      m.cut_alloc();
-      m.cut_abs = (int)inpass_cc;
-      m.cut_hit = m.cut_mtp_hit = false;
-    }
     cur = m.prefill_batch(seg, (int)done_upto, true, false, &cancel);
     cut_lap("last-prefill");
-    if (inpass_cc) {
-      const bool mtp_cut = (use_spec || chain_mtp) && m.cut_mtp_hit;
-      if (m.cut_hit) {
-        std::vector<int> chist(g.ids.begin(), g.ids.begin() + inpass_cc);
-        m.with_cut_state(mtp_cut, [&] {
-          rckpt::save(m, chist, mtp_cut);
-          if (!kvs.dir.empty()) kvsnap::capture(m, chist, mtp_cut, pend);
-        });
-      } else {
-        fprintf(stderr, "%s cut: in-pass snapshot at %zu missed (req %lld)\n", log_ts(),
-                inpass_cc, (long long)g.req);
+    if (!inpass_recs.empty()) {
+      if (!kvs.dir.empty()) {
+        for (auto& rec : inpass_recs) {
+          const rckpt::Ck* rc = rec.has_extra ? &rec.extra_ck
+                              : (rec.saved_rckpt ? rckpt::find(g.ids, rec.cc) : nullptr);
+          if (rc) {
+            std::vector<int> chist(g.ids.begin(), g.ids.begin() + rec.cc);
+            kvsnap::capture_rc(m, chist, rec.mtp_cut, rc, pend);
+          }
+        }
       }
       clear_cut();
       cut_lap("cut-save");
