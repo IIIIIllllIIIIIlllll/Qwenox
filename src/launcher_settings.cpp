@@ -1818,6 +1818,9 @@ std::string request_hostname(const http::Request& q) {
 // 背景（docs/POWER.md）：平衡方案下引擎重启/空闲数分钟后前 ~35s decode 有
 // ~10% 的 DVFS ramp；切高性能方案可消除。符号运行时装载（PowrProf.dll），
 // 与 os_win32.h 的 advapi32 做法一致，避免新增链接依赖。
+// 所有 Windows 类型（DWORD/GUID/LocalFree 等）只存在于 _WIN32 分支内；
+// Linux 编译到的是下面的 supported=false 桩。
+#ifdef _WIN32
 struct PowerApi {
     using GetFn = DWORD(WINAPI*)(void*, GUID**);
     using SetFn = DWORD(WINAPI*)(void*, const GUID*);
@@ -1825,7 +1828,6 @@ struct PowerApi {
     SetFn set = nullptr;
     bool ok = false;
     PowerApi() {
-#ifdef _WIN32
         HMODULE h = GetModuleHandleA("PowrProf.dll");
         if (!h) h = LoadLibraryA("PowrProf.dll");
         if (h) {
@@ -1833,7 +1835,6 @@ struct PowerApi {
             set = (SetFn)GetProcAddress(h, "PowerSetActiveScheme");
             ok = get && set;
         }
-#endif
     }
 };
 static PowerApi& power_api() {
@@ -1867,27 +1868,38 @@ json power_scheme_json() {
     LocalFree(g);
     return j;
 }
+#endif  // _WIN32
 
 void handle_power_scheme(const http::Request&, http::Response* r, http::Stream*) {
+#ifdef _WIN32
     send_json(r, power_scheme_json());
+#else
+    json j;
+    j["supported"] = false;
+    send_json(r, j);
+#endif
 }
 
 void handle_power_high(const http::Request&, http::Response* r, http::Stream*) {
+    json j;
+#ifdef _WIN32
     auto& P = power_api();
     if (!P.ok) {
-        json j;
         j["ok"] = false;
-        j["error"] = "unsupported platform";
-        send_json(r, j);
-        return;
+        j["error"] = "powrprof unavailable";
+    } else {
+        const DWORD rc = P.set(nullptr, &kGuidHighPerf);
+        j = power_scheme_json();
+        j["ok"] = (rc == 0);
+        if (rc != 0)
+            j["error"] = "PowerSetActiveScheme rc=" + std::to_string(rc);
+        else
+            log_event("电源方案已切换为「高性能」（一键设置）");
     }
-    const DWORD rc = P.set(nullptr, &kGuidHighPerf);
-    json j = power_scheme_json();
-    j["ok"] = (rc == 0);
-    if (rc != 0)
-        j["error"] = "PowerSetActiveScheme rc=" + std::to_string(rc);
-    else
-        log_event("电源方案已切换为「高性能」（一键设置）");
+#else
+    j["ok"] = false;
+    j["error"] = "unsupported platform";
+#endif
     send_json(r, j);
 }
 
