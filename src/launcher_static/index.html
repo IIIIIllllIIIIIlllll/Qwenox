@@ -370,6 +370,8 @@ zh:{
   m_switched:"已切换到「{n}」", m_created:"已新建方案「{n}」", m_renamed:"已重命名为「{n}」",
   m_dup:"已复制为「{n}」", m_deleted:"已删除方案「{n}」", m_starting:"启动中…", m_stopping:"停止中…",
   m_restart_to:"重启超时：服务没有在 60 秒内停下", m_fixfirst:"有字段需要修正，先改好再保存",
+  pw_btn:"电源：{n} → 设为高性能", pw_done:"电源方案已设为「高性能」", pw_fail:"电源方案设置失败",
+  pw_scheme:{high:"高性能", balanced:"平衡", saver:"节能", custom:"自定义"},
   quit_done:"启动器已退出，本页可以关闭（托盘图标可能还在，可一并退出）。",
   // 文件浏览器
   fb_root:"项目根", fb_drives:"计算机", fb_all:"全部文件", fb_pick:"选择此目录",
@@ -443,6 +445,8 @@ en:{
   m_switched:"Switched to “{n}”", m_created:"Created “{n}”", m_renamed:"Renamed to “{n}”",
   m_dup:"Duplicated as “{n}”", m_deleted:"Deleted “{n}”", m_starting:"Starting…", m_stopping:"Stopping…",
   m_restart_to:"Restart timed out: service did not stop within 60 s", m_fixfirst:"Fix the highlighted fields first",
+  pw_btn:"Power: {n} → Set High Performance", pw_done:"Power scheme set to High performance", pw_fail:"Failed to set power scheme",
+  pw_scheme:{high:"High performance", balanced:"Balanced", saver:"Power saver", custom:"Custom"},
   quit_done:"The launcher has exited; this page can be closed.",
   fb_root:"Project root", fb_drives:"Computer", fb_all:"All files", fb_pick:"Pick this directory",
   fb_hint_dir:"Click a directory to enter, then pick it", fb_hint_file:"Click a file to pick; ↑ goes up; type a path + Enter",
@@ -1107,7 +1111,8 @@ function renderHeader(){
   const dirty = isDirty(), bad = !!S.draft && Object.keys(validate(S.draft)).length > 0;
   const consoleUrl = (S.svc.api && S.svc.api.up && S.svc.console_url) || "";
   // 轮询每 2 s 调一次：内容没变就不重建按钮，免得按下与松开之间被换掉而丢点击
-  const sig = [LANG, st, active, leftover, need, dirty, bad, consoleUrl].join("|");
+  const sig = [LANG, st, active, leftover, need, dirty, bad, consoleUrl,
+               S.power && S.power.scheme, S.power && S.power.is_high].join("|");
   if (host._sig === sig) return;
   host._sig = sig;
   host.innerHTML = "";
@@ -1120,6 +1125,11 @@ function renderHeader(){
         onclick:doRestart}));
     host.append(el("button", {class:"btn danger", disabled:st === "stopping",
       text: leftover ? t("cleanup") : t("stop"), onclick:doStop}));
+  }
+  if (S.power && S.power.supported && !S.power.is_high){
+    const nm = (t("pw_scheme") || {})[S.power.scheme] || S.power.scheme || "?";
+    host.append(el("button", {class:"btn ghost", title:"docs/POWER.md",
+      text: t("pw_btn", {n: nm}), onclick:doPowerHigh}));
   }
   $("#consoleLink").innerHTML = "";
   if (consoleUrl) $("#consoleLink").append(el("a", {class:"btn ghost", href:consoleUrl, target:"_blank", text:t("console")}));
@@ -1475,9 +1485,26 @@ async function doQuit(){
   document.body.innerHTML = `<p style="position:relative;padding:40px;text-align:center;color:#9aa6c0">${t("quit_done")}</p>`;
 }
 
+async function doPowerHigh(){
+  try{
+    const j = await api("/api/power_high", "POST", {});
+    if (j.ok){ toast(t("pw_done")); }
+    else toast(t("pw_fail") + (j.error ? "：" + j.error : ""), true);
+    S.power = j;
+    renderHeader();
+  }catch(e){ toast(t("pw_fail") + "：" + e.message, true); }
+}
+
 let lastState = null;
 async function pollStatus(){
   try{ S.svc = await api("/api/status"); }catch(e){ return; }
+  try{
+    const p = await api("/api/power_scheme");
+    if (JSON.stringify([p.supported, p.is_high, p.scheme]) !== S._pwsig){
+      S._pwsig = JSON.stringify([p.supported, p.is_high, p.scheme]);
+      S.power = p;
+    }
+  }catch(e){}
   const st = S.svc.state;
   if (!ACTIVE.includes(st)) LS.set("restart", null);  // 没在运行就谈不上"需要重启"
   renderHeader();

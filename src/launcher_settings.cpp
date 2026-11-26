@@ -1814,6 +1814,83 @@ std::string request_hostname(const http::Request& q) {
     return host;
 }
 
+// ---- 一键电源方案（Windows）：高性能 -------------------------------------
+// 背景（docs/POWER.md）：平衡方案下引擎重启/空闲数分钟后前 ~35s decode 有
+// ~10% 的 DVFS ramp；切高性能方案可消除。符号运行时装载（PowrProf.dll），
+// 与 os_win32.h 的 advapi32 做法一致，避免新增链接依赖。
+struct PowerApi {
+    using GetFn = DWORD(WINAPI*)(void*, GUID**);
+    using SetFn = DWORD(WINAPI*)(void*, const GUID*);
+    GetFn get = nullptr;
+    SetFn set = nullptr;
+    bool ok = false;
+    PowerApi() {
+#ifdef _WIN32
+        HMODULE h = GetModuleHandleA("PowrProf.dll");
+        if (!h) h = LoadLibraryA("PowrProf.dll");
+        if (h) {
+            get = (GetFn)GetProcAddress(h, "PowerGetActiveScheme");
+            set = (SetFn)GetProcAddress(h, "PowerSetActiveScheme");
+            ok = get && set;
+        }
+#endif
+    }
+};
+static PowerApi& power_api() {
+    static PowerApi p;
+    return p;
+}
+// 知名方案 GUID（locale 无关，免去 PowerReadFriendlyName 的本地化问题）
+static const GUID kGuidBalanced = {0x381b4222, 0xf694, 0x41f0,
+                                   {0x96, 0x85, 0xff, 0x5b, 0xb2, 0x60, 0xdf, 0x2e}};
+static const GUID kGuidHighPerf = {0x8c5e7fda, 0xe8bf, 0x4a96,
+                                   {0x9a, 0x85, 0xa6, 0xe2, 0x3a, 0x8c, 0x63, 0x5c}};
+static const GUID kGuidSaver = {0xa1841308, 0x3541, 0x4fab,
+                                {0xbc, 0x81, 0xf7, 0x15, 0x56, 0xf2, 0x0b, 0x4a}};
+static const GUID kGuidUltimate = {0xe9a42b02, 0xd5df, 0x448d,
+                                   {0xaa, 0x00, 0x03, 0xf1, 0x47, 0x49, 0xeb, 0x61}};
+
+json power_scheme_json() {
+    json j;
+    auto& P = power_api();
+    j["supported"] = P.ok;
+    if (!P.ok) return j;
+    j["is_high"] = false;
+    GUID* g = nullptr;
+    if (P.get(nullptr, &g) != 0 || !g) return j;
+    j["is_high"] = IsEqualGUID(*g, kGuidHighPerf) || IsEqualGUID(*g, kGuidUltimate);
+    std::string name = "custom";
+    if (IsEqualGUID(*g, kGuidHighPerf) || IsEqualGUID(*g, kGuidUltimate)) name = "high";
+    else if (IsEqualGUID(*g, kGuidBalanced)) name = "balanced";
+    else if (IsEqualGUID(*g, kGuidSaver)) name = "saver";
+    j["scheme"] = name;
+    LocalFree(g);
+    return j;
+}
+
+void handle_power_scheme(const http::Request&, http::Response* r, http::Stream*) {
+    send_json(r, power_scheme_json());
+}
+
+void handle_power_high(const http::Request&, http::Response* r, http::Stream*) {
+    auto& P = power_api();
+    if (!P.ok) {
+        json j;
+        j["ok"] = false;
+        j["error"] = "unsupported platform";
+        send_json(r, j);
+        return;
+    }
+    const DWORD rc = P.set(nullptr, &kGuidHighPerf);
+    json j = power_scheme_json();
+    j["ok"] = (rc == 0);
+    if (rc != 0)
+        j["error"] = "PowerSetActiveScheme rc=" + std::to_string(rc);
+    else
+        log_event("电源方案已切换为「高性能」（一键设置）");
+    send_json(r, j);
+}
+
 void handle_status(const http::Request& q, http::Response* r, http::Stream*) {
     json j = status_json();
 #ifdef _WIN32
@@ -2868,6 +2945,8 @@ int main(int argc, char** argv) {
 #endif
 
     g_srv = &g_server;
+    g_server.on("GET", "/api/power_scheme", handle_power_scheme);
+    g_server.on("POST", "/api/power_high", handle_power_high);
     g_server.on("GET", "/api/config", handle_config_get);
     g_server.on("POST", "/api/config", handle_config_post);
     g_server.on("GET", "/api/status", handle_status);
