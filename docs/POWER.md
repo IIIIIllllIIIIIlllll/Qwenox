@@ -122,7 +122,8 @@ dump 两次 → GPU 满载（跑推理或 hipMemset 循环）dump 两次，看�
   （高性能）后，闲置 4 分钟首个请求立即 37.2 tok/s，无 ramp。
 
 各平台旋钮：Windows 用上面的高性能 GUID（`381b4222-f694-41f0-9685-ff5bb260df2e`
-回平衡）；Linux 用 `amd_pstate=active` + performance governor，并用
+回平衡），或直接用**网页启动器（8729）顶栏的一键「电源 → 设为高性能」**
+（Windows 专属，已是高性能时不显示；走 PowrProf API，无需管理员权限）；Linux 用 `amd_pstate=active` + performance governor，并用
 `echo high > /sys/class/drm/card*/device/power_dpm_force_performance_level`
 直接锁 GPU DPM（效果更强的等价旋钮，`auto` 恢复）。
 

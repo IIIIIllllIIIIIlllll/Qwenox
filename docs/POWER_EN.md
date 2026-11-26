@@ -47,6 +47,10 @@ echo high | sudo tee /sys/class/drm/card*/device/power_dpm_force_performance_lev
 direct Linux equivalent of the Windows High performance scheme (even
 stronger). Use `auto` to restore.
 
+**Shortcut (Windows)**: the web launcher's header has a one-click
+"Power → Set High Performance" button (hidden when already on High
+performance or on Linux; uses the PowrProf API, no admin rights needed).
+
 ## Secondary: PLE cold faults after an engine restart
 
 Unrelated to the power ramp but in the same time window: after a **process
