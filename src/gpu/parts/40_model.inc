@@ -7927,6 +7927,19 @@ struct GpuModel {
           k_moe_group2<<<1, 256, 0, g_str>>>(d_topidsb, P, k, 16, d_gx_exp, d_gx_n, d_gx_sl, d_gx_ng);
         else
           k_moe_group<<<1, 128, 0, g_str>>>(d_topidsb, P, k, 16, d_gx_exp, d_gx_n, d_gx_sl, d_gx_ng);
+        // QWENOX_MOE_DDBG (diagnostic): per-layer distinct-expert count, so the
+        // grouped-down dedup's expected saving can be sized before writing it.
+        // The blocking readback is capture-illegal: skip while vgraph captures.
+        static const bool ddbg = getenv("QWENOX_MOE_DDBG") != nullptr;
+        if (ddbg && !vg_capturing_) {
+          static int sum_ng = 0, cnt = 0;
+          int ng = 0;
+          CK(hipMemcpy(&ng, d_gx_ng, 4, hipMemcpyDeviceToHost));
+          sum_ng += ng;
+          if (++cnt % 48 == 0)
+            fprintf(stderr, "[moe-ddbg] P=%d avg distinct %.1f of %d slots (48 layers)\n",
+                    P, (double)sum_ng / 48, P * k), sum_ng = 0;
+        }
         const uint64_t pps = (uint64_t)mid;  // (2*mid + 1) / 2 row pairs
         k_q4cp_gemv_ggx<2, 4><<<dim3((unsigned)((pps + 15) / 16), (unsigned)(P * k)), 512, 0, g_str>>>(
             cg.codes, cg.scales, cg.cb, d_eyb, d_guvb, (uint64_t)2 * mid, gu.cols, gu.scale_stride,
@@ -7944,11 +7957,26 @@ struct GpuModel {
       k_i4r_mid<float, false><<<P * k, mid_threads, 0, g_str>>>(d_guvb, 2 * mid, d_hidb, mid,
                                                                 gu.svh, dn.suh, mid);
       if (direct_down) {
+        // QWENOX_MOE_GDX=0 opt-out: grouped down_proj reusing the up phase's
+        // expert groups — each distinct expert's down weights are read once
+        // (see k_q4cp_gemv_gdx_h16; bit-identical to the fused kernel).
+        static const bool moe_gdx = !env_zero("QWENOX_MOE_GDX");
+        if (moe_gdx && moe_gg_on() && d_gx_exp && P >= 2 && P <= 16 && P * k <= 256) {
+          const uint64_t row_pairs = (d + 1) / 2;
+          k_q4cp_gemv_gdx_h16<10, 2, 4><<<dim3((unsigned)((row_pairs + 15) / 16), (unsigned)(P * k)),
+                                           512, 0, g_str>>>(
+              cd.codes, cd.scales, cd.cb, d_hidb, d_guvb, (uint64_t)d, dn.cols,
+              dn.scale_stride, (uint64_t)mid, d_gx_exp, d_gx_n, d_gx_sl, d_gx_ng);
+          const uint64_t n2 = (uint64_t)P * d;
+          k_topk_wsum<10><<<(unsigned)((n2 + 255) / 256), 256, 0, g_str>>>(
+              d_guvb, d_topwb, acc, (uint64_t)d, 16, (uint64_t)d, P);
+        } else {
         const uint64_t row_pairs = (d + 1) / 2, warps_per_block = 128 / 32;
         k_q4cp_gemv_gd_topk_h16<10, 2><<<
             (unsigned)(((uint64_t)P * row_pairs + warps_per_block - 1) / warps_per_block), 128, 0,
             g_str>>>(cd.codes, cd.scales, cd.cb, d_hidb, acc, d_topidsb, d_topwb, (uint64_t)d,
                      dn.cols, dn.scale_stride, (uint64_t)mid, P, 16, (uint64_t)d);
+        }
       } else {
         const uint64_t pairs2 = (uint64_t)P * k * ((d + 1) / 2);
         k_q4cp_gemv_gd<2><<<(unsigned)((pairs2 + 15) / 16), 512, 0, g_str>>>(

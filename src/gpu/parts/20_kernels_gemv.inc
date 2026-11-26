@@ -2373,6 +2373,111 @@ __global__ void k_q4cp_gemv_gd_topk_h16(
   }
 }
 
+// Grouped small-P verify down_proj (QWENOX_MOE_GDX, default on): the down
+// weights of a verify batch's duplicate experts are read once per group
+// instead of once per slot (groups from k_moe_group2, shared with the up
+// phase). Per-(slot,row) arithmetic replicates k_q4cp_gemv_gd_topk_h16
+// exactly — same 16-lane half-warp mapping, same x layout, same sequential
+// i/j dot order, same shfl reduce tree, fp32 acc. Slot partials ("pairs")
+// land in a [slot][rows] fp32 buffer; the fused kernel's epilogue then runs
+// as k_topk_wsum (router order, fp32), so the result is bit-identical.
+template <int KPT, int GSH, int TM>
+__global__ __launch_bounds__(512) void k_q4cp_gemv_gdx_h16(
+    const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales,
+    const float* __restrict__ cb, const float* __restrict__ xs,
+    float* __restrict__ pairs, uint64_t rows_per, uint64_t cols,
+    uint64_t scale_stride, uint64_t x_stride,
+    const int* __restrict__ gexp, const int* __restrict__ gnum,
+    const int* __restrict__ gsl, const int* __restrict__ ngrp) {
+  const int g = blockIdx.y;
+  if (g >= *ngrp) return;
+  __shared__ float cbf[16];
+  if (threadIdx.x < 16) cbf[threadIdx.x] = cb[threadIdx.x];
+  __syncthreads();
+  const uint64_t row_pairs = (rows_per + 1) / 2;
+  const uint64_t rp =
+      (uint64_t)blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
+  if (rp >= row_pairs) return;
+  const int half = (threadIdx.x % warpSize) / 16;
+  const int lane = threadIdx.x & 15;
+  const uint64_t r = rp * 2 + half;
+  if (r >= rows_per) return;
+  const uint64_t row = (uint64_t)gexp[g] * rows_per + r;
+  const uint8_t* rc = codes + row * (cols / 2);
+  const uint8_t* rs = scales + row * scale_stride;
+  const int ns = gnum[g];
+  const int* sl = gsl + g * 16;
+  for (int b0 = 0; b0 < ns; b0 += TM) {
+    const int nb = min(TM, ns - b0);
+    float acc[TM];
+#pragma unroll
+    for (int q = 0; q < TM; q++) acc[q] = 0.f;
+    for (uint64_t gi = lane; gi < cols / 32; gi += 16) {
+      const uint4 pk = *(const uint4*)(rc + gi * 16);
+      const float sc = __half2float(*(const __half*)(rs + (gi >> GSH) * 2));
+      uint32_t w[4] = {pk.x, pk.y, pk.z, pk.w};
+      float c[32];
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        uint32_t v = w[i];
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+          c[i * 8 + j] = cbf[v & 0xf];
+          v >>= 4;
+        }
+      }
+#pragma unroll
+      for (int q = 0; q < TM; q++) {
+        if (q < nb) {
+          const float* xg = xs + (size_t)sl[b0 + q] * x_stride + gi * 32;
+          float xv[32];
+#pragma unroll
+          for (int i = 0; i < 8; i++) {
+            float4 t = *(const float4*)(xg + i * 4);
+            xv[i * 4] = t.x;
+            xv[i * 4 + 1] = t.y;
+            xv[i * 4 + 2] = t.z;
+            xv[i * 4 + 3] = t.w;
+          }
+          float a = 0.f;
+#pragma unroll
+          for (int i = 0; i < 4; i++)
+#pragma unroll
+            for (int j = 0; j < 8; j++) a += c[i * 8 + j] * xv[i * 8 + j];
+          acc[q] += a * sc;
+        }
+      }
+    }
+#pragma unroll
+    for (int q = 0; q < TM; q++)
+      if (q < nb)
+        for (int off = 8; off > 0; off >>= 1)
+          acc[q] += __shfl_down_sync(~0ull, acc[q], off, 16);
+    if (lane == 0)
+#pragma unroll
+      for (int q = 0; q < TM; q++)
+        if (q < nb) pairs[(size_t)sl[b0 + q] * rows_per + r] = acc[q];
+  }
+}
+
+// Epilogue of k_q4cp_gemv_gd_topk_h16 as a standalone pass over grouped
+// pairs: out[tok][r] = sum_s ws[s] * pairs[tok*KPT+s][r], fp32, router order.
+template <int KPT>
+__global__ void k_topk_wsum(const float* __restrict__ pairs,
+                            const float* __restrict__ ws, float* __restrict__ out,
+                            uint64_t rows_per, int id_stride, uint64_t out_stride,
+                            int P) {
+  const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= (uint64_t)P * rows_per) return;
+  const int tok = (int)(i / rows_per);
+  const uint64_t r = i % rows_per;
+  float y = 0.f;
+#pragma unroll
+  for (int s = 0; s < KPT; s++)
+    y += ws[tok * id_stride + s] * pairs[((size_t)tok * KPT + s) * rows_per + r];
+  out[(size_t)tok * out_stride + r] = y;
+}
+
 // --- PLE conv (dilation 3, k=4): ring 9 x 10240; tap j pairs t-(3-j)*3
 __global__ void k_ple_conv(const float* __restrict__ ring,
                            const int* __restrict__ d_ringpos,
