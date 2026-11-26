@@ -12814,19 +12814,32 @@ struct GpuModel {
       spec_snap = true;
       vsnap_row0_ = 0;  // D2-S2a: serial verify always packs at row 0
       static const bool svf = !env_zero("QWENOX_SVF");
+      // P3-Bs: graph replay of the same verify pass (logits land in
+      // d_logits_b); eager fallback while the per-P graph warms or misfits.
+      // svf is the default (final=false); QWENOX_SVF=0 (final=true) stays eager.
+      const bool vgraphed = svf && verify_graph_sample_try(vt, q + 1);
       // Sampling below uses batched logits; final=true adds lm_head+argmax+D2H.
-      prefill_batch(vt, q + 1, !svf, true);
+      if (!vgraphed) prefill_batch(vt, q + 1, !svf, true);
       spec_snap = false;
       bool smg_v = false;
       if (smg) {
         const int pfx = sms_prefix_upload(sampler, drafts.data(), 0, g + 1);
         if (pfx >= 0) {
-          batch_logits_device(g + 1);
+          if (!vgraphed) batch_logits_device(g + 1);
           smg_v = sms_topk_rows(d_logits_b, g_cfg.vocab, g + 1, sampler.top_k,
                                 pfx > 0, sms_out_ids.data(), sms_out_vals.data());
         }
       }
-      if (!smg_v) batch_logits(g + 1, verify_logits);
+      if (!smg_v) {
+        if (vgraphed) {
+          verify_logits.resize((size_t)(g + 1) * g_cfg.vocab);
+          CK(hipMemcpy(verify_logits.data(), d_logits_b,
+                       verify_logits.size() * sizeof(float),
+                       hipMemcpyDeviceToHost));
+        } else {
+          batch_logits(g + 1, verify_logits);
+        }
+      }
       const int smk = sampler.top_k;
 
       Sampler target_view = sampler;
@@ -13564,17 +13577,30 @@ struct GpuModel {
         if (!pooled) {
           vsnap_row0_ = 0;
           static const bool svf = !env_zero("QWENOX_SVF");
+          // P3-Bs: graph replay of the same verify pass (logits land in
+          // d_logits_b); eager fallback while the per-P graph warms or
+          // misfits. svf default (final=false); QWENOX_SVF=0 stays eager.
+          const bool vgraphed = svf && verify_graph_sample_try(vt, q + 1);
           // Sampling below uses batched logits; final=true adds lm_head+argmax+D2H.
-          prefill_batch(vt, q + 1, !svf, true);
+          if (!vgraphed) prefill_batch(vt, q + 1, !svf, true);
           if (smg) {
             const int pfx = sms_prefix_upload(sampler, drafts.data(), 0, g + 1);
             if (pfx >= 0) {
-              batch_logits_device(g + 1);
+              if (!vgraphed) batch_logits_device(g + 1);
               smg_v = sms_topk_rows(d_logits_b, g_cfg.vocab, g + 1, sampler.top_k,
                                     pfx > 0, sms_out_ids.data(), sms_out_vals.data());
             }
           }
-          if (!smg_v) batch_logits(g + 1, verify_logits);
+          if (!smg_v) {
+            if (vgraphed) {
+              verify_logits.resize((size_t)(g + 1) * g_cfg.vocab);
+              CK(hipMemcpy(verify_logits.data(), d_logits_b,
+                           verify_logits.size() * sizeof(float),
+                           hipMemcpyDeviceToHost));
+            } else {
+              batch_logits(g + 1, verify_logits);
+            }
+          }
         }
         spec_snap = false;
         const int smk = sampler.top_k;
@@ -13920,25 +13946,34 @@ struct GpuModel {
 
   bool vgraph_ok(int P, int base) {
     static const bool off = env_zero("QWENOX_VGRAPH");
-    if (off || !vbase_on()) return false;
-    if ((dbg && !getenv("QWENOX_VGRAPH_DBG")) || perf || g_kprof_on)
+    static const bool why = getenv("QWENOX_VGRAPH_WHY") != nullptr;
+    auto rej = [&](const char* what) {
+      if (why)
+        fprintf(stderr, "vgraph_ok: reject P=%d base=%d: %s\n", P, base, what);
       return false;
-    if (P < 2 || P > kVGMaxP || base < g_index_first || base + P > maxctx) return false;
+    };
+    if (off || !vbase_on()) return rej("off/vbase");
+    if ((dbg && !getenv("QWENOX_VGRAPH_DBG")) || perf || g_kprof_on)
+      return rej("dbg/perf/kprof");
+    if (P < 2 || P > kVGMaxP || base < g_index_first || base + P > maxctx)
+      return rej("P/base range");
     if (mrope_active_ || cut_abs >= 0 || !cut_plan_.empty() || qsa_dense ||
         qsa_loop || qsa_wmma6)
-      return false;
-    if (ple_on && ple_loop) return false;
-    if (ngram_verify_active || ws_lent_ || prog_total > 0) return false;
+      return rej("mrope/cut/qsa-flags");
+    if (ple_on && ple_loop) return rej("ple_loop");
+    if (ngram_verify_active || ws_lent_ || prog_total > 0)
+      return rej("ngram/lent/prog");
     // graphs bake this slot's pointers (d_ptab, d_R, ...): single-slot only
-    if (nslots > 1) return false;
-    if (injp_cur >= 0 || !hcw_site_.empty()) return false;
+    if (nslots > 1) return rej("nslots");
+    if (injp_cur >= 0 || !hcw_site_.empty()) return rej("injp/hcw");
     if (getenv("QWENOX_VCT_CHECK") || getenv("QWENOX_ATTN_HASH") ||
         getenv("QWENOX_VCT_TAILZERO"))
-      return false;
-    if (cvec_.probe_on()) return false;  // probe 读回只走 eager 路径
+      return rej("vct-env");
+    if (cvec_.probe_on()) return rej("cvec-probe");
     // D1b mid-chunk GPU lending is not part of the graphs (production has
     // moe_lt on, which already makes the yield a no-op).
-    if (ws_ok_ && borrow_query_fn && !moe_lt && P > conc_rmax_) return false;
+    if (ws_ok_ && borrow_query_fn && !moe_lt && P > conc_rmax_)
+      return rej("borrow-ws");
     return true;
   }
 
@@ -14177,7 +14212,8 @@ struct GpuModel {
     ple_ringpos = (base + P) % 9;
     CK(hipMemcpyAsync(d_pos, &pos, 4, hipMemcpyHostToDevice, g_str));
     CK(hipMemcpyAsync(d_ringpos, &ple_ringpos, 4, hipMemcpyHostToDevice, g_str));
-    CK(hipMemcpy(vout, d_argmax_arr, (size_t)P * 4, hipMemcpyDeviceToHost));
+    if (vout)  // nullptr (sampled verify): logits stay in d_logits_b, skip the sync
+      CK(hipMemcpy(vout, d_argmax_arr, (size_t)P * 4, hipMemcpyDeviceToHost));
   }
 
   // verify_graph_round_try: graph fast path for MTP verify; false -> caller
@@ -14208,6 +14244,36 @@ struct GpuModel {
       }
     }
     vgraph_run(tokens, base, vout);
+    return true;
+  }
+
+  // Sampled-verify variant of the graph fast path (P3-Bs). The per-P graph
+  // sets are shared with the greedy path: their tail already computes the
+  // batch logits into d_logits_b (the baked argmax is simply unused), so the
+  // same kernels serve both loops. The blocking argmax readback is skipped;
+  // the caller's sampling reads d_logits_b on device (top-k) or D2H-copies it.
+  bool verify_graph_sample_try(const std::vector<int>& tokens, int base) {
+    const int P = (int)tokens.size();
+    if (!vgraph_ok(P, base)) return false;
+    VGraph& G = vg_[P - 2];
+    if (G.nseg < 0) return false;
+    if (!G.nseg) {
+      if (vg_warm_[P - 2]++ < 1) return false;
+      if (!vgraph_capture(P, base)) {
+        G.nseg = -1;
+        fprintf(stderr, "verify graphs: capture failed for P=%d, staying eager\n",
+                P);
+        return false;
+      }
+      fprintf(stderr, "verify graphs captured (P=%d, %d segments)\n", P, G.nseg);
+      crashdiag::note("verify graphs captured P=%d base=%d", P, base);
+      if (getenv("QWENOX_VGRAPH_NOLAUNCH")) {
+        for (int s = 0; s < G.nseg; s++) (void)hipGraphExecDestroy(G.seg[s]);
+        G.nseg = -1;
+        return false;
+      }
+    }
+    vgraph_run(tokens, base, nullptr);
     return true;
   }
 
