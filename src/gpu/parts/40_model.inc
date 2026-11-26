@@ -1010,6 +1010,11 @@ struct GpuModel {
   std::chrono::steady_clock::time_point prog_snap_last;
   int64_t prog_snap_last_est = 0;
   hipEvent_t prog_ev[64] = {};  // per-layer completion probes (DisableTiming)
+  // 进度事件跨 chunk 复用：stale 的完成状态会让"已完成层数"在块边界虚高再
+  // 回落，进度行打印负的瞬时 tok/s（16384 块下 -9558 tok/s 实测）。按 chunk
+  // 递增世代号，prog_print 只认当前 chunk 记录的事件。
+  unsigned prog_gen = 0;
+  unsigned prog_ev_gen[64] = {};
   int live_spec_rounds = 0;
   int live_spec_commits = 0;
   int live_spec_proposed = 0;
@@ -8725,7 +8730,8 @@ struct GpuModel {
     if (siv < 0.2 && iv < 1.0) return;
     int done = -1;
     for (int k = g_cfg.layers - 1; k >= 0; --k)
-      if (prog_ev[k] && hipEventQuery(prog_ev[k]) == hipSuccess) {
+      if (prog_ev[k] && prog_ev_gen[k] == prog_gen &&
+          hipEventQuery(prog_ev[k]) == hipSuccess) {
         done = k;
         break;
       }
@@ -8756,6 +8762,7 @@ struct GpuModel {
     if (!prog_ev[l])
       CK(hipEventCreateWithFlags(&prog_ev[l], hipEventDisableTiming));
     CK(hipEventRecord(prog_ev[l], g_str));
+    prog_ev_gen[l] = prog_gen;
     prog_print(P);
   }
   // The layer enqueue is fully asynchronous: every probe above fires within
@@ -9214,6 +9221,7 @@ struct GpuModel {
       exit(1);
     }
     moe_dump_base_ = base;
+    if (prog_total > 0) prog_gen++;  // 本 chunk 的进度事件属新世代（见 prog_ev_gen）
     {  // QWENOX_LT_FORGET=1 (diagnostic): every chunk re-pays the hipBLASLt
        // per-P algo miss, as a serving request with a new prompt length does.
       static const bool lt_forget = getenv("QWENOX_LT_FORGET") != nullptr;
