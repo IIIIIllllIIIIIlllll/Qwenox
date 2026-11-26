@@ -522,6 +522,19 @@ bool start(const std::string& root, const svcconf::Conf& conf, std::string* err)
     // 0 = 引擎按模式自选：不设（并删掉外部残留）
     SetEnvironmentVariableA("QWENOX_SPEC_GAMMA",
                             mtp_gamma ? std::to_string(mtp_gamma).c_str() : nullptr);
+    // 草稿门控与自适应 γ 参数（手改 service.conf，不进设置面板）：键存在才
+    // 设置对应的 QWENOX_* 变量——本文件给了就以本文件为准；没给则完全不动
+    // 外部环境（外部 export 的同名 QWENOX_ 变量仍然生效），引擎内置默认兜底。
+    // 这四个键是性能敏感项：SAMPLED_GATE / SPEC_CONF / GREEDY_CONF 为 0 时
+    // 关闭置信度截断、草稿长度交给 GammaCtl；SPEC_ADAPT_R 是 GammaCtl 的
+    // 边际成本系数（实测轮成本 固定 41.8ms + 5.4ms/γ → r≈0.12）。
+    for (const auto& kv : {std::pair<const char*, const char*>{"SAMPLED_GATE", "QWENOX_SAMPLED_GATE"},
+                           {"SPEC_CONF", "QWENOX_SPEC_CONF"},
+                           {"GREEDY_CONF", "QWENOX_GREEDY_CONF"},
+                           {"SPEC_ADAPT_R", "QWENOX_SPEC_ADAPT_R"}}) {
+        const std::string v = svcconf::cfg(conf, kv.first, "");
+        if (!v.empty()) SetEnvironmentVariableA(kv.second, v.c_str());
+    }
     SetEnvironmentVariableA("QWENOX_KV_PAGED", kv_paged ? "1" : nullptr);
     SetEnvironmentVariableA("QWENOX_KV_POOL_TOKENS",
                             kv_paged && kv_pool_tokens
