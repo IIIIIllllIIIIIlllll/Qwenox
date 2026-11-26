@@ -105,9 +105,23 @@ template <typename TG, bool OUTH>
 __global__ __launch_bounds__(512) void k_i4r_mid(const TG* __restrict__ guv, uint64_t gs,
                                                  void* out, uint64_t os,
                                                  const float* __restrict__ svh_gu,
-                                                 const float* __restrict__ suh_dn, int mid) {
+                                                 const float* __restrict__ suh_dn, int mid,
+                                                 int n_routed = 0,
+                                                 const float* __restrict__ se_guv = nullptr,
+                                                 float* __restrict__ se_hid = nullptr,
+                                                 int se_mid = 0) {
   __shared__ float s[2048];
   const int slot = blockIdx.x;
+  if (n_routed > 0 && slot >= n_routed) {
+    if (se_guv && se_hid && threadIdx.x < 256) {
+      const int i = (slot - n_routed) * 256 + threadIdx.x;
+      if (i < se_mid) {
+        const float a = se_guv[i];
+        se_hid[i] = a / (1.f + expf(-a)) * se_guv[se_mid + i];
+      }
+    }
+    return;
+  }
   const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
   {
     const TG* z = guv + (size_t)slot * gs + w * 128;
@@ -1400,6 +1414,76 @@ __global__ __launch_bounds__(1024) void k_hcf_wn(const uint8_t* __restrict__ wq,
   }
 }
 
+// k_hcf_wn + fused k_moe_post on the idle waves (8..27) before the first barrier.
+template <bool kNorm>
+__global__ __launch_bounds__(1024) void k_hcf_wn_moe(
+    const uint8_t* __restrict__ wq, int C, int st, int gps, int ns,
+    const float* __restrict__ rh_old, float* __restrict__ R,
+    const float* __restrict__ moe_acc, const float* __restrict__ dn_svh,
+    const float* __restrict__ se_ey, const float* __restrict__ se_sg,
+    const float* __restrict__ nw, float* __restrict__ rh_new,
+    float* __restrict__ w4, int d, float eps) {
+  const int b = blockIdx.x, tid = threadIdx.x, wv = tid >> 5, li = tid & 31;
+  __shared__ float sp[32];
+  __shared__ float sm[1024];
+  __shared__ float sy[2560];
+  if (wv < ns) {
+    const int g0 = wv * gps, g1 = min(C >> 6, g0 + gps);
+    const float a = hcf::sk_lane(wq + (size_t)b * st, rh_old, C, g0, g1, li);
+    if (li == 0) sp[wv] = a;
+  } else if (wv >= 8 && wv < 28) {
+    const int eb = wv - 8;
+    if (eb < (d >> 7)) {
+      float v[4];
+#pragma unroll
+      for (int j = 0; j < 4; j++) v[j] = moe_acc[eb * 128 + j * 32 + li] * 1.f;
+      hv2::fwht128(v[0], v[1], v[2], v[3], li);
+      const float s = 1.f / (1.f + expf(-se_sg[0]));
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        const int i = eb * 128 + j * 32 + li;
+        float o = __fmul_rn(__fmul_rn(v[j], hv2::kRs128), dn_svh[i]);
+        o = fmaf(s, se_ey[i], o);
+        sy[i] = o;
+      }
+    }
+  }
+  __syncthreads();
+  float w = sp[0];
+  for (int s = 1; s < ns; s++) w += sp[s];
+  if (tid == 0) w4[b] = w;
+  const float s2 = 2.f / (1.f + expf(-w * 0.25f));
+  float* Rb = R + (size_t)b * d;
+  float rv[4];
+  float ss = 0.f;
+#pragma unroll
+  for (int k = 0; k < 4; k++) {
+    const int i = tid + k * 1024;
+    if (i < d) {
+      float v = Rb[i];
+      v += s2 * sy[i];
+      Rb[i] = v;
+      rv[k] = v;
+      ss += v * v;
+    }
+  }
+  if (!kNorm) return;
+  sm[tid] = ss;
+  __syncthreads();
+  for (int off = 512; off > 0; off >>= 1) {
+    if (tid < off) sm[tid] += sm[tid + off];
+    __syncthreads();
+  }
+  const float inv = rsqrtf(sm[0] / d + eps);
+  const float* wg = nw + (size_t)b * d;
+  float* og = rh_new + (size_t)b * d;
+#pragma unroll
+  for (int k = 0; k < 4; k++) {
+    const int i = tid + k * 1024;
+    if (i < d) og[i] = rv[k] * inv * (1.f + wg[i]);
+  }
+}
+
 // mix-down GEMV (R x C split-K, as k_q6g64_gemv_sk<1,float>) + the skred sum
 // (last-arriving K slice of each 8-row tile, slices in order) + silu(v/4).
 __global__ __launch_bounds__(256) void k_hcf_down(const uint8_t* __restrict__ wq,
@@ -1748,8 +1832,58 @@ __global__ __launch_bounds__(512) void k_moe_pre(const uint16_t* __restrict__ rw
                                                  const float* __restrict__ suh,
                                                  float* __restrict__ xr, int n,
                                                  int* __restrict__ ids, float* __restrict__ ws,
-                                                 int* __restrict__ cnt, VizTap vt) {
+                                                 int* __restrict__ cnt, VizTap vt,
+                                                 const uint16_t* __restrict__ seg_w = nullptr,
+                                                 float* __restrict__ seg_out = nullptr,
+                                                 bool seg_rowfast = false) {
   const int lane = threadIdx.x & 31, wv = threadIdx.x >> 5;
+  if (seg_w && blockIdx.x == 32) {
+    if (seg_rowfast) {
+      __shared__ float red[8];
+      float acc = 0.f;
+      if (threadIdx.x < 256) {
+        for (uint64_t c = (uint64_t)threadIdx.x * 8; c < (uint64_t)cols; c += 256 * 8) {
+          uint4 pk = *(const uint4*)(seg_w + c);
+          float4 xa = *(const float4*)(x + c);
+          float4 xb = *(const float4*)(x + c + 4);
+          const uint32_t pw[4] = {pk.x, pk.y, pk.z, pk.w};
+          const float xv[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+#pragma unroll
+          for (int j = 0; j < 4; j++) {
+            acc += __uint_as_float(pw[j] << 16) * xv[2 * j];
+            acc += __uint_as_float(pw[j] & 0xFFFF0000u) * xv[2 * j + 1];
+          }
+        }
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(~0ull, acc, off);
+        if (lane == 0) red[wv] = acc;
+      }
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        float t = 0.f;
+        for (int i = 0; i < 8; i++) t += red[i];
+        seg_out[0] = t;
+      }
+    } else if (wv == 0) {
+      float acc = 0.f;
+      for (uint64_t c = lane * 8; c < (uint64_t)cols; c += 32 * 8) {
+        uint4 pk = *(const uint4*)(seg_w + c);
+        float4 xa = *(const float4*)(x + c);
+        float4 xb = *(const float4*)(x + c + 4);
+        const uint16_t* h = (const uint16_t*)&pk;
+        float xv[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+          uint32_t u = (uint32_t)h[j] << 16;
+          float wf;
+          memcpy(&wf, &u, 4);
+          acc += wf * xv[j];
+        }
+      }
+      for (int off = 16; off > 0; off >>= 1) acc += __shfl_down(acc, off, 32);
+      if (lane == 0) seg_out[0] = acc;
+    }
+    return;
+  }
   {
     const uint64_t row = (uint64_t)blockIdx.x * 16 + wv;
     if (row < 512) {  // grid 32 x 16 waves = the 512 router rows
@@ -1795,7 +1929,8 @@ __global__ __launch_bounds__(512) void k_moe_pre(const uint16_t* __restrict__ rw
   __shared__ int s_last;
   __threadfence();
   __syncthreads();
-  if (threadIdx.x == 0) s_last = atomicAdd(cnt, 1) == (int)gridDim.x - 1;
+  const int n_rt_blk = seg_w ? (int)gridDim.x - 1 : (int)gridDim.x;
+  if (threadIdx.x == 0) s_last = atomicAdd(cnt, 1) == n_rt_blk - 1;
   __syncthreads();
   if (!s_last) return;
   __threadfence();
@@ -1894,5 +2029,192 @@ __global__ __launch_bounds__(256) void k_moe_post(const float* __restrict__ acc,
     float o = __fmul_rn(__fmul_rn(v[j], hv2::kRs128), svh[i]);
     o = fmaf(s, ey[i], o);
     out[i] = o;
+  }
+}
+
+// Fused P=1 routed down_proj (k_q4cp_gemv_gd_topk_h16<10, 2>, blocks 0..dn_blocks-1)
+// + shared_expert down_proj (k_ht_gemv<1, float>, blocks dn_blocks..end).
+// Both branches run at 256 threads/block and <=4 KiB LDS (zero occupancy loss).
+__global__ __launch_bounds__(256) void k_moe_dn_se(
+    int dn_blocks, const uint8_t* __restrict__ dn_codes,
+    const uint8_t* __restrict__ dn_scales, const float* __restrict__ dn_cb,
+    const float* __restrict__ dn_xs, float* __restrict__ dn_out,
+    const int* __restrict__ ids, const float* __restrict__ ws,
+    uint64_t rows_per, uint64_t dn_cols, uint64_t dn_scale_stride,
+    uint64_t x_stride,
+    const uint8_t* __restrict__ se_codes, const float* __restrict__ se_suh,
+    const float* __restrict__ se_svh, const float* __restrict__ se_x,
+    float* __restrict__ se_y, int se_nty, int se_ks, int se_O, int se_K,
+    int se_nrows, int se_tpb, int se_tpc, float* __restrict__ zs,
+    int* __restrict__ cnt) {
+  extern __shared__ float hv2_lds[];
+  if ((int)blockIdx.x < dn_blocks) {
+    if (threadIdx.x < 16) hv2_lds[threadIdx.x] = dn_cb[threadIdx.x];
+    __syncthreads();
+    const uint64_t row_pairs = (rows_per + 1) / 2;
+    const uint64_t gw = (uint64_t)blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (gw >= row_pairs) return;
+    const int half = (threadIdx.x & 31) >> 4;
+    const int lane = threadIdx.x & 15;
+    const uint64_t r = gw * 2 + half;
+    if (r >= rows_per) return;
+    float acc[10] = {};
+#pragma unroll
+    for (int s = 0; s < 10; s++) {
+      const uint64_t row = (uint64_t)ids[s] * rows_per + r;
+      const uint8_t* rc = dn_codes + row * (dn_cols / 2);
+      const uint8_t* rs = dn_scales + row * dn_scale_stride;
+      const float* x = dn_xs + (size_t)s * x_stride;
+      for (uint64_t g = lane; g < dn_cols / 32; g += 16) {
+        const uint4 pk = *(const uint4*)(rc + g * 16);
+        const float sc = __half2float(*(const __half*)(rs + (g >> 2) * 2));
+        const float* xg = x + g * 32;
+        float xv[32];
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+          const float4 t = *(const float4*)(xg + i * 4);
+          xv[i * 4] = t.x;
+          xv[i * 4 + 1] = t.y;
+          xv[i * 4 + 2] = t.z;
+          xv[i * 4 + 3] = t.w;
+        }
+        const uint32_t w[4] = {pk.x, pk.y, pk.z, pk.w};
+        float a = 0.f;
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+          uint32_t v = w[i];
+#pragma unroll
+          for (int j = 0; j < 8; j++) {
+            a += hv2_lds[v & 0xf] * xv[i * 8 + j];
+            v >>= 4;
+          }
+        }
+        acc[s] += a * sc;
+      }
+    }
+#pragma unroll
+    for (int s = 0; s < 10; s++)
+      for (int off = 8; off > 0; off >>= 1)
+        acc[s] += __shfl_down_sync(~0ull, acc[s], off, 16);
+    if (lane == 0) {
+      float y = 0.f;
+#pragma unroll
+      for (int s = 0; s < 10; s++) y += ws[s] * acc[s];
+      dn_out[r] = y;
+    }
+    return;
+  }
+
+  float* xh = hv2_lds;
+  float* zl = hv2_lds;
+  __shared__ int s_last;
+  const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+  const int sb = (int)blockIdx.x - dn_blocks;
+  const int ty = sb % se_nty, kz = sb / se_nty;
+  const int ntx = se_K >> 7;
+  const int tx0 = kz * se_tpb;
+  const int nt = min(ntx, tx0 + se_tpb) - tx0;
+
+  float acc[8];
+#pragma unroll
+  for (int q = 0; q < 8; q++) acc[q] = 0.f;
+  const int h = lane >> 4;
+  const uint8_t* base = se_codes + ((size_t)ty * ntx + tx0) * 8192 + w * 1024 + lane * 4;
+  uint32_t nxt[8];
+#pragma unroll
+  for (int q = 0; q < 8; q++) nxt[q] = *(const uint32_t*)(base + q * 128);
+  for (int t = 0; t < nt; t++) {
+    const int tc = t % se_tpc;
+    if (tc == 0) {
+      const int nc = min(se_tpc, nt - t);
+      if (t) __syncthreads();
+      for (int u = w; u < nc; u += 8) {
+        const int col0 = (tx0 + t + u) * 128;
+        float v[4];
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          const int i = col0 + j * 32 + lane;
+          v[j] = se_x[i] * se_suh[i];
+        }
+        hv2::fwht128(v[0], v[1], v[2], v[3], lane);
+#pragma unroll
+        for (int j = 0; j < 4; j++) xh[u * 128 + j * 32 + lane] = v[j] * hv2::kRs128;
+      }
+      __syncthreads();
+    }
+    uint32_t cw[8];
+#pragma unroll
+    for (int q = 0; q < 8; q++) cw[q] = nxt[q];
+    if (t + 1 < nt) {
+      const uint8_t* tb = base + (size_t)(t + 1) * 8192;
+#pragma unroll
+      for (int q = 0; q < 8; q++) nxt[q] = *(const uint32_t*)(tb + q * 128);
+    }
+    float xv[8];
+    const float* xt = xh + tc * 128 + w * 16 + h * 8;
+    const float4 a = *(const float4*)xt;
+    const float4 b = *(const float4*)(xt + 4);
+    xv[0] = a.x; xv[1] = a.y; xv[2] = a.z; xv[3] = a.w;
+    xv[4] = b.x; xv[5] = b.y; xv[6] = b.z; xv[7] = b.w;
+#pragma unroll
+    for (int q = 0; q < 8; q++) {
+      const uint32_t cur = cw[q];
+      const uint32_t rr = (uint32_t)__builtin_amdgcn_mov_dpp((int)cur, 0x121, 0xf, 0xf, false);
+      const uint32_t xx = (uint32_t)__builtin_amdgcn_permlanex16((int)rr, (int)rr, 0x76543210,
+                                                                 (int)0xfedcba98, false, false);
+      const uint32_t prev = (lane & 15) ? rr : xx;
+      float wv[8];
+#pragma unroll
+      for (int e = 0; e < 8; e += 2)
+        hv2::ht_val2(__builtin_amdgcn_alignbit(prev, cur, 28 - 4 * e) & 0xffffu,
+                     __builtin_amdgcn_alignbit(prev, cur, 24 - 4 * e) & 0xffffu, wv[e], wv[e + 1]);
+      float s = acc[q];
+#pragma unroll
+      for (int e = 0; e < 8; e++) s = fmaf(wv[e], xv[e], s);
+      acc[q] = s;
+    }
+  }
+#pragma unroll
+  for (int q = 0; q < 8; q++) acc[q] += __shfl_xor(acc[q], 16, 32);
+  __syncthreads();
+  if (lane < 16)
+#pragma unroll
+    for (int q = 0; q < 8; q++) hv2_lds[w * 128 + q * 16 + lane] = acc[q];
+  __syncthreads();
+  if (tid < 128) {
+    float s = hv2_lds[tid];
+#pragma unroll
+    for (int v = 1; v < 8; v++) s += hv2_lds[v * 128 + tid];
+    zl[tid] = s;
+  }
+  __syncthreads();
+  if (se_ks > 1) {
+    if (tid < 128) zs[(size_t)kz * se_O + ty * 128 + tid] = zl[tid];
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) s_last = atomicAdd(cnt + ty, 1) == se_ks - 1;
+    __syncthreads();
+    if (!s_last) return;
+    __threadfence();
+    if (tid < 128) {
+      const size_t o = (size_t)ty * 128 + tid;
+      float s = __builtin_nontemporal_load(zs + o);
+      for (int k2 = 1; k2 < se_ks; k2++)
+        s += __builtin_nontemporal_load(zs + (size_t)k2 * se_O + o);
+      zl[tid] = s;
+    }
+    if (tid == 0) atomicExch(cnt + ty, 0);
+    __syncthreads();
+  }
+  if (w == 0) {
+    float v[4];
+#pragma unroll
+    for (int j = 0; j < 4; j++) v[j] = zl[j * 32 + lane];
+    hv2::fwht128(v[0], v[1], v[2], v[3], lane);
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      const int r = ty * 128 + j * 32 + lane;
+      if (r < se_nrows) se_y[r] = v[j] * hv2::kRs128 * se_svh[r];
+    }
   }
 }

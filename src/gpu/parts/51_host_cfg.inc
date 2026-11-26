@@ -4271,7 +4271,9 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
         if (!send_tok(cur, g.logprobs, cur_lp)) break;
         if (i + 1 < g.max_tokens) {
           int fed = cur;  // the token forward() ingests (pre-sampling)
-          cur = m.forward(fed);
+          const bool need_amx = (!g.sample && !repeat_greedy) ||
+                                (!ckpt_toks.empty() && ckpt_toks.count(fed));
+          cur = m.forward_step(fed, need_amx);
           hist.push_back(fed);
           // Serial decode advances one token at a time: checkpoint right
           // after a ckpt token (mtp is stale on this path).

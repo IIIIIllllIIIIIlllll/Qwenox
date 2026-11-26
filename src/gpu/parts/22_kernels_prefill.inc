@@ -1407,7 +1407,8 @@ __global__ void k_qsa_flash(const float* __restrict__ q, const KVT* __restrict__
 __global__ void k_qsa_flash_combine(const float* __restrict__ pml,
                                     const float* __restrict__ pacc,
                                     float* __restrict__ out, int qpg, int dh,
-                                    const int* __restrict__ d_pos) {
+                                    const int* __restrict__ d_pos,
+                                    const float* __restrict__ gs = nullptr) {
   (void)d_pos;  // dense tokens now take this path too (no <qsa_index_first() early-out)
   const int h = blockIdx.y, row = blockIdx.x;
   const float* pm = pml + ((size_t)h * QSA_DEC_NSPLIT * qpg + row) * 2;
@@ -1435,7 +1436,16 @@ __global__ void k_qsa_flash_combine(const float* __restrict__ pml,
     o.y *= inv;
     o.z *= inv;
     o.w *= inv;
-    *(float4*)(out + ((size_t)h * qpg + row) * dh + d4 * 4) = o;  // token 0
+    const size_t off = ((size_t)h * qpg + row) * dh + d4 * 4;
+    if (gs) {
+      asm volatile("" : "+v"(o.x), "+v"(o.y), "+v"(o.z), "+v"(o.w));
+      const float4 g4 = *(const float4*)(gs + off);
+      o.x = o.x / (1.f + expf(-g4.x));
+      o.y = o.y / (1.f + expf(-g4.y));
+      o.z = o.z / (1.f + expf(-g4.z));
+      o.w = o.w / (1.f + expf(-g4.w));
+    }
+    *(float4*)(out + off) = o;  // token 0
   }
 }
 

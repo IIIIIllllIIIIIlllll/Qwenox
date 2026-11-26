@@ -996,6 +996,70 @@ __global__ void k_gdn_step(const float* __restrict__ q, const float* __restrict_
   if (jc == 0) out[h * dv + i] = part[0][i] + part[1][i] + part[2][i] + part[3][i];
 }
 
+// --- Fused P=1 GDN recurrence + gated RMSNorm (dk=128, dv=128, hv=48, hk=16) ---
+// Keeps decayed S[32] in VGPRs across pass 1 -> pass 2 (halving S DRAM traffic
+// from 432 MB to 216 MB/tok) and runs k_gdn_gatednorm in-place before storing out.
+__global__ __launch_bounds__(512, 2) void k_gdn_step_gn(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, const float* __restrict__ g,
+    const float* __restrict__ beta, float* __restrict__ S,
+    const float* __restrict__ z, const float* __restrict__ w_gn,
+    float* __restrict__ out, float eps) {
+  const int h = blockIdx.x;
+  const float* kh = k + (h / 3) * 128;
+  const float* qh = q + (h / 3) * 128;
+  const float* vh = v + h * 128;
+  float* Sh = S + (size_t)h * 128 * 128;
+  const float alpha = expf(g[h]);
+  const float be = beta[h];
+  const int t = threadIdx.x;
+  const int i = t & 127, jc = t >> 7;
+  const int j0 = jc * 32;
+  __shared__ float part[4][128];
+  __shared__ float sdelta[128];
+  float s_reg[32];
+  float kv = 0.f;
+  for (int u = 0; u < 32; u++) {
+    const int j = j0 + u;
+    float s = Sh[j * 128 + i] * alpha;
+    asm volatile("" : "+v"(s));
+    s_reg[u] = s;
+    kv += s * kh[j];
+  }
+  part[jc][i] = kv;
+  __syncthreads();
+  const float kvf = part[0][i] + part[1][i] + part[2][i] + part[3][i];
+  float delta = (vh[i] - kvf) * be;
+  if (jc == 0) sdelta[i] = delta;
+  __syncthreads();
+  delta = sdelta[i];
+  float o = 0.f;
+  for (int u = 0; u < 32; u++) {
+    const int j = j0 + u;
+    float s = s_reg[u] + kh[j] * delta;
+    Sh[j * 128 + i] = s;
+    o += s * qh[j];
+  }
+  __syncthreads();
+  part[jc][i] = o;
+  __syncthreads();
+  float yv = 0.f;
+  if (t < 128) {
+    yv = part[0][t] + part[1][t] + part[2][t] + part[3][t];
+    sdelta[t] = yv * yv;
+  }
+  __syncthreads();
+  for (int off = 64; off > 0; off >>= 1) {
+    if (t < off) sdelta[t] += sdelta[t + off];
+    __syncthreads();
+  }
+  if (t < 128) {
+    const float inv = rsqrtf(sdelta[0] / 128 + eps);
+    const float zz = z[h * 128 + t];
+    out[h * 128 + t] = yv * inv * w_gn[t] / (1.f + expf(-zz));
+  }
+}
+
 // Short speculative batches: keep the entire recurrent state in registers.
 // The four partial reductions and accumulation order follow k_gdn_step.
 // Thread map: the four jc shards of one column i sit in adjacent lanes of
@@ -2448,6 +2512,15 @@ __global__ void k_step_incr(int* __restrict__ d_pos, int* __restrict__ d_ringpos
   *d_pos += 1;
   *d_ringpos = (*d_ringpos + 1) % 9;
 }
+__global__ void k_step_incr_amx(int* __restrict__ d_pos, int* __restrict__ d_ringpos,
+                                const int* __restrict__ d_amx, int* __restrict__ p_amx) {
+  *d_pos += 1;
+  *d_ringpos = (*d_ringpos + 1) % 9;
+  if (p_amx) {
+    *p_amx = *d_amx;
+    __threadfence_system();
+  }
+}
 // R[ch] += U[ch] + convout[ch]
 __global__ void k_add2(float* __restrict__ R, const float* __restrict__ a,
                        const float* __restrict__ b, int n) {
@@ -2505,5 +2578,190 @@ __global__ void k_ple_gate(const float* __restrict__ kn, const float* __restrict
   g = (g < 0 ? -1.f : 1.f) * sqrtf(fmaxf(fabsf(g), 1e-6f));
   float alpha = 1.f / (1.f + expf(-g));
   for (int i = t; i < d; i += blockDim.x) U[m * d + i] = alpha * v[i];
+}
+
+// --- Fused P=1 PLE tail: 2x rmsnorm_zc + ple_gate + rmsnorm_zc_ring + ple_conv + add2 ---
+// Each block m in 0..3 owns branch slice [m*2560 .. (m+1)*2560) independently.
+__global__ __launch_bounds__(1024) void k_ple_tail(
+    const float* __restrict__ keys, const float* __restrict__ v,
+    float* __restrict__ R, const float* __restrict__ nk,
+    float* __restrict__ ring, const int* __restrict__ d_ringpos,
+    const float* __restrict__ cw, float eps) {
+  const int m = blockIdx.x, t = threadIdx.x;
+  const float* kg = keys + (size_t)m * 2560;
+  const float* wk = nk + (size_t)m * 2560;
+  float* Rg = R + (size_t)m * 2560;
+  const float* wq = nk + 10240 + (size_t)m * 2560;
+  const float* wu = nk + 20480 + (size_t)m * 2560;
+  __shared__ float sm[1024];
+
+  float ssk = 0.f;
+  for (int i = t; i < 2560; i += 1024) ssk += kg[i] * kg[i];
+  sm[t] = ssk;
+  __syncthreads();
+  for (int off = 512; off > 0; off >>= 1) {
+    if (t < off) sm[t] += sm[t + off];
+    __syncthreads();
+  }
+  const float inv_k = rsqrtf(sm[0] / 2560 + eps);
+
+  float ssq = 0.f;
+  for (int i = t; i < 2560; i += 1024) ssq += Rg[i] * Rg[i];
+  sm[t] = ssq;
+  __syncthreads();
+  for (int off = 512; off > 0; off >>= 1) {
+    if (t < off) sm[t] += sm[t + off];
+    __syncthreads();
+  }
+  const float inv_q = rsqrtf(sm[0] / 2560 + eps);
+
+  float acc = 0.f;
+  for (int i = t; i < 2560; i += 1024) {
+    float kn_i = kg[i] * inv_k * (1.f + wk[i]);
+    float qn_i = Rg[i] * inv_q * (1.f + wq[i]);
+    asm volatile("" : "+v"(kn_i), "+v"(qn_i));
+    acc += kn_i * qn_i;
+  }
+  sm[t] = acc;
+  __syncthreads();
+  for (int off = 512; off > 0; off >>= 1) {
+    if (t < off) sm[t] += sm[t + off];
+    __syncthreads();
+  }
+  float g = sm[0] / sqrtf(2560.f);
+  g = (g < 0 ? -1.f : 1.f) * sqrtf(fmaxf(fabsf(g), 1e-6f));
+  const float alpha = 1.f / (1.f + expf(-g));
+
+  float uv[3];
+  float ssu = 0.f;
+  for (int k = 0; k < 3; k++) {
+    const int i = t + k * 1024;
+    if (i < 2560) {
+      float ui = alpha * v[i];
+      asm volatile("" : "+v"(ui));
+      uv[k] = ui;
+      ssu += ui * ui;
+    }
+  }
+  sm[t] = ssu;
+  __syncthreads();
+  for (int off = 512; off > 0; off >>= 1) {
+    if (t < off) sm[t] += sm[t + off];
+    __syncthreads();
+  }
+  const float inv_u = rsqrtf(sm[0] / 2560 + eps);
+  const int ringpos = *d_ringpos;
+  float* rcur = ring + (size_t)ringpos * 10240;
+
+  for (int k = 0; k < 3; k++) {
+    const int i = t + k * 1024;
+    if (i < 2560) {
+      const int ch = m * 2560 + i;
+      float rni = uv[k] * inv_u * (1.f + wu[i]);
+      asm volatile("" : "+v"(rni));
+      rcur[ch] = rni;
+      float a = 0.f;
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        const int back = (3 - j) * 3;
+        const int rp = ((ringpos - back) % 9 + 9) % 9;
+        const float rv = (rp == ringpos) ? rni : ring[(size_t)rp * 10240 + ch];
+        a += cw[ch * 4 + j] * rv;
+      }
+      float co = a / (1.f + expf(-a));
+      asm volatile("" : "+v"(co));
+      Rg[i] += uv[k] + co;
+    }
+  }
+}
+
+// --- Fused P=1 QSA prepare: qsplit + knorm + 2x rope + KV append (26x256) ---
+// Blocks 0..23: Q head h (zcnorm + gate split + rotary 64).
+// Blocks 24..25: KV head kh = blockIdx.x - 24 (zcnorm + rotary 64 + KV store).
+// KvMode: 0 = bf16, 1 = fp16, 2 = fp32, 3 = no store (caller runs k_store_kv_q8).
+template <int KvMode>
+__global__ __launch_bounds__(256) void k_qsa_prep_p1(
+    const float* __restrict__ qg, const float* __restrict__ qnw,
+    float* __restrict__ qs, float* __restrict__ gs,
+    float* __restrict__ kb, const float* __restrict__ vb,
+    const float* __restrict__ knw, void* __restrict__ kc, void* __restrict__ vc,
+    uint16_t* __restrict__ vct, const int* __restrict__ ptab,
+    const int* __restrict__ d_pos, const int* __restrict__ d_rdelta, float eps) {
+  __shared__ float sm[256];
+  const int b = blockIdx.x, t = threadIdx.x;
+  const int pos = *d_pos;
+  const int rpos = d_rdelta ? pos + *d_rdelta : pos;
+  if (b < 24) {
+    const int h = b;
+    const float v = qg[h * 512 + t];
+    sm[t] = v * v;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+      if (t < off) sm[t] += sm[t + off];
+      __syncthreads();
+    }
+    const float inv = rsqrtf(sm[0] / 256 + eps);
+    gs[h * 256 + t] = qg[h * 512 + 256 + t];
+    const float qn = v * inv * (1.f + qnw[t]);
+    __syncthreads();
+    sm[t] = qn;
+    __syncthreads();
+    float* q = qs + h * 256;
+    if (t < 32) {
+      const double ang = rpos * g_rope_tab[t];
+      float cs = (float)cos(ang), sn = (float)sin(ang);
+      if (g_rope_mscale != 1.f) cs *= g_rope_mscale, sn *= g_rope_mscale;
+      const float x0 = sm[t], x1 = sm[t + 32];
+      q[t] = x0 * cs - x1 * sn;
+      q[t + 32] = x0 * sn + x1 * cs;
+    } else if (t >= 64) {
+      q[t] = qn;
+    }
+    return;
+  }
+  const int kh = b - 24;
+  const int idx = kh * 256 + t;
+  const float v = kb[idx];
+  sm[t] = v * v;
+  __syncthreads();
+  for (int off = 128; off > 0; off >>= 1) {
+    if (t < off) sm[t] += sm[t + off];
+    __syncthreads();
+  }
+  const float inv = rsqrtf(sm[0] / 256 + eps);
+  const float kn = v * inv * (1.f + knw[t]);
+  __syncthreads();
+  sm[t] = kn;
+  __syncthreads();
+  if (t < 32) {
+    const double ang = rpos * g_rope_tab[t];
+    float cs = (float)cos(ang), sn = (float)sin(ang);
+    if (g_rope_mscale != 1.f) cs *= g_rope_mscale, sn *= g_rope_mscale;
+    const float x0 = sm[t], x1 = sm[t + 32];
+    sm[t] = x0 * cs - x1 * sn;
+    sm[t + 32] = x0 * sn + x1 * cs;
+  }
+  __syncthreads();
+  const float kf = sm[t];
+  kb[idx] = kf;
+  if constexpr (KvMode == 0) {
+    const int row = kv_row(ptab, pos);
+    const size_t off = (size_t)row * 512 + idx;
+    ((uint16_t*)kc)[off] = f2bf(kf);
+    const uint16_t vv = f2bf(vb[idx]);
+    ((uint16_t*)vc)[off] = vv;
+    if (vct) vct[((size_t)(row >> 2) * 512 + idx) * 4 + (pos & 3)] = vv;
+  } else if constexpr (KvMode == 1) {
+    const size_t row = (size_t)kv_row(ptab, pos);
+    const size_t dst = row * 512 + idx;
+    ((__half*)kc)[dst] = __float2half_rn(kf);
+    const __half hv = __float2half_rn(vb[idx]);
+    ((__half*)vc)[dst] = hv;
+    if (vct) vct[((row >> 2) * 512 + idx) * 4 + (pos & 3)] = __half_as_ushort(hv);
+  } else if constexpr (KvMode == 2) {
+    const size_t off = (size_t)kv_row(ptab, pos) * 512 + idx;
+    ((float*)kc)[off] = kf;
+    ((float*)vc)[off] = vb[idx];
+  }
 }
 

@@ -754,6 +754,14 @@ struct GpuModel {
   int* d_pos = nullptr;
   int* d_ringpos = nullptr;
   int* p_token = nullptr;        // pinned staging for token id
+  int* p_zc_tok = nullptr;       // coherent mapped token input for gall_exec
+  int* d_zc_tok = nullptr;
+  int* p_zc_amx = nullptr;       // coherent mapped argmax output for gall_exec
+  int* d_zc_amx = nullptr;
+  uint8_t* p_zc_ple = nullptr;   // coherent mapped 16-row raw PLE staging
+  uint8_t* d_zc_ple = nullptr;
+  int* p_sm_ci = nullptr;        // pinned shared-correction id staging
+  float* p_sm_cv = nullptr;      // pinned shared-correction val staging
   int* d_vbase = nullptr;        // P3-A: device mirror of the batch base position
   // QWENOX_VIZ taps (19_viz.inc). Batched rows are tagged with the position
   // source the engine kernels of the current batch use: set by enq_layer_b
@@ -1074,11 +1082,11 @@ struct GpuModel {
   float *d_cS = nullptr, *d_cconvst = nullptr, *d_cring = nullptr, *d_ciraw = nullptr,
         *d_cR = nullptr, *d_cmiraw = nullptr;
   bool cut_busy = false;  // NOT per slot: one shadow set, one owner at a time
-  hipGraphExec_t g1_exec = nullptr, g2_exec = nullptr;  // per-slot decode graphs
+  hipGraphExec_t g1_exec = nullptr, g2_exec = nullptr, gall_exec = nullptr;  // per-slot decode graphs
 
   // ---- Sequence slots (concurrent serve, QWENOX_PARALLEL) ----
   // Everything one sequence carries from step to step: host mirrors, GDN /
-  // conv / PLE ring / indexer ring state, the page table (the KV pages live
+  // conv / PLE ring / indexer ring state, the KV page table (the KV pages live
   // in the shared pool, MTP layer included), the MTP indexer ring and
   // position, the verify rollback checkpoints (d_ckpt / d_mring_ckpt — D2
   // swaps slots between checkpoint save and restore), per-slot decode graphs
@@ -1101,7 +1109,7 @@ struct GpuModel {
   X(prog_last) X(prog_snap_last) X(prog_snap_last_est) X(last_spec_rounds) X(last_spec_commit) X(last_spec_rollbacks) \
   X(last_spec_proposed) X(last_ng_rounds) X(last_ng_proposed)                \
   X(last_ng_accepted) X(live_spec_rounds) X(live_spec_commits)                \
-  X(live_spec_proposed) X(g1_exec) X(g2_exec)                                 \
+  X(live_spec_proposed) X(g1_exec) X(g2_exec) X(gall_exec)                    \
   X(d_S) X(d_convst) X(d_ring) X(d_iraw) X(d_R) X(d_pos) X(d_ringpos)         \
   X(d_miraw) X(d_mpos) X(d_ckpt) X(d_mring_ckpt)
   struct SeqState {
@@ -1543,6 +1551,19 @@ struct GpuModel {
     }
     CK(hipHostMalloc((void**)&p_token, 4, hipHostMallocDefault));
     CK(hipHostMalloc((void**)&p_vbase, 4 * kVbRing, hipHostMallocDefault));
+    {
+      const unsigned zc_flags = hipHostMallocCoherent | hipHostMallocMapped;
+      CK(hipHostMalloc((void**)&p_zc_tok, 4, zc_flags));
+      CK(hipHostGetDevicePointer((void**)&d_zc_tok, p_zc_tok, 0));
+      CK(hipHostMalloc((void**)&p_zc_amx, 4, zc_flags));
+      CK(hipHostGetDevicePointer((void**)&d_zc_amx, p_zc_amx, 0));
+      CK(hipHostMalloc((void**)&p_zc_ple, 16 * 320, zc_flags));
+      CK(hipHostGetDevicePointer((void**)&d_zc_ple, p_zc_ple, 0));
+      CK(hipHostMalloc((void**)&p_sm_ci, (SMS_BIAS_CAP + SMS_HIST_CAP) * sizeof(int),
+                       hipHostMallocDefault));
+      CK(hipHostMalloc((void**)&p_sm_cv, (SMS_BIAS_CAP + SMS_HIST_CAP) * sizeof(float),
+                       hipHostMallocDefault));
+    }
     DALLOC(&d_keys, 10240 * 4);
     DALLOC(&d_v, 2560 * 4);
     DALLOC(&d_kn, 10240 * 4);
@@ -1961,7 +1982,14 @@ struct GpuModel {
   bool pf_pending_ = false;
   int pf_blocks_ = 16;
   void pf_init() {
+#ifdef _WIN32
+    // Windows WDDM: 48 cross-stream hipEventRecord/hipStreamWaitEvent pairs inside
+    // captured decode graphs break AQL packet batching and add ~11.5 ms/token.
+    const char* pf_env = getenv("QWENOX_DECODE_PF");
+    if (!pf_env || strcmp(pf_env, "1") != 0) return;
+#else
     if (env_zero("QWENOX_DECODE_PF")) return;
+#endif
     if (const char* e = getenv("QWENOX_DECODE_PF_BLOCKS")) pf_blocks_ = std::max(1, atoi(e));
     pf_sets_.assign(g_cfg.layers, DpfSet{});
     double tot = 0;
@@ -2752,14 +2780,23 @@ struct GpuModel {
                            d_dtbias + (size_t)gi * 48, d_g48, d_beta48, 48, 48);
     }
     pf_fork(l);  // decode prefetch: overlaps step/norm/out_proj
-    k_gdn_step<<<48, 512, 0, g_str>>>(qp, kp, vp, d_g48, d_beta48,
-                            d_S + (size_t)gi * 48 * 128 * 128, vp /*out in place*/,
-                            128, 128, 48, 16);
-    // out written over vp is safe: k_gdn_step reads vh before writing out
-    if (!gdn_pair) gemv(zw, x, d_z);
-    k_gdn_gatednorm<<<dim3(48, 1), 128, 0, g_str>>>(vp, d_z, d_gdnnorm + (size_t)gi * 128,
-                                                    vp, 128, g_cfg.norm_eps, 10240,
-                                                    6144);
+    static const bool gdn_step_gn = !env_zero("QWENOX_GDN_STEP_GN");
+    if (gdn_step_gn) {
+      if (!gdn_pair) gemv(zw, x, d_z);
+      k_gdn_step_gn<<<48, 512, 0, g_str>>>(qp, kp, vp, d_g48, d_beta48,
+                                           d_S + (size_t)gi * 48 * 128 * 128, d_z,
+                                           d_gdnnorm + (size_t)gi * 128, vp,
+                                           g_cfg.norm_eps);
+    } else {
+      k_gdn_step<<<48, 512, 0, g_str>>>(qp, kp, vp, d_g48, d_beta48,
+                              d_S + (size_t)gi * 48 * 128 * 128, vp /*out in place*/,
+                              128, 128, 48, 16);
+      // out written over vp is safe: k_gdn_step reads vh before writing out
+      if (!gdn_pair) gemv(zw, x, d_z);
+      k_gdn_gatednorm<<<dim3(48, 1), 128, 0, g_str>>>(vp, d_z, d_gdnnorm + (size_t)gi * 128,
+                                                      vp, 128, g_cfg.norm_eps, 10240,
+                                                      6144);
+    }
     snprintf(buf, sizeof buf, "layers.%d.linear_attn.out_proj.weight", l);
     gemv(wview(ckpt.at(buf)), vp, y);
   }
@@ -2773,12 +2810,13 @@ struct GpuModel {
   // selection list (all visible positions). k_qsa_step used to be its fallback,
   // but its pass 3 recomputes every q.k per output dim: 1170 ms/token at 8K.
   template <typename KVT>
-  void qsa_attn(const KVT* kc, const KVT* vc, const int* ptab = nullptr) {
+  void qsa_attn(const KVT* kc, const KVT* vc, const int* ptab = nullptr,
+                const float* gs = nullptr) {
     k_qsa_flash<true, false, KVT, true><<<dim3(QSA_DEC_NSPLIT, 2), 128, 0, g_str>>>(
         d_qs, kc, vc, d_attn, 1, 256, 2, 24, qsa_dense ? nullptr : d_iselected, 0,
         d_pos, d_pacc, d_pml, 0, ptab);
     k_qsa_flash_combine<<<dim3(12, 2), 64, 0, g_str>>>(d_pml, d_pacc, d_attn, 12,
-                                                       256, d_pos);
+                                                       256, d_pos, gs);
   }
 
   void qsa(int l, int qi, const float* x, float* y) {
@@ -2816,6 +2854,43 @@ struct GpuModel {
     float* qnw = ensure_norm256(buf);
     snprintf(buf, sizeof buf, "layers.%d.self_attn.k_norm.weight", l);
     float* knw = ensure_norm256(buf);
+    static const bool qsa_fuse = !env_zero("QWENOX_QSA_FUSE") && g_cfg.rotary_dim == 64;
+    if (qsa_fuse) {
+      pf_fork(l);  // decode prefetch (QSA)
+      if (qsa_kv_q8) {
+        auto* kc = d_kcq + (size_t)qi * kv_layer_rows * 16;
+        auto* vc = d_vcq + (size_t)qi * kv_layer_rows * 16;
+        k_qsa_prep_p1<3><<<26, 256, 0, g_str>>>(d_qg, qnw, d_qs, d_gs, d_kb, d_vb, knw,
+                                                nullptr, nullptr, nullptr, kvpt(), d_pos,
+                                                d_rdelta, g_cfg.norm_eps);
+        k_store_kv_q8<<<4, 128, 0, g_str>>>(d_kb, d_vb, kc, vc, 1, 0, kvpt(), d_pos);
+        qsa_attn(kc, vc, kvpt(), d_gs);
+      } else if (qsa_kv_fp16) {
+        auto* kc = fp16_kc((size_t)qi * kv_layer_rows * 512);
+        auto* vc = fp16_vc((size_t)qi * kv_layer_rows * 512);
+        k_qsa_prep_p1<1><<<26, 256, 0, g_str>>>(d_qg, qnw, d_qs, d_gs, d_kb, d_vb, knw,
+                                                kc, vc, vct_layer(qi), kvpt(), d_pos,
+                                                d_rdelta, g_cfg.norm_eps);
+        qsa_attn(kc, vc, kvpt(), d_gs);
+      } else if (qsa_kv_fp32) {
+        float* kc = d_kc + (size_t)qi * kv_layer_rows * 512;
+        float* vc = d_vc + (size_t)qi * kv_layer_rows * 512;
+        k_qsa_prep_p1<2><<<26, 256, 0, g_str>>>(d_qg, qnw, d_qs, d_gs, d_kb, d_vb, knw,
+                                                kc, vc, nullptr, kvpt(), d_pos,
+                                                d_rdelta, g_cfg.norm_eps);
+        qsa_attn(kc, vc, kvpt(), d_gs);
+      } else {
+        uint16_t* kc = d_kcb + (size_t)qi * kv_layer_rows * 512;
+        uint16_t* vc = d_vcb + (size_t)qi * kv_layer_rows * 512;
+        k_qsa_prep_p1<0><<<26, 256, 0, g_str>>>(d_qg, qnw, d_qs, d_gs, d_kb, d_vb, knw,
+                                                kc, vc, vct_layer(qi), kvpt(), d_pos,
+                                                d_rdelta, g_cfg.norm_eps);
+        qsa_attn(kc, vc, kvpt(), d_gs);
+      }
+      snprintf(buf, sizeof buf, "layers.%d.self_attn.o_proj.weight", l);
+      gemv(wview(ckpt.at(buf)), d_attn, y);
+      return;
+    }
     // per-head: q[h] = zcnorm(qg[h*512 .. +256]); gate[h] = qg[h*512+256 ..]
     k_qsa_qsplit<<<dim3(24, 1), 256, 0, g_str>>>(d_qg, qnw, d_qs, d_gs, 256,
                                                  g_cfg.norm_eps);
@@ -3275,6 +3350,12 @@ struct GpuModel {
   float* d_se_ey = nullptr;  // moe_v2_1 uses d_ey as its x-rotation scratch
   float* d_se_sg = nullptr;
   void se_par_init() {
+    // Always allocate P=1 SE private scratch (18 KiB) so single-stream MoE+SE
+    // overlap never aliases routed d_guv/d_hid/d_ey/d_sg.
+    DALLOC(&d_se_guv, 1280 * 4);
+    DALLOC(&d_se_hid, 640 * 4);
+    DALLOC(&d_se_ey, 2560 * 4);
+    DALLOC(&d_se_sg, 64);
 #ifdef _WIN32
     const char* se_par = getenv("QWENOX_SE_PAR");
     if (!se_par || strcmp(se_par, "1") != 0) return;
@@ -3284,14 +3365,10 @@ struct GpuModel {
     CK(hipStreamCreateWithFlags(&se_st_, hipStreamNonBlocking));
     CK(hipEventCreateWithFlags(&se_fork_ev_, hipEventDisableTiming));
     CK(hipEventCreateWithFlags(&se_join_ev_, hipEventDisableTiming));
-    DALLOC(&d_se_guv, 1280 * 4);
-    DALLOC(&d_se_hid, 640 * 4);
     DALLOC(&d_se_guvb, 16 * 1280 * 4);
     DALLOC(&d_se_hidb, 16 * 640 * 4);
     DALLOC(&d_se_eyb, 16 * 2560 * 4);
     DALLOC(&d_se_sgb, 64 * 4);
-    DALLOC(&d_se_ey, 2560 * 4);
-    DALLOC(&d_se_sg, 64);
     fprintf(stderr, "shared expert: parallel stream (P=1 decode)\n");
   }
   void se_chain(int l, const float* x, float* guv, float* hid, float* ey, float* sg) {
@@ -3305,8 +3382,9 @@ struct GpuModel {
     snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert_gate.weight", l);
     gemv(wview(ckpt.at(buf)), x, sg);
   }
-  void moe(int l, const float* x, float* y) {
-    char buf[128];
+  void moe(int l, const float* x, float* y, const float** defer_post_svh = nullptr) {
+    if (defer_post_svh) *defer_post_svh = nullptr;
+    char buf[128], ub[128];
     const bool se_par = se_st_ != nullptr && !dbg;
     if (se_par) {
       CK(hipEventRecord(se_fork_ev_, g_str));
@@ -3323,6 +3401,62 @@ struct GpuModel {
     // MOE_PP: router + x rotation + top-k in one launch; moe_v2_1 then skips
     // its own rotation and moe() the output rotation + axpy.
     const bool pp = moepp_ok(l, rtw, k);
+    static const bool moe_se_fuse_env = !env_zero("QWENOX_MOE_SE_FUSE");
+    if (pp && !se_par && !dbg && !gg_on() && moe_se_fuse_env) {
+      snprintf(buf, sizeof buf, "layers.%d.mlp.experts.gate_up_proj.weight", l);
+      const WView gu = wview(ckpt.at(buf));
+      snprintf(buf, sizeof buf, "layers.%d.mlp.experts.down_proj.weight", l);
+      const WView dn = wview(ckpt.at(buf));
+      snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.down_proj.weight", l);
+      const WView se_dn = wview(ckpt.at(buf));
+      snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert_gate.weight", l);
+      const WView se_gw = wview(ckpt.at(buf));
+      const int ntx = (int)se_dn.cols / 128, nty = (int)((se_dn.rows + 127) / 128);
+      int se_ks = std::max(1, std::min((80 + nty - 1) / nty, ntx));
+      while (se_ks > 1 && (size_t)se_ks * nty * 128 > kHtZs) se_ks = (se_ks + 1) / 2;
+      const int se_tpb = (ntx + se_ks - 1) / se_ks;
+      se_ks = (ntx + se_tpb - 1) / se_tpb;
+      const int se_tpc = std::min(se_tpb, 24);
+      const size_t se_lds = (size_t)std::max(se_tpc, 8) * 128 * 4;
+      if (gu.dtype == 23 && dn.dtype == 23 && moe_down_direct(k, dn) &&
+          se_dn.dtype == 16 && !(dense_wmma_on() && dense_wmma_p1_on()) &&
+          se_lds <= 16384 && se_gw.dtype == 0 && g_cfg.moe_mid == 640) {
+        snprintf(buf, sizeof buf, "layers.%d.mlp.shared_expert.gate_proj.weight", l);
+        snprintf(ub, sizeof ub, "layers.%d.mlp.shared_expert.up_proj.weight", l);
+        se_gate_up(buf, ub, x, d_se_guv, d_se_guv + 640, 1, true);
+        const bool seg_rf = g_dense_rowfast && se_gw.cols % 8 == 0 && se_gw.cols >= 2048;
+        k_moe_pre<<<33, 512, 0, g_str>>>((const uint16_t*)rtw.data, x, (int)rtw.cols,
+                                         d_router, gu.suh, d_moe_xr, g_cfg.d, d_topids,
+                                         d_topw, moepp_cnt_, vz_tap(l, false),
+                                         (const uint16_t*)se_gw.data, d_se_sg, seg_rf);
+        if (l == g_cfg.layers - 1) vz_publish(1, false);
+        const XCodes cgu = xcodes(gu);
+        const uint64_t pairs = (uint64_t)k * g_cfg.moe_mid;
+        k_q4cp_gemv_gg<2><<<(unsigned)((pairs + 15) / 16), 512, 0, g_str>>>(
+            cgu.codes, cgu.scales, cgu.cb, d_moe_xr, d_guv, d_topids,
+            (uint64_t)2 * g_cfg.moe_mid, gu.cols, gu.scale_stride, k,
+            0 /*x_stride*/, 16 /*id_stride*/, k);
+        k_i4r_mid<float, false><<<(unsigned)(k + (640 + 255) / 256),
+                                  2 * g_cfg.moe_mid / 128 * 32, 0, g_str>>>(
+            d_guv, 2 * g_cfg.moe_mid, d_hid, g_cfg.moe_mid, gu.svh, dn.suh,
+            g_cfg.moe_mid, k, d_se_guv, d_se_hid, 640);
+        const XCodes cdn = xcodes(dn);
+        const int dn_blocks = (int)(((g_cfg.d + 1) / 2 + 7) / 8);
+        k_moe_dn_se<<<(unsigned)(dn_blocks + nty * se_ks), 256, se_lds, g_str>>>(
+            dn_blocks, cdn.codes, cdn.scales, cdn.cb, d_hid, d_moeacc, d_topids,
+            d_topw, (uint64_t)g_cfg.d, dn.cols, dn.scale_stride,
+            (uint64_t)g_cfg.moe_mid, se_dn.data, se_dn.suh, se_dn.svh, d_se_hid,
+            d_se_ey, nty, se_ks, nty * 128, (int)se_dn.cols, (int)se_dn.rows,
+            se_tpb, se_tpc, g_ht_zs, g_ht_cnt);
+        if (defer_post_svh && g_cfg.d == 2560) {
+          *defer_post_svh = dn.svh;
+          return;
+        }
+        k_moe_post<<<(g_cfg.d / 128 + 7) / 8, 256, 0, g_str>>>(
+            d_moeacc, dn.svh, d_se_ey, d_se_sg, y, g_cfg.d);
+        return;
+      }
+    }
     if (pp) {
       snprintf(buf, sizeof buf, "layers.%d.mlp.experts.gate_up_proj.weight", l);
       const WView gu0 = wview(ckpt.at(buf));
@@ -3439,7 +3573,8 @@ struct GpuModel {
       madvise((void*)(uintptr_t)((uintptr_t)p & ~4095ull), 4096, MADV_WILLNEED);
     }
 #ifdef _WIN32
-    if (g_ple_win.ok()) {
+    static const bool ple_map_on = !env_zero("QWENOX_PLE_MAP");
+    if (!ple_map_on && g_ple_win.ok()) {
       uint64_t a64[16];
       uint8_t stg[16 * 320];  // largest PLE row: bf16, 160 values * 2 bytes
       for (int h = 0; h < 16; h++) a64[h] = (uint64_t)(uintptr_t)addrs[h];
@@ -3447,6 +3582,7 @@ struct GpuModel {
       for (int h = 0; h < 16; h++) ple_deq(stg + h * g_ple_rb, dst + h * 160);
       return;
     }
+    os_prefetch_ple(addrs, 16, g_ple_rb);
 #endif
     // pass 2: read (pages already in flight)
     for (int h = 0; h < 16; h++) ple_deq(addrs[h], dst + h * 160);
@@ -3470,12 +3606,14 @@ struct GpuModel {
       madvise((void*)(uintptr_t)((uintptr_t)p & ~4095ull), 4096, MADV_WILLNEED);
     }
 #ifdef _WIN32
-    if (g_ple_win.ok()) {
+    static const bool ple_map_on = !env_zero("QWENOX_PLE_MAP");
+    if (!ple_map_on && g_ple_win.ok()) {
       uint64_t a64[16];
       for (int h = 0; h < 16; h++) a64[h] = (uint64_t)(uintptr_t)addrs[h];
       g_ple_win.run(a64, dst, (uint64_t)(uintptr_t)ple_table->data, 16);
       return;
     }
+    os_prefetch_ple(addrs, 16, g_ple_rb);
 #endif
     for (int h = 0; h < 16; h++) memcpy(dst + h * g_ple_rb, addrs[h], g_ple_rb);
   }
@@ -3483,12 +3621,24 @@ struct GpuModel {
     chist.push_back(token);
     ple_rows((int)chist.size() - 1, dst);
   }
+  void ple_host_raw(int token, uint8_t* dst) {
+    chist.push_back(token);
+    ple_rows_fp8((int)chist.size() - 1, dst);
+  }
 
-  // PLE device phase: upload + gate/conv kernels (must be enqueued after L0).
-  void ple_gpu() {
-    CK(hipMemcpyAsync(d_e, ple_e, 2560 * 4, hipMemcpyHostToDevice, g_str));
+  void ple_gpu_proj_tail() {
     gemv(wview(ckpt.at("layers.1.ple.key_proj.weight")), d_e, d_keys);
     gemv(wview(ckpt.at("layers.1.ple.value_proj.weight")), d_e, d_v);
+    // 默认关（opt-in =1）：融合核对部分输入仍有未定位的 1-ulp 级分歧
+    //（cw 场景 hash 漂移，其余 6 个融合开关全部逐位通过；保留代码待
+    // 用 ring/conv 中间值 dump 做数据级定位后再放开）。其余开关默认开。
+    static const bool ple_tail = getenv("QWENOX_PLE_TAIL") &&
+                                 !env_zero("QWENOX_PLE_TAIL");
+    if (ple_tail && g_cfg.d == 2560 && g_cfg.branches == 4) {
+      k_ple_tail<<<4, 1024, 0, g_str>>>(d_keys, d_v, d_R, d_ple_nk, d_ring,
+                                        d_ringpos, d_ple_convw, g_cfg.norm_eps);
+      return;
+    }
     k_rmsnorm_zc_grouped<<<4, 1024, 0, g_str>>>(d_keys, d_ple_nk, d_kn, 2560,
                                                 g_cfg.norm_eps, 4);
     k_rmsnorm_zc_grouped<<<4, 1024, 0, g_str>>>(d_R, d_ple_nk + 10240, d_qn, 2560,
@@ -3501,6 +3651,24 @@ struct GpuModel {
                                                        d_convout, 10240);
     k_add2<<<(10240 + 255) / 256, 256, 0, g_str>>>(d_R, d_U, d_convout, 10240);
     // device ringpos advanced by k_step_incr (graph) or host upload (direct)
+  }
+  // PLE device phase: upload + gate/conv kernels (must be enqueued after L0).
+  void ple_gpu() {
+    CK(hipMemcpyAsync(d_e, ple_e, 2560 * 4, hipMemcpyHostToDevice, g_str));
+    ple_gpu_proj_tail();
+  }
+  // Zero-copy PLE device phase for unified decode graph (reads mapped d_zc_ple).
+  void enq_ple_zc() {
+    if (ple_iq4) {
+      k_ple_iq4nl_dequant<<<1, 256, 0, g_str>>>(d_zc_ple, d_e, 2560 / 32);
+    } else if (ple_q50) {
+      k_ple_q50_dequant<<<1, 256, 0, g_str>>>(d_zc_ple, d_e, 2560 / 32);
+    } else if (ple_bf16) {
+      k_ple_bf16_dequant<<<1, 256, 0, g_str>>>(d_zc_ple, d_e, 2560 / 16);
+    } else {
+      k_ple_fp8_dequant<<<1, 256, 0, g_str>>>(d_zc_ple, d_e, ple_tscale, 2560 / 16);
+    }
+    ple_gpu_proj_tail();
   }
 
   // one token; returns true + writes argmax id when want_token
@@ -3566,7 +3734,7 @@ struct GpuModel {
          p_ple_wait = 0;
   // perf accumulators (ms): embed, ple, attn, moe, head
   double t_acc[5] = {0, 0, 0, 0, 0};
-  double t_enq = 0, t_sync = 0;
+  double t_enq = 0, t_sync = 0, t_lch = 0, t_kv = 0;
   int t_n = 0;
   std::chrono::steady_clock::time_point tick() {
     if (!perf) return std::chrono::steady_clock::time_point{};
@@ -3589,12 +3757,12 @@ struct GpuModel {
     fprintf(stderr, "%s L%02d %s rms=%.4f [0..3]=%.5f %.5f %.5f %.5f\n", tag, l, sub,
             sqrt(s / n), h[0], h[1], h[2], h[3]);
   }
-  // enqueue helpers — shared by direct execution and graph capture
-  void enq_embed() {
-    embed_rows(wview(ckpt.at("embed_tokens.weight")), d_token, 1, d_emb, 0);
+  void enq_embed_src(const int* tok_src) {
+    embed_rows(wview(ckpt.at("embed_tokens.weight")), tok_src, 1, d_emb, 0);
     k_repeat4<<<(2560 + 255) / 256, 256, 0, g_str>>>(d_emb, d_R, g_cfg.d);
     h_rms("gpu", -1, "emb", d_emb, g_cfg.d);
   }
+  void enq_embed() { enq_embed_src(d_token); }
   // ---- verify HC (P <= gemvmr_maxp) ------------------------------------------
   // QWENOX_VHC (default on; =0 off): gr_mix_b's 5-launch chain ->
   // 2 x k_vhc_wmma, bit-identical (see 28_kernels_hgn_v2.inc). Only taken where
@@ -3842,6 +4010,28 @@ struct GpuModel {
       hcf_ready_ = false;
     }
   }
+  void hcf_wn_moe(const char* prefix, const float* moe_acc, const float* dn_svh,
+                  const float* se_ey, const float* se_sg, const char* next_prefix) {
+    char b[160];
+    snprintf(b, sizeof b, "%s.block_inject_weight.weight", prefix);
+    const WView inj = wview(ckpt.at(b));
+    const int gps = 32, ns = (int)((inj.cols / 64 + gps - 1) / gps);
+    float* out = hcf_rh_ == d_Rhat ? d_RhatB : d_Rhat;
+    if (next_prefix) {
+      float* hw = ensure_hcnorm(next_prefix);
+      k_hcf_wn_moe<true><<<4, 1024, 0, g_str>>>(inj.data, (int)inj.cols, (int)inj.scale_stride,
+                                                gps, ns, hcf_rh_, d_R, moe_acc, dn_svh, se_ey,
+                                                se_sg, hw, out, d_w4, 2560, g_cfg.norm_eps);
+      hcf_rh_ = out;
+      hcf_ready_ = true;
+    } else {
+      k_hcf_wn_moe<false><<<4, 1024, 0, g_str>>>(inj.data, (int)inj.cols, (int)inj.scale_stride,
+                                                 gps, ns, hcf_rh_, d_R, moe_acc, dn_svh, se_ey,
+                                                 se_sg, nullptr, nullptr, d_w4, 2560,
+                                                 g_cfg.norm_eps);
+      hcf_ready_ = false;
+    }
+  }
   void enq_layer_hcf(int l) {
     char pa[96], pm[96], pn[96];
     snprintf(pa, sizeof pa, "layers.%d.attn_hyper_connection", l);
@@ -3859,9 +4049,15 @@ struct GpuModel {
     tock(2, t2);
     auto t3 = tick();
     hcf_rest(pm, d_x);
-    moe(l, d_x, d_y);
+    static const bool hcf_moe_post = !env_zero("QWENOX_HCF_MOE_POST");
+    const float* moe_svh = nullptr;
+    moe(l, d_x, d_y, hcf_moe_post ? &moe_svh : nullptr);
     // PLE (ple_gpu, between layer 0 and 1) adds into R: no norm fold there
-    hcf_wn(pm, d_y, (l == 0 && ple_on) ? nullptr : pn);
+    const char* next_p = (l == 0 && ple_on) ? nullptr : pn;
+    if (moe_svh)
+      hcf_wn_moe(pm, d_moeacc, moe_svh, d_se_ey, d_se_sg, next_p);
+    else
+      hcf_wn(pm, d_y, next_p);
     pf_join();
     tock(3, t3);
   }
@@ -10775,33 +10971,63 @@ struct GpuModel {
       sm_nh = (int)s.hist.size();
     }
     if (!sm_nb && !sm_nh) return true;
-    h_sm_ci.clear();
-    h_sm_cv.clear();
-    for (auto& b : s.bias) {
-      h_sm_ci.push_back(b.first);
-      h_sm_cv.push_back(b.second);
+    const bool use_pin = p_sm_ci && p_sm_cv && sm_nb <= SMS_BIAS_CAP && sm_nh <= SMS_HIST_CAP;
+    if (!use_pin) {
+      h_sm_ci.clear();
+      h_sm_cv.clear();
     }
+    int w = 0;
+    for (auto& b : s.bias) {
+      if (use_pin) {
+        p_sm_ci[w] = b.first;
+        p_sm_cv[w] = b.second;
+      } else {
+        h_sm_ci.push_back(b.first);
+        h_sm_cv.push_back(b.second);
+      }
+      w++;
+    }
+    const int* ci_ptr = use_pin ? p_sm_ci : h_sm_ci.data();
+    const float* cv_ptr = use_pin ? p_sm_cv : h_sm_cv.data();
     if (sm_nb) {
-      CK(hipMemcpyAsync(d_sm_bids, h_sm_ci.data(), sm_nb * 4,
+      CK(hipMemcpyAsync(d_sm_bids, ci_ptr, sm_nb * 4,
                         hipMemcpyHostToDevice, g_str));
-      CK(hipMemcpyAsync(d_sm_bvals, h_sm_cv.data(), sm_nb * 4,
+      CK(hipMemcpyAsync(d_sm_bvals, cv_ptr, sm_nb * 4,
                         hipMemcpyHostToDevice, g_str));
     }
     if (sm_nh) {
       if (llama) {
         for (const auto& h : s.llama.counts) {
-          h_sm_ci.push_back(h.first);
-          h_sm_cv.push_back((float)h.second * s.llama.frequency + s.llama.presence);
+          const float v = (float)h.second * s.llama.frequency + s.llama.presence;
+          if (use_pin) {
+            p_sm_ci[w] = h.first;
+            p_sm_cv[w] = v;
+          } else {
+            h_sm_ci.push_back(h.first);
+            h_sm_cv.push_back(v);
+          }
+          w++;
         }
       } else {
         for (auto& h : s.hist) {
-          h_sm_ci.push_back(h.first);
-          h_sm_cv.push_back(s.presence + s.frequency * (float)h.second);
+          const float v = s.presence + s.frequency * (float)h.second;
+          if (use_pin) {
+            p_sm_ci[w] = h.first;
+            p_sm_cv[w] = v;
+          } else {
+            h_sm_ci.push_back(h.first);
+            h_sm_cv.push_back(v);
+          }
+          w++;
         }
       }
-      CK(hipMemcpyAsync(d_sm_hids, h_sm_ci.data() + sm_nb, sm_nh * 4,
+      if (!use_pin) {
+        ci_ptr = h_sm_ci.data();
+        cv_ptr = h_sm_cv.data();
+      }
+      CK(hipMemcpyAsync(d_sm_hids, ci_ptr + sm_nb, sm_nh * 4,
                         hipMemcpyHostToDevice, g_str));
-      CK(hipMemcpyAsync(d_sm_hvals, h_sm_cv.data() + sm_nb, sm_nh * 4,
+      CK(hipMemcpyAsync(d_sm_hvals, cv_ptr + sm_nb, sm_nh * 4,
                         hipMemcpyHostToDevice, g_str));
     }
     return true;
@@ -12759,8 +12985,10 @@ struct GpuModel {
               : std::vector<int>{};
       bool stop = false;
       const auto t_round = std::chrono::steady_clock::now();
-      // GPU sampling prep (direction A) applies to all three legs below.
-      const bool smg = sms_gpu_active(sampler) && sms_round_shared(sampler);
+      // GPU sampling prep (direction A) applies to draft/MTP legs; plain serial
+      // fallback calls sms_sample_serial -> sms_round_shared after forward_step.
+      const bool smg = (!draft.empty() || mtp_ok) && sms_gpu_active(sampler) &&
+                       sms_round_shared(sampler);
       if (!draft.empty() && ng_legacy) {
         // ---- ngram round: long draft, whole-state checkpoint + replay ----
         VrExcuseS vr_x(*this, vr_on);
@@ -13387,7 +13615,7 @@ struct GpuModel {
         VrExcuseS vr_x(*this, vr_on);
         DrExcuseS dr_x(*this, dr_on);
         ++fallback;
-        forward(cur);
+        forward_step(cur, false);
         if (!ple_on) chist.push_back(cur);
         ple_ringpos = pos % 9;  // graph advances the device scalar
         // GPU corrections + top-k prefilter first (as the pure serial loop
@@ -13491,14 +13719,36 @@ struct GpuModel {
     enq_final();
     k_step_incr<<<1, 1, 0, cap>>>(d_pos, d_ringpos);
     CK(hipStreamEndCapture(cap, &g2));
+    hipGraph_t gall = nullptr;
+    const bool use_gall = !env_zero("QWENOX_UNIFIED_GRAPH") && !d_cs1 && d_zc_tok &&
+                          d_zc_amx && (!ple_on || d_zc_ple);
+    if (use_gall) {
+      hcf_ready_ = false;
+      hcf_rh_ = d_Rhat;
+      CK(hipStreamBeginCapture(cap, hipStreamCaptureModeGlobal));
+      enq_embed_src(d_zc_tok);
+      enq_layer(0);
+      if (ple_on) enq_ple_zc();
+      for (int l = 1; l < g_cfg.layers; l++) enq_layer(l);
+      enq_final();
+      k_step_incr_amx<<<1, 1, 0, cap>>>(d_pos, d_ringpos, d_argmax, p_zc_amx);
+      CK(hipStreamEndCapture(cap, &gall));
+    }
     g_str = nullptr;
     g_kprof_mute = false;
     CK(hipGraphInstantiate(&g1_exec, g1, nullptr, nullptr, 0));
     CK(hipGraphInstantiate(&g2_exec, g2, nullptr, nullptr, 0));
+    if (gall) {
+      CK(hipGraphInstantiate(&gall_exec, gall, nullptr, nullptr, 0));
+      CK(hipGraphDestroy(gall));
+    }
+    CK(hipGraphDestroy(g1));
+    CK(hipGraphDestroy(g2));
     vb_forget_stream(cap);
     CK(hipStreamDestroy(cap));
     graphs_ok = true;
-    fprintf(stderr, "decode graphs captured (ple=%d)\n", (int)ple_on);
+    fprintf(stderr, "decode graphs captured (ple=%d, unified=%d)\n", (int)ple_on,
+            gall_exec != nullptr ? 1 : 0);
     crashdiag::note("decode graphs captured");
   }
 
@@ -14459,8 +14709,55 @@ struct GpuModel {
     return pass;
   }
 
-  int forward(int token) {
+  int forward(int token) { return forward_step(token, true); }
+
+  int forward_step(int token, bool want_argmax) {
+    const bool time_lch = getenv("QWENOX_TIME") != nullptr;
+    auto lch_t0 = std::chrono::steady_clock::now();
     kv_prepare(pos, pos + 1);  // A2/A3: back (and unshare) row pos, both paths
+    double kv_ms = 0;
+    if (time_lch)
+      kv_ms = std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now() - lch_t0).count();
+    if (graphs_ok && gall_exec && !cvec_.probe_on()) {
+      *p_zc_tok = token;
+      double g1_ms = 0;
+      if (ple_on) {
+        auto g0 = std::chrono::steady_clock::now();
+        ple_host_raw(token, p_zc_ple);
+        g1_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - g0)
+                    .count();
+      }
+      auto lch_t1 = std::chrono::steady_clock::now();
+      CK(hipGraphLaunch(gall_exec, 0));
+      const double lch_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - lch_t1).count();
+      pos++;
+      int id = -1;
+      double sync_ms = 0;
+      if (want_argmax) {
+        auto sync0 = std::chrono::steady_clock::now();
+        CK(hipStreamSynchronize(0));
+        id = *(volatile const int*)p_zc_amx;
+        sync_ms = std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - sync0)
+                      .count();
+      }
+      if (time_lch) {
+        t_enq += g1_ms;
+        t_sync += sync_ms;
+        t_lch += lch_ms;
+        t_kv += kv_ms;
+        if (t_n % 16 == 15)
+          fprintf(stderr,
+                  "TIME: ple_host=%.2f kv=%.2f launch=%.2f g_sync=%.2f ms/tok\n",
+                  t_enq / (t_n + 1), t_kv / (t_n + 1), t_lch / (t_n + 1),
+                  t_sync / (t_n + 1));
+      }
+      t_n++;
+      return id;
+    }
     if (graphs_ok) {
       *p_token = token;
       auto g0 = std::chrono::steady_clock::now();
@@ -14477,13 +14774,16 @@ struct GpuModel {
       }
       CK(hipGraphLaunch(g2_exec, 0));
       pos++;
-      int id;
-      auto sync0 = std::chrono::steady_clock::now();
-      CK(hipMemcpy(&id, d_argmax, 4, hipMemcpyDeviceToHost));
-      if (cvec_.probe_on()) cvec_.probe_report();
-      double sync_ms =
-          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - sync0)
-              .count();
+      int id = -1;
+      double sync_ms = 0;
+      if (want_argmax || cvec_.probe_on()) {
+        auto sync0 = std::chrono::steady_clock::now();
+        CK(hipMemcpy(&id, d_argmax, 4, hipMemcpyDeviceToHost));
+        if (cvec_.probe_on()) cvec_.probe_report();
+        sync_ms = std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - sync0)
+                      .count();
+      }
       if (getenv("QWENOX_TIME")) {
         t_enq += g1_ms;
         t_sync += sync_ms;
@@ -14516,16 +14816,19 @@ struct GpuModel {
     auto enq0 = std::chrono::steady_clock::now();
     enq_final();
     pos++;
-    int id;
+    int id = -1;
     double enq_ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - enq0)
             .count();
-    auto sync0 = std::chrono::steady_clock::now();
-    CK(hipMemcpy(&id, d_argmax, 4, hipMemcpyDeviceToHost));
-    if (cvec_.probe_on()) cvec_.probe_report();
-    double sync_ms =
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - sync0)
-            .count();
+    double sync_ms = 0;
+    if (want_argmax || cvec_.probe_on() || perf) {
+      auto sync0 = std::chrono::steady_clock::now();
+      CK(hipMemcpy(&id, d_argmax, 4, hipMemcpyDeviceToHost));
+      if (cvec_.probe_on()) cvec_.probe_report();
+      sync_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - sync0)
+                    .count();
+    }
     if (getenv("QWENOX_TIME")) {
       t_enq += enq_ms;
       t_sync += sync_ms;

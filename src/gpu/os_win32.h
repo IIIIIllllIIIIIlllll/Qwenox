@@ -30,6 +30,49 @@
 #define MADV_WILLNEED 0
 #endif
 static inline int madvise(void*, size_t, int) { return 0; }
+// 批量异步预取映射冷页（单次系统调用并发下发 16 行 PLE NVMe 缺页，消除 QD=1 串行硬缺页）
+static inline void os_prefetch_ple(const uint8_t* const* addrs, size_t n, size_t rb) {
+  struct Win32VmRange {
+    void* VirtualAddress;
+    SIZE_T NumberOfBytes;
+  };
+  using PfnPrefetchVm = BOOL(WINAPI*)(HANDLE, ULONG_PTR, Win32VmRange*, ULONG);
+  static const PfnPrefetchVm pfn = []() -> PfnPrefetchVm {
+    const char* e = getenv("QWENOX_WIN_PLE_PREFETCH");
+    if (e && !strcmp(e, "0")) return nullptr;
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    return k32 ? (PfnPrefetchVm)GetProcAddress(k32, "PrefetchVirtualMemory") : nullptr;
+  }();
+  if (!pfn || !n || !rb) return;
+  // 热页免预取：探测首行首字节，页在 working set（或 standby 软缺页）时
+  // 访问极快（<<100us）——此时 PrefetchVirtualMemory 对常驻页只是空走页表，
+  // 实测反而耗 ~0.3-0.4ms/tok（OPT_ple_pf0 热页快 1.5% 的实证），直接跳过。
+  // 首行硬缺页（Phison ~0.3-1ms）才为其余行并发预取：与旧串行路径同价的
+  // 一次缺页，换掉余下 15 行的串行硬缺页。
+  LARGE_INTEGER pt0, pt1, fr;
+  QueryPerformanceCounter(&pt0);
+  (void)*(const volatile uint8_t*)addrs[0];
+  QueryPerformanceCounter(&pt1);
+  QueryPerformanceFrequency(&fr);
+  if ((double)(pt1.QuadPart - pt0.QuadPart) * 1e6 / (double)fr.QuadPart < 100.0)
+    return;
+  Win32VmRange vr[64];
+  ULONG_PTR cnt = 0;
+  for (size_t i = 0; i < n && cnt < 64; i++) {
+    uintptr_t p0 = (uintptr_t)addrs[i] & ~(uintptr_t)4095;
+    uintptr_t p1 = ((uintptr_t)addrs[i] + rb - 1) & ~(uintptr_t)4095;
+    SIZE_T bytes = (SIZE_T)(p1 - p0 + 4096);
+    bool dup = false;
+    for (ULONG_PTR j = 0; j < cnt; j++) {
+      if ((uintptr_t)vr[j].VirtualAddress == p0 && vr[j].NumberOfBytes >= bytes) {
+        dup = true;
+        break;
+      }
+    }
+    if (!dup) vr[cnt++] = {(void*)p0, bytes};
+  }
+  if (cnt) pfn(GetCurrentProcess(), cnt, vr, 0);
+}
 #define isatty _isatty
 #define mkdir(p, m) _mkdir(p)
 
