@@ -106,3 +106,29 @@ pmlog.exe watch 60 pmlog.log       :: 每 250ms 采样时钟/活动率/功耗到
 
 判定流程：空闲 dump 一次 → CPU 满载（PowerShell `1..16 | % { Start-Job { while($true){} } }`）
 dump 两次 → GPU 满载（跑推理或 hipMemset 循环）dump 两次，看哪些传感器跟随哪类负载。
+
+---
+
+## 附：解码冷启动归因——DVFS 频率爬升（2026-11-26 实测）
+
+引擎重启或空闲数分钟后，前 ~35 秒 decode 慢 ~10%（34 → 37.1 平台期），
+根因是**平台电源管理的频率爬升**，与代码、PLE 页缓存、预热缺失均无关：
+
+- **排除 PLE 冷页**：同一 seeded prompt 的第 2 个请求（其 n-gram 行已在页
+  缓存）并不变快；且 4 分钟空闲（缓存不失效）后性能重新回落。
+- **排除"重负载热身"**：13 秒 ~1900 tok/s prefill（接近峰值 GEMM）之后，
+  decode 依然只有 ~33。**引擎启动跑 warm pass 解决不了它。**
+- **坐实电源管理**：`powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c`
+  （高性能）后，闲置 4 分钟首个请求立即 37.2 tok/s，无 ramp。
+
+各平台旋钮：Windows 用上面的高性能 GUID（`381b4222-f694-41f0-9685-ff5bb260df2e`
+回平衡）；Linux 用 `amd_pstate=active` + performance governor，并用
+`echo high > /sys/class/drm/card*/device/power_dpm_force_performance_level`
+直接锁 GPU DPM（效果更强的等价旋钮，`auto` 恢复）。
+
+次要项：**进程重启后**（非空闲后）PLE 表（47.7 GiB mmap）页缓存为空，前
+~1-2K decode token 伴随 ~500-2000 次/秒硬缺页，NVMe 上代价几个百分点、
+自愈快，量级远小于电源 ramp；表放最快的盘即可（本机已在 NVMe）。
+
+反模式：不要做引擎内"启动 warm decode"对抗 ramp（实测无效，ramp 由电源
+策略的时间/空闲驱动而非利用率）；不要 keep-alive 心跳负载（偷带宽费电）。
