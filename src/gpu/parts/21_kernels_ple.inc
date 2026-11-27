@@ -332,8 +332,9 @@ __global__ void k_corr_apply_hdr(float* __restrict__ x, int stride,
                                  const int* __restrict__ ci,
                                  const float* __restrict__ cv,
                                  const int* __restrict__ hdr) {
-  float* xr = x + (size_t)blockIdx.y * stride;
   const int nb = hdr[0], nh = hdr[1];
+  if ((nb | nh) == 0) return;
+  float* xr = x + (size_t)blockIdx.y * stride;
   const float repeat = __int_as_float(hdr[3]);
   for (int i = threadIdx.x; i < nb; i += blockDim.x) xr[ci[i]] += cv[i];
   __syncthreads();
@@ -344,6 +345,26 @@ __global__ void k_corr_apply_hdr(float* __restrict__ x, int stride,
   }
 }
 
+__global__ void k_f32_copy_vec4_hdr(float* __restrict__ dst, const float* __restrict__ src,
+                                    size_t n, const int* __restrict__ hdr) {
+  if ((hdr[0] | hdr[1]) == 0) return;
+  size_t n4 = n >> 2;
+  float4* d4 = (float4*)dst;
+  const float4* s4 = (const float4*)src;
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
+       i += (size_t)gridDim.x * blockDim.x)
+    d4[i] = s4[i];
+  if (blockIdx.x == 0) {
+    for (size_t i = (n4 << 2) + threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
+  }
+}
+
+__global__ void k_zero_u32(unsigned* __restrict__ dst, int n) {
+  for (int i = (int)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += (int)gridDim.x * blockDim.x)
+    dst[i] = 0u;
+}
+
 // Radix top-k over fp32 logits via their monotonic u32 keys (same map as
 // amx_pack). Two 12-bit histogram passes narrow the k-th value to a 24-bit
 // prefix; collect then writes every key >= T (the true top-k is a subset).
@@ -352,6 +373,39 @@ __global__ void k_corr_apply_hdr(float* __restrict__ x, int stride,
 __device__ __forceinline__ unsigned tk_key(float v) {
   unsigned u = __float_as_uint(v);
   return u ^ ((u & 0x80000000u) ? 0xFFFFFFFFu : 0x80000000u);
+}
+
+template <int PASS>
+__global__ void k_tk_hist_hdr(const float* __restrict__ logits,
+                              const float* __restrict__ scratch, int n, int stride,
+                              const int* __restrict__ ctrl,
+                              unsigned* __restrict__ hist,
+                              const int* __restrict__ hdr) {
+  __shared__ unsigned sh[4096];
+  for (int i = threadIdx.x; i < 4096; i += blockDim.x) sh[i] = 0;
+  __syncthreads();
+  const int row = blockIdx.y;
+  if (!PASS || !ctrl[(size_t)row * 8 + 3]) {
+    const unsigned pfx = PASS ? (unsigned)ctrl[(size_t)row * 8 + 0] : 0u;
+    const float* base = ((hdr[0] | hdr[1]) != 0) ? scratch : logits;
+    const float* xr = base + (size_t)row * stride;
+    const int chunk = (n + gridDim.x - 1) / gridDim.x;
+    const int lo = blockIdx.x * chunk, hi = min(n, lo + chunk);
+    for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+      const unsigned k = tk_key(xr[i]);
+      if (!PASS) {
+        atomicAdd(&sh[k >> 20], 1u);
+      } else if ((k >> 20) == pfx) {
+        atomicAdd(&sh[(k >> 8) & 0xFFFu], 1u);
+      }
+    }
+    __syncthreads();
+    unsigned* h = hist + (size_t)row * 4096;
+    for (int i = threadIdx.x; i < 4096; i += blockDim.x) {
+      const unsigned c = sh[i];
+      if (c) atomicAdd(&h[i], c);
+    }
+  }
 }
 
 template <int PASS>
@@ -472,6 +526,30 @@ __global__ void k_tk_init_hdr(int* __restrict__ ctrl, const int* __restrict__ hd
     c[3] = 0;
     c[4] = 0;
     c[5] = 0;
+  }
+}
+
+__global__ void k_tk_collect_hdr(const float* __restrict__ logits,
+                                 const float* __restrict__ scratch, int n, int stride,
+                                 const int* __restrict__ ctrl,
+                                 int* __restrict__ ids, float* __restrict__ vals,
+                                 int* __restrict__ cand_n, int tcap,
+                                 const int* __restrict__ hdr) {
+  const int row = blockIdx.y;
+  const unsigned T = (unsigned)ctrl[(size_t)row * 8 + 4];
+  const float* base = ((hdr[0] | hdr[1]) != 0) ? scratch : logits;
+  const float* xr = base + (size_t)row * stride;
+  const int chunk = (n + gridDim.x - 1) / gridDim.x;
+  const int lo = blockIdx.x * chunk, hi = min(n, lo + chunk);
+  for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+    const float xv = xr[i];
+    if (tk_key(xv) >= T) {
+      const int idx = atomicAdd(&cand_n[row], 1);
+      if (idx < tcap) {
+        ids[(size_t)row * tcap + idx] = i;
+        vals[(size_t)row * tcap + idx] = xv;
+      }
+    }
   }
 }
 

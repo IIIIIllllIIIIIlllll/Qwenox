@@ -4311,7 +4311,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     } else {
       mtp_live = false;  // plain decode leaves the MTP layer stale
     }
-    if (!use_spec && !use_ngram && !use_chain && !use_df2)
+    if (!use_spec && !use_ngram && !use_chain && !use_df2) {
       for (int i = 0; i < g.max_tokens; i++) {
         if (eos.count(cur)) {
           reason = "done";
@@ -4341,11 +4341,13 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
           hist.push_back(fed);
           // Serial decode advances one token at a time: checkpoint right
           // after a ckpt token (mtp is stale on this path).
-          if (!ckpt_toks.empty() && ckpt_toks.count(fed) &&
-              rckpt::save(m, hist, false)) {
-            fprintf(stderr, "%s ckpt: saved %zu tokens (after token %d, req %lld)\n",
-                    log_ts(), hist.size(), fed, (long long)g.req);
-            note_pause(hist.size(), fed);
+          if (!ckpt_toks.empty() && ckpt_toks.count(fed)) {
+            m.gdn_s_to_f32();
+            if (rckpt::save(m, hist, false)) {
+              fprintf(stderr, "%s ckpt: saved %zu tokens (after token %d, req %lld)\n",
+                      log_ts(), hist.size(), fed, (long long)g.req);
+              note_pause(hist.size(), fed);
+            }
           }
           if (cancel) break;
           m.yield_point();
@@ -4361,11 +4363,13 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
           hist.push_back(fed);
           // Serial decode advances one token at a time: checkpoint right
           // after a ckpt token (mtp is stale on this path).
-          if (!ckpt_toks.empty() && ckpt_toks.count(fed) &&
-              rckpt::save(m, hist, false)) {
-            fprintf(stderr, "%s ckpt: saved %zu tokens (after token %d, req %lld)\n",
-                    log_ts(), hist.size(), fed, (long long)g.req);
-            note_pause(hist.size(), fed);
+          if (!ckpt_toks.empty() && ckpt_toks.count(fed)) {
+            m.gdn_s_to_f32();
+            if (rckpt::save(m, hist, false)) {
+              fprintf(stderr, "%s ckpt: saved %zu tokens (after token %d, req %lld)\n",
+                      log_ts(), hist.size(), fed, (long long)g.req);
+              note_pause(hist.size(), fed);
+            }
           }
           if (g.sample) {
             // sms_serial: GPU corrections + top-k prefilter, host replays the
@@ -4383,6 +4387,8 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
         if (cancel) break;
         m.yield_point();
       }
+      m.gdn_s_to_f32();
+    }
     if (dead) {  // client gone: no D line, no end-of-turn snapshot
       perfsnap::write_idle();
       c.in_flight = false;

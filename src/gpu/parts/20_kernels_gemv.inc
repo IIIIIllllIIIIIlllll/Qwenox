@@ -1181,6 +1181,106 @@ __global__ __launch_bounds__(128, 8) void k_gdn_step_gn_128(
   out[h * 128 + t] = yv * inv * w_gn[t] / (1.f + expf(-zz));
 }
 
+// BF16-storage variant of k_gdn_step_gn_128 (QWENOX_GDN_STATE_BF16=1):
+// identical 192x128 (768-wave) high-occupancy grid and FP32 register math,
+// halving S DRAM traffic from 226.5 MB/tok to 113.25 MB/tok.
+__global__ __launch_bounds__(128, 8) void k_gdn_step_gn_128_bf16(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, const float* __restrict__ g,
+    const float* __restrict__ beta, uint16_t* __restrict__ S,
+    const float* __restrict__ z, const float* __restrict__ w_gn,
+    float* __restrict__ ytmp, float* __restrict__ out,
+    int* __restrict__ cnt, float eps) {
+  const int h = blockIdx.x >> 2, bh = blockIdx.x & 3;
+  const int t = threadIdx.x;
+  const int il = t & 31, jc = t >> 5;
+  const int i = bh * 32 + il, j0 = jc * 32;
+  __shared__ float skh[128];
+  __shared__ float sqh[128];
+  __shared__ float part[4][32];
+  __shared__ int s_last;
+  skh[t] = k[(h / 3) * 128 + t];
+  sqh[t] = q[(h / 3) * 128 + t];
+  __syncthreads();
+
+  uint16_t* Sh = S + (size_t)h * 128 * 128;
+  const float alpha = expf(g[h]);
+  const float be = beta[h];
+  float s_reg[32];
+  float kv = 0.f;
+#pragma unroll
+  for (int u = 0; u < 32; u++) {
+    const int j = j0 + u;
+    const uint32_t su = (uint32_t)Sh[j * 128 + i] << 16;
+    float s = __uint_as_float(su) * alpha;
+    asm volatile("" : "+v"(s));
+    s_reg[u] = s;
+    kv += s * skh[j];
+  }
+  part[jc][il] = kv;
+  __syncthreads();
+  const float kvf = part[0][il] + part[1][il] + part[2][il] + part[3][il];
+  const float delta = (v[h * 128 + i] - kvf) * be;
+  float o = 0.f;
+#pragma unroll
+  for (int u = 0; u < 32; u++) {
+    const int j = j0 + u;
+    float s = s_reg[u] + skh[j] * delta;
+    uint32_t u32 = __float_as_uint(s);
+    uint16_t bf = (uint16_t)((u32 + 0x7fffu + ((u32 >> 16) & 1u)) >> 16);
+    Sh[j * 128 + i] = bf;
+    o += s * sqh[j];
+  }
+  __syncthreads();
+  part[jc][il] = o;
+  __syncthreads();
+  if (jc == 0) ytmp[h * 128 + i] = part[0][il] + part[1][il] + part[2][il] + part[3][il];
+  __threadfence();
+  __syncthreads();
+  if (t == 0) s_last = atomicAdd(cnt + h, 1) == 3;
+  __syncthreads();
+  if (!s_last) return;
+  __threadfence();
+  const float yv = __builtin_nontemporal_load(ytmp + h * 128 + t);
+  skh[t] = __fmul_rn(yv, yv);
+  __syncthreads();
+  if (t < 64) skh[t] += skh[t + 64];
+  __syncthreads();
+  if (t < 32) {
+    float sv = skh[t] + skh[t + 32];
+    sv += __shfl_down(sv, 16, 32);
+    sv += __shfl_down(sv, 8, 32);
+    sv += __shfl_down(sv, 4, 32);
+    sv += __shfl_down(sv, 2, 32);
+    sv += __shfl_down(sv, 1, 32);
+    if (t == 0) skh[0] = sv;
+  }
+  if (t == 0) atomicExch(cnt + h, 0);
+  __syncthreads();
+  const float inv = rsqrtf(skh[0] / 128 + eps);
+  const float zz = z[h * 128 + t];
+  out[h * 128 + t] = yv * inv * w_gn[t] / (1.f + expf(-zz));
+}
+
+__global__ void k_f32_to_bf16_vec(const float* __restrict__ src, uint16_t* __restrict__ dst,
+                                  size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  size_t st = (size_t)gridDim.x * blockDim.x;
+  for (; i < n; i += st) {
+    uint32_t u = __float_as_uint(src[i]);
+    dst[i] = (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+  }
+}
+
+__global__ void k_bf16_to_f32_vec(const uint16_t* __restrict__ src, float* __restrict__ dst,
+                                  size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  size_t st = (size_t)gridDim.x * blockDim.x;
+  for (; i < n; i += st) {
+    dst[i] = __uint_as_float((uint32_t)src[i] << 16);
+  }
+}
+
 // Two-kernel split of k_gdn_step_gn_128 (QWENOX_GDN_STEP_F3): phase kernel
 // (192 blocks, same wave-aligned occupancy) ends after the yv partial write —
 // no threadfence/atomic at all — and the tail RMSNorm runs as a separate tiny
@@ -2659,6 +2759,77 @@ __global__ void k_q4cp_gemv_gd_topk_h16(
 #pragma unroll
     for (int s = 0; s < KPT; s++) y += ws[tok * id_stride + s] * acc[s];
     out[(size_t)tok * out_stride + r] = y;
+  }
+}
+
+// High-occupancy zero-idle P=1 MoE down_proj (QWENOX_MOE_DN_FAST=1):
+// 320 blocks x 160 threads (5 warps/block = 1600 waves, 8 rows/block, 2 experts/warp).
+// Within each warp: 8 rows x 4 lanes/row; cols=640 -> 20 groups = 4 lanes x 5 groups
+// (100% lane utilization vs 75% idle on iter 2 in h16), only 2 accumulators/thread
+// (cuts VGPRs), and LDS 5-warp reduction (zero global atomics).
+template <int GSH = 2>
+__global__ __launch_bounds__(160, 6) void k_q4cp_gemv_gd_topk_5w(
+    const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales,
+    const float* __restrict__ cb, const float* __restrict__ xs,
+    float* __restrict__ out, const int* __restrict__ ids,
+    const float* __restrict__ ws, uint64_t rows_per, uint64_t cols,
+    uint64_t scale_stride, uint64_t x_stride) {
+  __shared__ float cbf[16];
+  __shared__ float sp[5][8];
+  const int tid = threadIdx.x;
+  if (tid < 16) cbf[tid] = cb[tid];
+  __syncthreads();
+  const int w = tid >> 5;
+  const int lane = tid & 31;
+  const int ri = lane >> 2;
+  const int sub = lane & 3;
+  const uint64_t r = (uint64_t)blockIdx.x * 8 + ri;
+  if (r < rows_per) {
+    float sum_w = 0.f;
+#pragma unroll
+    for (int e2 = 0; e2 < 2; e2++) {
+      const int s = w * 2 + e2;
+      const uint64_t row = (uint64_t)ids[s] * rows_per + r;
+      const uint8_t* rc = codes + row * (cols / 2);
+      const uint8_t* rs = scales + row * scale_stride;
+      const float* x = xs + (size_t)s * x_stride;
+      float acc = 0.f;
+#pragma unroll
+      for (int it = 0; it < 5; it++) {
+        const uint64_t g = (uint64_t)(it * 4 + sub);
+        const uint4 pk = *(const uint4*)(rc + g * 16);
+        const float sc = __half2float(*(const __half*)(rs + (g >> GSH) * 2));
+        const float* xg = x + g * 32;
+        const uint32_t wv[4] = {pk.x, pk.y, pk.z, pk.w};
+        float a = 0.f;
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+          const float4 t0 = *(const float4*)(xg + i * 8);
+          const float4 t1 = *(const float4*)(xg + i * 8 + 4);
+          uint32_t v = wv[i];
+          a = fmaf(cbf[v & 0xf], t0.x, a); v >>= 4;
+          a = fmaf(cbf[v & 0xf], t0.y, a); v >>= 4;
+          a = fmaf(cbf[v & 0xf], t0.z, a); v >>= 4;
+          a = fmaf(cbf[v & 0xf], t0.w, a); v >>= 4;
+          a = fmaf(cbf[v & 0xf], t1.x, a); v >>= 4;
+          a = fmaf(cbf[v & 0xf], t1.y, a); v >>= 4;
+          a = fmaf(cbf[v & 0xf], t1.z, a); v >>= 4;
+          a = fmaf(cbf[v & 0xf], t1.w, a);
+        }
+        acc += a * sc;
+      }
+      acc += __shfl_xor(acc, 2, 32);
+      acc += __shfl_xor(acc, 1, 32);
+      sum_w += ws[s] * acc;
+    }
+    if (sub == 0) sp[w][ri] = sum_w;
+  }
+  __syncthreads();
+  if (tid < 8) {
+    const uint64_t rr = (uint64_t)blockIdx.x * 8 + tid;
+    if (rr < rows_per) {
+      out[rr] = sp[0][tid] + sp[1][tid] + sp[2][tid] + sp[3][tid] + sp[4][tid];
+    }
   }
 }
 

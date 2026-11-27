@@ -2256,16 +2256,11 @@ __global__ __launch_bounds__(160, 6) void k_hcf_upc_160(const uint8_t* __restric
     const uint32_t sb = *(const uint32_t*)(row + 240 + g * 4);
     const float sc = __half2float(__ushort_as_half((unsigned short)(sb & 0xffffu)));
     const float bi = __half2float(__ushort_as_half((unsigned short)(sb >> 16)));
-    const uint4 l0 = *(const uint4*)(row + g * 32);
-    const uint4 l1 = *(const uint4*)(row + g * 32 + 16);
-    const uint4 hp = *(const uint4*)(row + 160 + g * 16);
-    const uint32_t lw8[8] = {l0.x, l0.y, l0.z, l0.w, l1.x, l1.y, l1.z, l1.w};
-    const uint32_t hw4[4] = {hp.x, hp.y, hp.z, hp.w};
     float dx = 0.f;
-#pragma unroll
+#pragma unroll 2
     for (int i8 = 0; i8 < 8; i8++) {
-      const uint32_t lw = lw8[i8];
-      const uint32_t hw = (hw4[i8 >> 1] >> (16 * (i8 & 1))) & 0xffffu;
+      const uint32_t lw = *(const uint32_t*)(row + g * 32 + i8 * 4);
+      const uint32_t hw = (uint32_t)*(const uint16_t*)(row + 160 + g * 16 + i8 * 2);
       const float4 a = *(const float4*)(st_sh + g * 64 + i8 * 8);
       const float4 bv = *(const float4*)(st_sh + g * 64 + i8 * 8 + 4);
       const float xv[8] = {a.x, a.y, a.z, a.w, bv.x, bv.y, bv.z, bv.w};
@@ -2298,6 +2293,72 @@ __global__ __launch_bounds__(160, 6) void k_hcf_upc_160(const uint8_t* __restric
       a += sterm[bb * 8 + tid][0] * sterm[bb * 8 + tid][1];
     }
     xo[blockIdx.x * 8 + tid] = a / 4;
+  }
+}
+
+// Coalesced high-wave HC mix-up + combine (QWENOX_HCF_UPC_COAL=1):
+// 320 blocks x 256 threads (2560 waves, 32 rows/block, 8 lanes/row, 0% dead lanes).
+// For each group g=0..4, 8 consecutive lanes load 32 contiguous bytes of lw
+// and 16 contiguous bytes of hw (100% coalesced 32B/16B cacheline sectors!).
+__global__ __launch_bounds__(256, 4) void k_hcf_upc_coal(const uint8_t* __restrict__ wq,
+                                                         const float* __restrict__ t,
+                                                         const float* __restrict__ rh,
+                                                         float* __restrict__ xo, int st) {
+  const int tid = threadIdx.x;
+  __shared__ float st_sh[320];
+  __shared__ float ssx[5];
+  __shared__ float sG[32];
+  st_sh[tid] = t[tid];
+  if (tid < 64) st_sh[256 + tid] = t[256 + tid];
+  __syncthreads();
+  if (tid < 5) {
+    float sx = 0.f;
+#pragma unroll
+    for (int k = 0; k < 64; k++) sx += st_sh[tid * 64 + k];
+    ssx[tid] = sx;
+  }
+  __syncthreads();
+  const int rr = tid >> 3, li = tid & 7;
+  const int b = rr >> 3, j = rr & 7;
+  const int r = b * 2560 + blockIdx.x * 8 + j;
+  const uint8_t* row = wq + (size_t)r * st;
+  float term[5];
+#pragma unroll
+  for (int g = 0; g < 5; g++) {
+    const uint32_t lw = *(const uint32_t*)(row + g * 32 + li * 4);
+    const uint32_t hw = (uint32_t)*(const uint16_t*)(row + 160 + g * 16 + li * 2);
+    const float4 a = *(const float4*)(st_sh + g * 64 + li * 8);
+    const float4 bv = *(const float4*)(st_sh + g * 64 + li * 8 + 4);
+    const float xv[8] = {a.x, a.y, a.z, a.w, bv.x, bv.y, bv.z, bv.w};
+    float dx = 0.f;
+#pragma unroll
+    for (int e = 0; e < 8; e++) {
+      const uint32_t lo = (lw >> (4 * e)) & 15u;
+      const uint32_t hi = (hw >> (2 * e)) & 3u;
+      dx = fmaf((float)(lo | (hi << 4)), xv[e], dx);
+    }
+    dx += __shfl_xor(dx, 4, 32);
+    dx += __shfl_xor(dx, 2, 32);
+    dx += __shfl_xor(dx, 1, 32);
+    if (li == 0) {
+      const uint32_t sb = *(const uint32_t*)(row + 240 + g * 4);
+      const float sc = __half2float(__ushort_as_half((unsigned short)(sb & 0xffffu)));
+      const float bi = __half2float(__ushort_as_half((unsigned short)(sb >> 16)));
+      term[g] = fmaf(sc, dx, bi * ssx[g]);
+    }
+  }
+  if (li == 0) {
+    float s0 = term[0] + term[4];
+    float G = (s0 + term[2]) + (term[1] + term[3]);
+    sG[rr] = 1.f / (1.f + expf(-G));
+  }
+  __syncthreads();
+  if (tid < 8) {
+    const int i = blockIdx.x * 8 + tid;
+    float a = 0.f;
+#pragma unroll
+    for (int bb = 0; bb < 4; bb++) a += sG[bb * 8 + tid] * rh[(size_t)bb * 2560 + i];
+    xo[i] = a / 4;
   }
 }
 

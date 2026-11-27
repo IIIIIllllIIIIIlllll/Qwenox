@@ -148,6 +148,8 @@ struct GpuModel {
   float *d_t320, *d_G, *d_w4;
   float *d_qkv, *d_g48, *d_beta48, *d_z;  // GDN scratch (z also used by QSA gate)
   float* d_S = nullptr;                   // (gdn_layers, 48, 128, 128)
+  uint16_t* d_S_bf16 = nullptr;           // optional BF16 mirror (QWENOX_GDN_STATE_BF16=1)
+  bool s_bf16_valid = false;              // true while d_S_bf16 holds the live decode state
   float* d_convst = nullptr;              // (gdn_layers, 3, 10240)
   float* d_convw = nullptr;               // (gdn_layers, 10240, 4) fp32
   float *d_Alog, *d_dtbias;               // (gdn_layers, 48)
@@ -1157,6 +1159,7 @@ struct GpuModel {
   int* d_sm_cand_ids_zc = nullptr;
   float* p_sm_cand_vals_zc = nullptr;
   float* d_sm_cand_vals_zc = nullptr;
+  std::vector<int> sms_ord_;       // reused sort index scratch for samp_wait_draw
   // Rollback snapshots (spec verify): S/convst per accepted depth, indexer
   // proj rows per QSA layer. Written only when spec_snap is set. One slot's
   // verify chunk needs gamma+1 <= 9 rows (gamma <= 8); kVSnapRows reserves
@@ -1237,7 +1240,7 @@ struct GpuModel {
   X(last_spec_proposed) X(last_ng_rounds) X(last_ng_proposed)                \
   X(last_ng_accepted) X(live_spec_rounds) X(live_spec_commits)                \
   X(live_spec_proposed) X(g1_exec) X(g2_exec) X(gall_exec) X(gall_samp_exec)   \
-  X(d_S) X(d_convst) X(d_ring) X(d_iraw) X(d_R) X(d_pos) X(d_ringpos)         \
+  X(d_S) X(d_S_bf16) X(s_bf16_valid) X(d_convst) X(d_ring) X(d_iraw) X(d_R) X(d_pos) X(d_ringpos) \
   X(d_miraw) X(d_mpos) X(d_ckpt) X(d_mring_ckpt)
   struct SeqState {
 #define QWENOX_SLOT_DECL(f) decltype(GpuModel::f) f{};
@@ -1256,6 +1259,7 @@ struct GpuModel {
   }
   void bind(int s) {
     if (s == bound_) return;
+    gdn_s_to_f32();
     CK(hipDeviceSynchronize());  // nothing of the outgoing slot still in flight
     swap_slot(slots_[(size_t)bound_]);  // members <- placeholder
     swap_slot(slots_[(size_t)s]);       // members <- slot s
@@ -1347,6 +1351,11 @@ struct GpuModel {
     int ngdn = g_cfg.layers - g_cfg.layers / 4;  // 36
     DALLOC(&d_S, (size_t)ngdn * 48 * 128 * 128 * 4);
     CK(hipMemset(d_S, 0, (size_t)ngdn * 48 * 128 * 128 * 4));
+    if (gdn_state_bf16_on()) {
+      DALLOC(&d_S_bf16, (size_t)ngdn * 48 * 128 * 128 * 2);
+      CK(hipMemset(d_S_bf16, 0, (size_t)ngdn * 48 * 128 * 128 * 2));
+      fprintf(stderr, "gdn state: BF16 decode mirror enabled (QWENOX_GDN_STATE_BF16=1)\n");
+    }
     DALLOC(&d_convst, (size_t)ngdn * 3 * 10240 * 4);
     CK(hipMemset(d_convst, 0, (size_t)ngdn * 3 * 10240 * 4));
     DALLOC(&d_convw, (size_t)ngdn * 10240 * 4 * 4);
@@ -2939,7 +2948,11 @@ struct GpuModel {
         getenv("QWENOX_GDN_STEP_F3") != nullptr && !env_zero("QWENOX_GDN_STEP_F3");
     if (gdn_step_gn) {
       if (!gdn_pair) gemv(zw, x, d_z);
-      if (gdn_step_fast && gdn_step_f3 && d_gdn_ytmp_) {
+      if (gdn_step_fast && d_S_bf16 && d_gdn_ytmp_ && gdn_step_cnt_) {
+        k_gdn_step_gn_128_bf16<<<192, 128, 0, g_str>>>(
+            qp, kp, vp, d_g48, d_beta48, d_S_bf16 + (size_t)gi * 48 * 128 * 128, d_z,
+            d_gdnnorm + (size_t)gi * 128, d_gdn_ytmp_, vp, gdn_step_cnt_, g_cfg.norm_eps);
+      } else if (gdn_step_fast && gdn_step_f3 && d_gdn_ytmp_) {
         k_gdn_step_gn_yt<<<192, 128, 0, g_str>>>(
             qp, kp, vp, d_g48, d_beta48, d_S + (size_t)gi * 48 * 128 * 128, d_z,
             d_gdn_ytmp_);
@@ -3151,6 +3164,14 @@ struct GpuModel {
   void moe_down1_t(int k, const WView& dn, const int* topids) {
     const XCodes c = xcodes(dn);
     if (moe_down_direct(k, dn)) {
+      static const bool moe_dn_fast =
+          getenv("QWENOX_MOE_DN_FAST") != nullptr && !env_zero("QWENOX_MOE_DN_FAST");
+      if (moe_dn_fast && g_cfg.d % 8 == 0) {
+        k_q4cp_gemv_gd_topk_5w<GSH><<<(unsigned)(g_cfg.d / 8), 160, 0, g_str>>>(
+            c.codes, c.scales, c.cb, d_hid, d_moeacc, topids, d_topw,
+            (uint64_t)g_cfg.d, dn.cols, dn.scale_stride, (uint64_t)g_cfg.moe_mid);
+        return;
+      }
       const uint64_t row_pairs = (g_cfg.d + 1) / 2, warps_per_block = 128 / 32;
       k_q4cp_gemv_gd_topk_h16<10, GSH><<<(unsigned)((row_pairs + warps_per_block - 1) / warps_per_block),
                                     128, 0, g_str>>>(
@@ -4231,23 +4252,26 @@ struct GpuModel {
     // 200-block form), so the generic stays the default.
     static const bool hcf_down_nsk =
         getenv("QWENOX_HCF_DOWN_NSK") != nullptr && !env_zero("QWENOX_HCF_DOWN_NSK");
+    static const bool hcf_down_c10k =
+        getenv("QWENOX_HCF_DOWN_C10K") != nullptr && !env_zero("QWENOX_HCF_DOWN_C10K");
     const int gps = 32, ns = (int)((dn.cols / 64 + gps - 1) / gps);
     if (hcf_fast && hcf_down_nsk && dn.rows == 320 && dn.cols == 10240 && ns == 5) {
       k_hcf_down_c10k_nsk<<<80, 128, 0, g_str>>>(dn.data, hcf_rh_, d_t320,
                                                (int)dn.scale_stride);
+    } else if (hcf_fast && hcf_down_c10k && dn.rows == 320 && dn.cols == 10240 && ns == 5) {
+      k_hcf_down_c10k<<<dim3(40, 5), 256, 0, g_str>>>(dn.data, hcf_rh_, hcf_part_, d_t320,
+                                                      (int)dn.scale_stride, hcf_cnt_);
     } else {
       k_hcf_down<<<dim3((unsigned)((dn.rows + 7) / 8), (unsigned)ns), 256, 0, g_str>>>(
           dn.data, hcf_rh_, hcf_part_, d_t320, (int)dn.rows, (int)dn.cols,
           (int)dn.scale_stride, gps, hcf_cnt_);
     }
-    // QWENOX_HCF_UPC_U4 (experiment, default off): uint4-vectorized
-    // k_hcf_upc_160. Bit-identical and faster at L2-resident microbench
-    // (~+9%), but in the DRAM-streaming serve its lane-strided uint4 reads
-    // half-fill 32B sectors (serve g_sync +0.12 ms), so the scalar form stays
-    // the default.
-    static const bool hcf_upc_u4 =
-        getenv("QWENOX_HCF_UPC_U4") != nullptr && !env_zero("QWENOX_HCF_UPC_U4");
-    if (hcf_fast && hcf_upc_u4 && up.rows == 10240 && up.cols == 320) {
+    static const bool hcf_upc_coal =
+        getenv("QWENOX_HCF_UPC_COAL") != nullptr && !env_zero("QWENOX_HCF_UPC_COAL");
+    if (hcf_fast && hcf_upc_coal && up.rows == 10240 && up.cols == 320) {
+      k_hcf_upc_coal<<<320, 256, 0, g_str>>>(up.data, d_t320, hcf_rh_, x_out,
+                                             (int)up.scale_stride);
+    } else if (hcf_fast && up.rows == 10240 && up.cols == 320) {
       k_hcf_upc_160<<<320, 160, 0, g_str>>>(up.data, d_t320, hcf_rh_, x_out,
                                             (int)up.scale_stride);
     } else {
@@ -4358,7 +4382,7 @@ struct GpuModel {
     pf_join();
     tock(3, t3);
   }
-  void enq_final() {
+  void enq_final(bool with_argmax = true) {
     if (hcf_active()) {
       if (!hcf_ready_) hcf_norm("hyper_connection_mixer");
       hcf_rest("hyper_connection_mixer", d_x);
@@ -4371,7 +4395,7 @@ struct GpuModel {
       const VizTap t = vz_tap(g_cfg.layers, false, true);
       if (t.ring) k_viz_top5<<<1, 256, 0, g_str>>>(d_logits, g_cfg.vocab, t);
     }
-    argmax_rows(d_logits, g_cfg.vocab, 1, d_amx_cand, d_argmax, g_str);
+    if (with_argmax) argmax_rows(d_logits, g_cfg.vocab, 1, d_amx_cand, d_argmax, g_str);
   }
 
   // =================== prefill batch (Phase 3a) ==============================
@@ -14238,20 +14262,6 @@ struct GpuModel {
     if (use_gall && gall_hi_st_ && samp_graph_on && p_sm_ci && p_sm_cv &&
         d_sm_ci_zc && d_sm_cv_zc) {
       if (!d_sm_scratch) DALLOC(&d_sm_scratch, (size_t)SMS_ROWS * g_cfg.vocab * 4);
-      // Probe hipMemsetAsync capture support first: if it is capture-illegal
-      // here, keep the eager sms path instead of failing startup.
-      bool memset_ok = false;
-      {
-        hipGraph_t probe = nullptr;
-        CK(hipStreamBeginCapture(cap, hipStreamCaptureModeGlobal));
-        hipError_t me = hipMemsetAsync(d_sm_hist, 0, 4096 * sizeof(unsigned), cap);
-        hipError_t ee = hipStreamEndCapture(cap, &probe);
-        memset_ok = me == hipSuccess && ee == hipSuccess && probe != nullptr;
-        if (probe) CK(hipGraphDestroy(probe));
-      }
-      if (!memset_ok)
-        fprintf(stderr, "sampling graph: hipMemsetAsync not capturable; eager sms path stays\n");
-      if (memset_ok) {
       hcf_ready_ = false;
       hcf_rh_ = d_Rhat;
       CK(hipStreamBeginCapture(cap, hipStreamCaptureModeGlobal));
@@ -14259,28 +14269,28 @@ struct GpuModel {
       enq_layer(0);
       if (ple_on) enq_ple_zc();
       for (int l = 1; l < g_cfg.layers; l++) enq_layer(l);
-      enq_final();
+      enq_final(false);
       const int vocab = g_cfg.vocab;
-      k_f32_copy_vec4<<<std::min<unsigned>(256u, (unsigned)((vocab / 4 + 255) / 256)),
-                        256, 0, cap>>>(d_sm_scratch, d_logits, vocab);
+      k_f32_copy_vec4_hdr<<<std::min<unsigned>(256u, (unsigned)((vocab / 4 + 255) / 256)),
+                            256, 0, cap>>>(d_sm_scratch, d_logits, vocab, d_zc_sm_hdr);
       k_corr_apply_hdr<<<dim3(1, 1), 256, 0, cap>>>(d_sm_scratch, vocab, d_sm_ci_zc,
                                                     d_sm_cv_zc, d_zc_sm_hdr);
       k_tk_init_hdr<<<1, 32, 0, cap>>>(d_sm_ctrl, d_zc_sm_hdr);
-      CK(hipMemsetAsync(d_sm_hist, 0, 4096 * sizeof(unsigned), cap));
-      k_tk_hist<0><<<dim3(8, 1), 256, 0, cap>>>(d_sm_scratch, vocab, vocab, d_sm_ctrl,
-                                                d_sm_hist);
+      k_zero_u32<<<1, 256, 0, cap>>>(d_sm_hist, 4096);
+      k_tk_hist_hdr<0><<<dim3(8, 1), 256, 0, cap>>>(d_logits, d_sm_scratch, vocab, vocab,
+                                                    d_sm_ctrl, d_sm_hist, d_zc_sm_hdr);
       k_tk_scan<0><<<dim3(1, 1), 256, 0, cap>>>(d_sm_hist, d_sm_ctrl, d_sm_cand_n_zc);
-      CK(hipMemsetAsync(d_sm_hist, 0, 4096 * sizeof(unsigned), cap));
-      k_tk_hist<1><<<dim3(8, 1), 256, 0, cap>>>(d_sm_scratch, vocab, vocab, d_sm_ctrl,
-                                                d_sm_hist);
+      k_zero_u32<<<1, 256, 0, cap>>>(d_sm_hist, 4096);
+      k_tk_hist_hdr<1><<<dim3(8, 1), 256, 0, cap>>>(d_logits, d_sm_scratch, vocab, vocab,
+                                                    d_sm_ctrl, d_sm_hist, d_zc_sm_hdr);
       k_tk_scan<1><<<dim3(1, 1), 256, 0, cap>>>(d_sm_hist, d_sm_ctrl, d_sm_cand_n_zc);
-      k_tk_collect<<<dim3(8, 1), 256, 0, cap>>>(d_sm_scratch, vocab, vocab, d_sm_ctrl,
-                                                d_sm_cand_ids_zc, d_sm_cand_vals_zc,
-                                                d_sm_cand_n_zc, SMS_TCAP);
+      k_tk_collect_hdr<<<dim3(8, 1), 256, 0, cap>>>(d_logits, d_sm_scratch, vocab, vocab,
+                                                    d_sm_ctrl, d_sm_cand_ids_zc,
+                                                    d_sm_cand_vals_zc, d_sm_cand_n_zc,
+                                                    SMS_TCAP, d_zc_sm_hdr);
       k_step_incr_amx_seq<<<1, 1, 0, cap>>>(d_pos, d_ringpos, d_argmax, p_zc_amx,
                                             d_gall_seq_);
       CK(hipStreamEndCapture(cap, &gsamp));
-      }
     }
     g_str = nullptr;
     g_kprof_mute = false;
@@ -14299,8 +14309,8 @@ struct GpuModel {
     vb_forget_stream(cap);
     CK(hipStreamDestroy(cap));
     graphs_ok = true;
-    fprintf(stderr, "decode graphs captured (ple=%d, unified=%d)\n", (int)ple_on,
-            gall_exec != nullptr ? 1 : 0);
+    fprintf(stderr, "decode graphs captured (ple=%d, unified=%d, samp=%d)\n", (int)ple_on,
+            gall_exec != nullptr ? 1 : 0, gall_samp_exec != nullptr ? 1 : 0);
     crashdiag::note("decode graphs captured");
   }
 
@@ -14897,6 +14907,11 @@ struct GpuModel {
       SeqState& t = slots_[(size_t)i];
       DALLOC(&t.d_R, rb * 4);
       DALLOC(&t.d_S, sS);
+      if (gdn_state_bf16_on()) {
+        DALLOC(&t.d_S_bf16, sS / 2);
+        CK(hipMemset(t.d_S_bf16, 0, sS / 2));
+      }
+      t.s_bf16_valid = false;
       DALLOC(&t.d_convst, sC);
       DALLOC(&t.d_ring, sRing);
       DALLOC(&t.d_pos, 4);
@@ -14993,6 +15008,8 @@ struct GpuModel {
     CK(hipMemsetAsync(d_pos, 0, 4, 0));
     CK(hipMemsetAsync(d_ringpos, 0, 4, 0));
     CK(hipMemsetAsync(d_S, 0, (size_t)ngdn * 48 * 128 * 128 * 4, 0));
+    if (d_S_bf16) CK(hipMemsetAsync(d_S_bf16, 0, (size_t)ngdn * 48 * 128 * 128 * 2, 0));
+    s_bf16_valid = false;
     CK(hipMemsetAsync(d_convst, 0, (size_t)ngdn * 3 * 10240 * 4, 0));
     CK(hipMemsetAsync(d_ring, 0, (size_t)9 * 10240 * 4, 0));
     CK(hipDeviceSynchronize());
@@ -15324,6 +15341,7 @@ struct GpuModel {
       }
       auto lch_t1 = std::chrono::steady_clock::now();
       const bool hispin = gall_hi_st_ != nullptr;
+      gdn_s_to_bf16(hispin ? gall_hi_st_ : 0);
       CK(hipGraphLaunch(gall_exec, hispin ? gall_hi_st_ : 0));
       if (ple_on) ple_dec_wait();
       const double lch_ms = std::chrono::duration<double, std::milli>(
@@ -15449,6 +15467,26 @@ struct GpuModel {
   // (sms_round_shared); the header is assembled here. The inline PLE gather
   // replaces the mutex/CV worker kick: the graph reaches its ple_wait_ready
   // ~0.5 ms after the launch, the gather takes ~0.02 ms.
+  static bool gdn_state_bf16_on() {
+    static const bool v = [] {
+      const char* e = getenv("QWENOX_GDN_STATE_BF16");
+      return e && e[0] != 0 && e[0] != '0';
+    }();
+    return v;
+  }
+  void gdn_s_to_bf16(hipStream_t st) {
+    if (!d_S_bf16 || s_bf16_valid) return;
+    const size_t n = (size_t)(g_cfg.layers - g_cfg.layers / 4) * 48 * 128 * 128;
+    k_f32_to_bf16_vec<<<256, 256, 0, st>>>(d_S, d_S_bf16, n);
+    s_bf16_valid = true;
+  }
+  void gdn_s_to_f32(hipStream_t st = nullptr) {
+    if (!d_S_bf16 || !s_bf16_valid) return;
+    const size_t n = (size_t)(g_cfg.layers - g_cfg.layers / 4) * 48 * 128 * 128;
+    k_bf16_to_f32_vec<<<256, 256, 0, st ? st : g_str>>>(d_S_bf16, d_S, n);
+    s_bf16_valid = false;
+  }
+
   void samp_launch(int fed, int k) {
     kv_prepare(pos, pos + 1);
     *p_zc_tok = fed;
@@ -15459,6 +15497,7 @@ struct GpuModel {
     memcpy(&rb, &sm_repeat, 4);
     p_zc_sm_hdr[3] = rb;
     if (ple_on && p_zc_ple_seq) __atomic_store_n(p_zc_ple_seq, 0u, __ATOMIC_RELEASE);
+    gdn_s_to_bf16(gall_hi_st_);
     CK(hipGraphLaunch(gall_samp_exec, gall_hi_st_));
     if (ple_on && p_zc_ple_seq) {
       chist.push_back(fed);
@@ -15481,15 +15520,15 @@ struct GpuModel {
     if (cn < k || cn > SMS_TCAP) return false;
     const int* ids = p_sm_cand_ids_zc;
     const float* vals = p_sm_cand_vals_zc;
-    std::vector<int> ord((size_t)cn);
-    for (int j = 0; j < cn; j++) ord[j] = j;
-    std::sort(ord.begin(), ord.end(), [&](int a, int b) {
+    sms_ord_.resize((size_t)cn);
+    for (int j = 0; j < cn; j++) sms_ord_[j] = j;
+    std::sort(sms_ord_.begin(), sms_ord_.end(), [&](int a, int b) {
       if (vals[a] != vals[b]) return vals[a] > vals[b];
       return ids[a] < ids[b];
     });
     for (int j = 0; j < k; j++) {
-      sms_out_ids[(size_t)j] = ids[ord[j]];
-      sms_out_vals[(size_t)j] = vals[ord[j]];
+      sms_out_ids[(size_t)j] = ids[sms_ord_[j]];
+      sms_out_vals[(size_t)j] = vals[sms_ord_[j]];
     }
     typename Sampler::SDist sd;
     sms_prep(s, 0, true, sd, k);
