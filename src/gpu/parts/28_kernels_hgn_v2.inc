@@ -397,6 +397,148 @@ __global__ __launch_bounds__(256) void k_ht_gemv(const uint8_t* __restrict__ cod
   }
 }
 
+struct HtGemvDesc {
+  const uint8_t* codes;
+  const float* suh;
+  const float* svh;
+  float* y;
+  float* zs;
+  int* cnt;
+  int nty, ks, O, nrows, tpb, tpc, b0;
+};
+struct HtGemvBatch {
+  HtGemvDesc m[4];
+  int nm;
+  int K;
+};
+
+// Multi-matrix P=1 k_ht_gemv<1, float>: runs 2..4 independent projections sharing
+// input x in a single launch while preserving each matrix's exact (nty, ks, tpb, tpc)
+// tile mapping and deterministic kz reduction order (bit-identical to separate gemvs).
+__global__ __launch_bounds__(256) void k_ht_gemv_multi(const float* __restrict__ x,
+                                                       HtGemvBatch B) {
+  extern __shared__ float hv2_lds[];
+  float* xh = hv2_lds;
+  float* zl = hv2_lds;
+  __shared__ int s_last;
+  const int bid = (int)blockIdx.x;
+  int mi = 0;
+#pragma unroll
+  for (int i = 1; i < 4; i++) {
+    if (i < B.nm && bid >= B.m[i].b0) mi = i;
+  }
+  const HtGemvDesc d = B.m[mi];
+  const int sb = bid - d.b0;
+  const int ty = sb % d.nty, kz = sb / d.nty;
+  const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+  const int ntx = B.K >> 7;
+  const int tx0 = kz * d.tpb;
+  const int nt = min(ntx, tx0 + d.tpb) - tx0;
+
+  float acc[8];
+#pragma unroll
+  for (int q = 0; q < 8; q++) acc[q] = 0.f;
+  const int h = lane >> 4;
+  const uint8_t* base = d.codes + ((size_t)ty * ntx + tx0) * 8192 + w * 1024 + lane * 4;
+  uint32_t nxt[8];
+#pragma unroll
+  for (int q = 0; q < 8; q++) nxt[q] = *(const uint32_t*)(base + q * 128);
+  for (int t = 0; t < nt; t++) {
+    const int tc = t % d.tpc;
+    if (tc == 0) {
+      const int nc = min(d.tpc, nt - t);
+      if (t) __syncthreads();
+      for (int u = w; u < nc; u += 8) {
+        const int col0 = (tx0 + t + u) * 128;
+        float v[4];
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          const int i = col0 + j * 32 + lane;
+          v[j] = x[i] * d.suh[i];
+        }
+        hv2::fwht128(v[0], v[1], v[2], v[3], lane);
+#pragma unroll
+        for (int j = 0; j < 4; j++) xh[u * 128 + j * 32 + lane] = v[j] * hv2::kRs128;
+      }
+      __syncthreads();
+    }
+    uint32_t cw[8];
+#pragma unroll
+    for (int q = 0; q < 8; q++) cw[q] = nxt[q];
+    if (t + 1 < nt) {
+      const uint8_t* tb = base + (size_t)(t + 1) * 8192;
+#pragma unroll
+      for (int q = 0; q < 8; q++) nxt[q] = *(const uint32_t*)(tb + q * 128);
+    }
+    float xv[8];
+    const float* xt = xh + tc * 128 + w * 16 + h * 8;
+    const float4 a = *(const float4*)xt;
+    const float4 b = *(const float4*)(xt + 4);
+    xv[0] = a.x; xv[1] = a.y; xv[2] = a.z; xv[3] = a.w;
+    xv[4] = b.x; xv[5] = b.y; xv[6] = b.z; xv[7] = b.w;
+#pragma unroll
+    for (int q = 0; q < 8; q++) {
+      const uint32_t cur = cw[q];
+      const uint32_t rr = (uint32_t)__builtin_amdgcn_mov_dpp((int)cur, 0x121, 0xf, 0xf, false);
+      const uint32_t xx = (uint32_t)__builtin_amdgcn_permlanex16((int)rr, (int)rr, 0x76543210,
+                                                                 (int)0xfedcba98, false, false);
+      const uint32_t prev = (lane & 15) ? rr : xx;
+      float wv[8];
+#pragma unroll
+      for (int e = 0; e < 8; e += 2)
+        hv2::ht_val2(__builtin_amdgcn_alignbit(prev, cur, 28 - 4 * e) & 0xffffu,
+                     __builtin_amdgcn_alignbit(prev, cur, 24 - 4 * e) & 0xffffu, wv[e], wv[e + 1]);
+      float s = acc[q];
+#pragma unroll
+      for (int e = 0; e < 8; e++) s = fmaf(wv[e], xv[e], s);
+      acc[q] = s;
+    }
+  }
+#pragma unroll
+  for (int q = 0; q < 8; q++) acc[q] += __shfl_xor(acc[q], 16, 32);
+  __syncthreads();
+  if (lane < 16)
+#pragma unroll
+    for (int q = 0; q < 8; q++) hv2_lds[w * 128 + q * 16 + lane] = acc[q];
+  __syncthreads();
+  if (tid < 128) {
+    float s = hv2_lds[tid];
+#pragma unroll
+    for (int v = 1; v < 8; v++) s += hv2_lds[v * 128 + tid];
+    zl[tid] = s;
+  }
+  __syncthreads();
+  if (d.ks > 1) {
+    if (tid < 128) d.zs[(size_t)kz * d.O + ty * 128 + tid] = zl[tid];
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) s_last = atomicAdd(d.cnt + ty, 1) == d.ks - 1;
+    __syncthreads();
+    if (!s_last) return;
+    __threadfence();
+    if (tid < 128) {
+      const size_t o = (size_t)ty * 128 + tid;
+      float s = __builtin_nontemporal_load(d.zs + o);
+      for (int k2 = 1; k2 < d.ks; k2++)
+        s += __builtin_nontemporal_load(d.zs + (size_t)k2 * d.O + o);
+      zl[tid] = s;
+    }
+    if (tid == 0) atomicExch(d.cnt + ty, 0);
+    __syncthreads();
+  }
+  if (w == 0) {
+    float v[4];
+#pragma unroll
+    for (int j = 0; j < 4; j++) v[j] = zl[j * 32 + lane];
+    hv2::fwht128(v[0], v[1], v[2], v[3], lane);
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      const int r = ty * 128 + j * 32 + lane;
+      if (r < d.nrows) d.y[r] = v[j] * hv2::kRs128 * d.svh[r];
+    }
+  }
+}
+
 // --- k_ht_wmma: row-invariant WMMA ht GEMV (dense WMMA, 10-12) --------------
 // Same contract as k_ht_gemv (rot_in -> z = G.x^ -> split-K -> rot_out) for
 // P = 1..16*NPT rows, but z runs on v_wmma_f32_16x16x16_f16: x^ is rounded to
@@ -1329,29 +1471,41 @@ __device__ __forceinline__ float sk_lane(const uint8_t* __restrict__ row, const 
                                          int C, int g0, int g1, int li) {
   const int sub = li & 7, gq = li >> 3;
   float acc = 0.f;
-  for (int g = g0 + gq; g < g1; g += 4) {
-    const uint32_t lw = *(const uint32_t*)(row + g * 32 + sub * 4);
-    const uint32_t hw = *(const uint32_t*)(row + C / 2 + g * 16 + (sub >> 1) * 4);
-    const uint32_t sb = *(const uint32_t*)(row + 3 * C / 4 + g * 4);
-    const float sc = __half2float(__ushort_as_half((unsigned short)(sb & 0xffffu)));
-    const float bi = __half2float(__ushort_as_half((unsigned short)(sb >> 16)));
-    float cf[8];
+  int g = g0 + gq;
+  if (g < g1) {
+    uint32_t clw = *(const uint32_t*)(row + g * 32 + sub * 4);
+    uint32_t chw = *(const uint32_t*)(row + C / 2 + g * 16 + (sub >> 1) * 4);
+    uint32_t csb = *(const uint32_t*)(row + 3 * C / 4 + g * 4);
+    for (; g < g1; g += 4) {
+      uint32_t nlw = 0, nhw = 0, nsb = 0;
+      const int gn = g + 4;
+      if (gn < g1) {
+        nlw = *(const uint32_t*)(row + gn * 32 + sub * 4);
+        nhw = *(const uint32_t*)(row + C / 2 + gn * 16 + (sub >> 1) * 4);
+        nsb = *(const uint32_t*)(row + 3 * C / 4 + gn * 4);
+      }
+      const uint32_t lw = clw, hw = chw, sb = csb;
+      clw = nlw; chw = nhw; csb = nsb;
+      const float sc = __half2float(__ushort_as_half((unsigned short)(sb & 0xffffu)));
+      const float bi = __half2float(__ushort_as_half((unsigned short)(sb >> 16)));
+      float cf[8];
 #pragma unroll
-    for (int e = 0; e < 8; e++) {
-      const uint32_t lo = (lw >> (4 * e)) & 15u;
-      const uint32_t hi = (hw >> (2 * ((sub & 1) * 8 + e))) & 3u;
-      cf[e] = (float)(lo | (hi << 4));
-    }
-    float xv[8];
-    hv2::ldx8(x + g * 64 + sub * 8, xv);
-    float dx = 0.f, sx = 0.f;
+      for (int e = 0; e < 8; e++) {
+        const uint32_t lo = (lw >> (4 * e)) & 15u;
+        const uint32_t hi = (hw >> (2 * ((sub & 1) * 8 + e))) & 3u;
+        cf[e] = (float)(lo | (hi << 4));
+      }
+      float xv[8];
+      hv2::ldx8(x + g * 64 + sub * 8, xv);
+      float dx = 0.f, sx = 0.f;
 #pragma unroll
-    for (int e = 0; e < 8; e++) {
-      dx = fmaf(cf[e], xv[e], dx);
-      sx += xv[e];
+      for (int e = 0; e < 8; e++) {
+        dx = fmaf(cf[e], xv[e], dx);
+        sx += xv[e];
+      }
+      // explicit form = what the backend emits for the unfused kernels
+      acc += fmaf(sc, dx, bi * sx);
     }
-    // explicit form = what the backend emits for the unfused kernels
-    acc += fmaf(sc, dx, bi * sx);
   }
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
@@ -1373,7 +1527,49 @@ __global__ __launch_bounds__(1024) void k_hcf_wn(const uint8_t* __restrict__ wq,
   const int b = blockIdx.x, tid = threadIdx.x, wv = tid >> 5, li = tid & 31;
   __shared__ float sp[32];
   __shared__ float sm[1024];
-  if (wv < ns) {
+  __shared__ float s_it[5][8][32];
+  if (C == 10240 && gps == 32 && ns == 5) {
+    if (wv < 20) {
+      const int s = wv >> 2, u = wv & 3;
+      const int sub = li & 7, gq = li >> 3;
+      const uint8_t* row = wq + (size_t)b * st;
+#pragma unroll
+      for (int p = 0; p < 2; p++) {
+        const int it = u * 2 + p;
+        const int g = s * 32 + it * 4 + gq;
+        const uint32_t lw = *(const uint32_t*)(row + g * 32 + sub * 4);
+        const uint32_t hw = *(const uint32_t*)(row + 5120 + g * 16 + (sub >> 1) * 4);
+        const uint32_t sb = *(const uint32_t*)(row + 7680 + g * 4);
+        const float sc = __half2float(__ushort_as_half((unsigned short)(sb & 0xffffu)));
+        const float bi = __half2float(__ushort_as_half((unsigned short)(sb >> 16)));
+        float cf[8];
+#pragma unroll
+        for (int e = 0; e < 8; e++) {
+          const uint32_t lo = (lw >> (4 * e)) & 15u;
+          const uint32_t hi = (hw >> (2 * ((sub & 1) * 8 + e))) & 3u;
+          cf[e] = (float)(lo | (hi << 4));
+        }
+        float xv[8];
+        hv2::ldx8(rh_old + g * 64 + sub * 8, xv);
+        float dx = 0.f, sx = 0.f;
+#pragma unroll
+        for (int e = 0; e < 8; e++) {
+          dx = fmaf(cf[e], xv[e], dx);
+          sx += xv[e];
+        }
+        s_it[s][it][li] = fmaf(sc, dx, bi * sx);
+      }
+    }
+    __syncthreads();
+    if (wv < 5) {
+      float a = 0.f;
+#pragma unroll
+      for (int it = 0; it < 8; it++) a += s_it[wv][it][li];
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) a += __shfl_xor(a, off, 32);
+      if (li == 0) sp[wv] = a;
+    }
+  } else if (wv < ns) {
     const int g0 = wv * gps, g1 = min(C >> 6, g0 + gps);
     const float a = hcf::sk_lane(wq + (size_t)b * st, rh_old, C, g0, g1, li);
     if (li == 0) sp[wv] = a;
@@ -1400,10 +1596,21 @@ __global__ __launch_bounds__(1024) void k_hcf_wn(const uint8_t* __restrict__ wq,
   if (!kNorm) return;
   sm[tid] = ss;
   __syncthreads();
-  for (int off = 512; off > 0; off >>= 1) {
+#pragma unroll
+  for (int off = 512; off >= 32; off >>= 1) {
     if (tid < off) sm[tid] += sm[tid + off];
     __syncthreads();
   }
+  if (tid < 32) {
+    float v = sm[tid];
+    v += __shfl_down(v, 16, 32);
+    v += __shfl_down(v, 8, 32);
+    v += __shfl_down(v, 4, 32);
+    v += __shfl_down(v, 2, 32);
+    v += __shfl_down(v, 1, 32);
+    if (tid == 0) sm[0] = v;
+  }
+  __syncthreads();
   const float inv = rsqrtf(sm[0] / d + eps);
   const float* wg = nw + (size_t)b * d;
   float* og = rh_new + (size_t)b * d;
@@ -1414,7 +1621,7 @@ __global__ __launch_bounds__(1024) void k_hcf_wn(const uint8_t* __restrict__ wq,
   }
 }
 
-// k_hcf_wn + fused k_moe_post on the idle waves (8..27) before the first barrier.
+// k_hcf_wn + fused k_moe_post on waves 10..29 while waves 0..9 compute 2x-parallel sk_lane.
 template <bool kNorm>
 __global__ __launch_bounds__(1024) void k_hcf_wn_moe(
     const uint8_t* __restrict__ wq, int C, int st, int gps, int ns,
@@ -1427,12 +1634,44 @@ __global__ __launch_bounds__(1024) void k_hcf_wn_moe(
   __shared__ float sp[32];
   __shared__ float sm[1024];
   __shared__ float sy[2560];
-  if (wv < ns) {
+  __shared__ float s_it[5][8][32];
+  const bool fast_sk = (C == 10240 && gps == 32 && ns == 5);
+  if (fast_sk && wv < 10) {
+    const int s = wv >> 1, u = wv & 1;
+    const int sub = li & 7, gq = li >> 3;
+    const uint8_t* row = wq + (size_t)b * st;
+#pragma unroll
+    for (int p = 0; p < 4; p++) {
+      const int it = u * 4 + p;
+      const int g = s * 32 + it * 4 + gq;
+      const uint32_t lw = *(const uint32_t*)(row + g * 32 + sub * 4);
+      const uint32_t hw = *(const uint32_t*)(row + 5120 + g * 16 + (sub >> 1) * 4);
+      const uint32_t sb = *(const uint32_t*)(row + 7680 + g * 4);
+      const float sc = __half2float(__ushort_as_half((unsigned short)(sb & 0xffffu)));
+      const float bi = __half2float(__ushort_as_half((unsigned short)(sb >> 16)));
+      float cf[8];
+#pragma unroll
+      for (int e = 0; e < 8; e++) {
+        const uint32_t lo = (lw >> (4 * e)) & 15u;
+        const uint32_t hi = (hw >> (2 * ((sub & 1) * 8 + e))) & 3u;
+        cf[e] = (float)(lo | (hi << 4));
+      }
+      float xv[8];
+      hv2::ldx8(rh_old + g * 64 + sub * 8, xv);
+      float dx = 0.f, sx = 0.f;
+#pragma unroll
+      for (int e = 0; e < 8; e++) {
+        dx = fmaf(cf[e], xv[e], dx);
+        sx += xv[e];
+      }
+      s_it[s][it][li] = fmaf(sc, dx, bi * sx);
+    }
+  } else if (!fast_sk && wv < ns) {
     const int g0 = wv * gps, g1 = min(C >> 6, g0 + gps);
     const float a = hcf::sk_lane(wq + (size_t)b * st, rh_old, C, g0, g1, li);
     if (li == 0) sp[wv] = a;
-  } else if (wv >= 8 && wv < 28) {
-    const int eb = wv - 8;
+  } else if (wv >= 10 && wv < 30) {
+    const int eb = wv - 10;
     if (eb < (d >> 7)) {
       float v[4];
 #pragma unroll
@@ -1449,6 +1688,17 @@ __global__ __launch_bounds__(1024) void k_hcf_wn_moe(
     }
   }
   __syncthreads();
+  if (fast_sk) {
+    if (wv < 5) {
+      float a = 0.f;
+#pragma unroll
+      for (int it = 0; it < 8; it++) a += s_it[wv][it][li];
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) a += __shfl_xor(a, off, 32);
+      if (li == 0) sp[wv] = a;
+    }
+    __syncthreads();
+  }
   float w = sp[0];
   for (int s = 1; s < ns; s++) w += sp[s];
   if (tid == 0) w4[b] = w;
@@ -1470,10 +1720,21 @@ __global__ __launch_bounds__(1024) void k_hcf_wn_moe(
   if (!kNorm) return;
   sm[tid] = ss;
   __syncthreads();
-  for (int off = 512; off > 0; off >>= 1) {
+#pragma unroll
+  for (int off = 512; off >= 32; off >>= 1) {
     if (tid < off) sm[tid] += sm[tid + off];
     __syncthreads();
   }
+  if (tid < 32) {
+    float v = sm[tid];
+    v += __shfl_down(v, 16, 32);
+    v += __shfl_down(v, 8, 32);
+    v += __shfl_down(v, 4, 32);
+    v += __shfl_down(v, 2, 32);
+    v += __shfl_down(v, 1, 32);
+    if (tid == 0) sm[0] = v;
+  }
+  __syncthreads();
   const float inv = rsqrtf(sm[0] / d + eps);
   const float* wg = nw + (size_t)b * d;
   float* og = rh_new + (size_t)b * d;
@@ -1482,6 +1743,80 @@ __global__ __launch_bounds__(1024) void k_hcf_wn_moe(
     const int i = tid + k * 1024;
     if (i < d) og[i] = rv[k] * inv * (1.f + wg[i]);
   }
+}
+
+// Fast specialized k_hcf_down for R=320, C=10240, gps=32 (ns=5): stages the 2048-float
+// x slice and its 256 8-element sums once in LDS and unrolls all 8 group iterations.
+__global__ __launch_bounds__(256) void k_hcf_down_c10k(const uint8_t* __restrict__ wq,
+                                                       const float* __restrict__ x,
+                                                       float* __restrict__ part,
+                                                       float* __restrict__ t,
+                                                       int st, int* __restrict__ cnt) {
+  __shared__ float sxv[2048];
+  __shared__ float ssx[256];
+  __shared__ int s_last;
+  const int tid = threadIdx.x, li = tid & 31;
+  const int s = blockIdx.y;
+  {
+    float xv[8];
+    hv2::ldx8(x + s * 2048 + tid * 8, xv);
+    *(float4*)(sxv + tid * 8) = make_float4(xv[0], xv[1], xv[2], xv[3]);
+    *(float4*)(sxv + tid * 8 + 4) = make_float4(xv[4], xv[5], xv[6], xv[7]);
+    float sx = 0.f;
+#pragma unroll
+    for (int e = 0; e < 8; e++) sx += xv[e];
+    ssx[tid] = sx;
+  }
+  __syncthreads();
+  const int r = blockIdx.x * 8 + (tid >> 5);
+  if (r < 320) {
+    const int sub = li & 7, gq = li >> 3;
+    const uint8_t* row = wq + (size_t)r * st;
+    const int g0 = s * 32;
+    float acc = 0.f;
+#pragma unroll
+    for (int it = 0; it < 8; it++) {
+      const int gl = it * 4 + gq;
+      const int g = g0 + gl;
+      const uint32_t lw = *(const uint32_t*)(row + g * 32 + sub * 4);
+      const uint32_t hw = *(const uint32_t*)(row + 5120 + g * 16 + (sub >> 1) * 4);
+      const uint32_t sb = *(const uint32_t*)(row + 7680 + g * 4);
+      const float sc = __half2float(__ushort_as_half((unsigned short)(sb & 0xffffu)));
+      const float bi = __half2float(__ushort_as_half((unsigned short)(sb >> 16)));
+      float cf[8];
+#pragma unroll
+      for (int e = 0; e < 8; e++) {
+        const uint32_t lo = (lw >> (4 * e)) & 15u;
+        const uint32_t hi = (hw >> (2 * ((sub & 1) * 8 + e))) & 3u;
+        cf[e] = (float)(lo | (hi << 4));
+      }
+      const float4 a = *(const float4*)(sxv + gl * 64 + sub * 8);
+      const float4 b = *(const float4*)(sxv + gl * 64 + sub * 8 + 4);
+      const float xv[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+      float dx = 0.f;
+#pragma unroll
+      for (int e = 0; e < 8; e++) dx = fmaf(cf[e], xv[e], dx);
+      acc += fmaf(sc, dx, bi * ssx[gl * 8 + sub]);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
+    if (li == 0) part[(size_t)s * 320 + r] = acc;
+  }
+  __threadfence();
+  __syncthreads();
+  if (tid == 0) s_last = atomicAdd(cnt + blockIdx.x, 1) == 4;
+  __syncthreads();
+  if (!s_last) return;
+  __threadfence();
+  if (tid < 8) {
+    const int rr = blockIdx.x * 8 + tid;
+    float v = __builtin_nontemporal_load(part + rr);
+#pragma unroll
+    for (int k = 1; k < 5; k++) v += __builtin_nontemporal_load(part + (size_t)k * 320 + rr);
+    const float xx = v * 0.25f;
+    t[rr] = xx / (1.f + expf(-xx));
+  }
+  if (tid == 0) atomicExch(cnt + blockIdx.x, 0);
 }
 
 // mix-down GEMV (R x C split-K, as k_q6g64_gemv_sk<1,float>) + the skred sum
@@ -1761,6 +2096,76 @@ __global__ __launch_bounds__(256) void k_vhc_wmma(const uint8_t* __restrict__ wq
   }
 }
 
+// Fast specialized k_hcf_upc_160 for d=2560, C=320 (ng=5): 320 blocks x 160 threads
+// (5 waves/block, 6 blocks = 30 waves/WGP = 93.75% occupancy, 0% dead lanes vs 37.5%
+// dead lanes in LPR=8), stages t[320] + ssx[5] in 2 KiB LDS, keeps low VGPR count
+// via scalar 32b loads, and preserves the exact shuffle-tree & FMA order of k_hcf_upc.
+__global__ __launch_bounds__(160, 6) void k_hcf_upc_160(const uint8_t* __restrict__ wq,
+                                                        const float* __restrict__ t,
+                                                        const float* __restrict__ rh,
+                                                        float* __restrict__ xo, int st) {
+  const int tid = threadIdx.x;
+  __shared__ float st_sh[320];
+  __shared__ float ssx[5];
+  __shared__ float sterm[32][5];
+  st_sh[tid] = t[tid];
+  st_sh[tid + 160] = t[tid + 160];
+  __syncthreads();
+  if (tid < 5) {
+    float sx = 0.f;
+#pragma unroll
+    for (int k = 0; k < 64; k++) sx += st_sh[tid * 64 + k];
+    ssx[tid] = sx;
+  }
+  __syncthreads();
+  {
+    const int rr = tid / 5, g = tid - rr * 5;
+    const int b = rr >> 3, j = rr & 7;
+    const int r = b * 2560 + blockIdx.x * 8 + j;
+    const uint8_t* row = wq + (size_t)r * st;
+    const uint32_t sb = *(const uint32_t*)(row + 240 + g * 4);
+    const float sc = __half2float(__ushort_as_half((unsigned short)(sb & 0xffffu)));
+    const float bi = __half2float(__ushort_as_half((unsigned short)(sb >> 16)));
+    float dx = 0.f;
+#pragma unroll 2
+    for (int i8 = 0; i8 < 8; i8++) {
+      const uint32_t lw = *(const uint32_t*)(row + g * 32 + i8 * 4);
+      const uint32_t hw = (uint32_t)*(const uint16_t*)(row + 160 + g * 16 + i8 * 2);
+      const float4 a = *(const float4*)(st_sh + g * 64 + i8 * 8);
+      const float4 bv = *(const float4*)(st_sh + g * 64 + i8 * 8 + 4);
+      const float xv[8] = {a.x, a.y, a.z, a.w, bv.x, bv.y, bv.z, bv.w};
+#pragma unroll
+      for (int e = 0; e < 8; e++) {
+        const uint32_t lo = (lw >> (4 * e)) & 15u;
+        const uint32_t hi = (hw >> (2 * e)) & 3u;
+        dx = fmaf((float)(lo | (hi << 4)), xv[e], dx);
+      }
+    }
+    sterm[rr][g] = fmaf(sc, dx, bi * ssx[g]);
+  }
+  __syncthreads();
+  if (tid < 32) {
+    float s0 = sterm[tid][0] + sterm[tid][4];
+    float s2 = sterm[tid][2];
+    float s1 = sterm[tid][1];
+    float s3 = sterm[tid][3];
+    float G = (s0 + s2) + (s1 + s3);
+    float gv = 1.f / (1.f + expf(-G));
+    const int b = tid >> 3, j = tid & 7;
+    sterm[tid][0] = gv;
+    sterm[tid][1] = rh[(size_t)b * 2560 + blockIdx.x * 8 + j];
+  }
+  __syncthreads();
+  if (tid < 8) {
+    float a = 0.f;
+#pragma unroll
+    for (int bb = 0; bb < 4; bb++) {
+      a += sterm[bb * 8 + tid][0] * sterm[bb * 8 + tid][1];
+    }
+    xo[blockIdx.x * 8 + tid] = a / 4;
+  }
+}
+
 // mix-up GEMV (branches*d rows x C, C < 1024, k_q6g64_gemv<1,float,8> lane
 // math) + sigmoid combine. Block = 8 output columns i for all 4 branches.
 __global__ __launch_bounds__(256) void k_hcf_upc(const uint8_t* __restrict__ wq,
@@ -1835,9 +2240,50 @@ __global__ __launch_bounds__(512) void k_moe_pre(const uint16_t* __restrict__ rw
                                                  int* __restrict__ cnt, VizTap vt,
                                                  const uint16_t* __restrict__ seg_w = nullptr,
                                                  float* __restrict__ seg_out = nullptr,
-                                                 bool seg_rowfast = false) {
+                                                 bool seg_rowfast = false,
+                                                 const uint8_t* __restrict__ seg_q4c = nullptr,
+                                                 const uint8_t* __restrict__ seg_q4s = nullptr,
+                                                 const float* __restrict__ seg_q4cb = nullptr) {
   const int lane = threadIdx.x & 31, wv = threadIdx.x >> 5;
-  if (seg_w && blockIdx.x == 32) {
+  const int nw = blockDim.x >> 5;
+  const int n_rt_blk = 512 / nw;
+  if ((seg_w || seg_q4c) && (int)blockIdx.x == n_rt_blk) {
+    if (seg_q4c) {
+      __shared__ float cbf[16];
+      if (threadIdx.x < 16) cbf[threadIdx.x] = seg_q4cb[threadIdx.x];
+      __syncthreads();
+      if (wv == 0) {
+        const uint64_t groups_per_row = (uint64_t)cols / 32;
+        float acc0 = 0.f;
+        for (uint64_t g = lane; g < groups_per_row; g += 32) {
+          uint4 pk0 = *(const uint4*)(seg_q4c + g * 16);
+          float s0 = __half2float(*(const __half*)(seg_q4s + g * 2));
+          const float* xg = x + g * 32;
+          float xv[32];
+#pragma unroll
+          for (int i = 0; i < 8; i++) {
+            float4 t = *(const float4*)(xg + i * 4);
+            xv[i * 4] = t.x; xv[i * 4 + 1] = t.y; xv[i * 4 + 2] = t.z; xv[i * 4 + 3] = t.w;
+          }
+          uint32_t w0[4] = {pk0.x, pk0.y, pk0.z, pk0.w};
+          float a0 = 0.f;
+#pragma unroll
+          for (int i = 0; i < 4; i++) {
+            uint32_t v0 = w0[i];
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+              a0 += cbf[v0 & 0xf] * xv[i * 8 + j];
+              v0 >>= 4;
+            }
+          }
+          acc0 += a0 * s0;
+        }
+        for (int off = 16; off > 0; off >>= 1)
+          acc0 += __shfl_down_sync(~0ull, acc0, off);
+        if (lane == 0) seg_out[0] = acc0;
+      }
+      return;
+    }
     if (seg_rowfast) {
       __shared__ float red[8];
       float acc = 0.f;
@@ -1884,39 +2330,70 @@ __global__ __launch_bounds__(512) void k_moe_pre(const uint16_t* __restrict__ rw
     }
     return;
   }
+  __shared__ float sx[2560];
+  const float* xsrc = x;
+  if (cols == 2560) {
+    for (int i = (int)threadIdx.x * 4; i < 2560; i += (int)blockDim.x * 4)
+      *(float4*)(sx + i) = *(const float4*)(x + i);
+    __syncthreads();
+    xsrc = sx;
+  }
   {
-    const uint64_t row = (uint64_t)blockIdx.x * 16 + wv;
-    if (row < 512) {  // grid 32 x 16 waves = the 512 router rows
-    const uint16_t* r = rw + row * cols;
-    float acc = 0.f;
-    for (uint64_t c = lane * 8; c < (uint64_t)cols; c += 32 * 8) {
-      uint4 pk = *(const uint4*)(r + c);
-      float4 xa = *(const float4*)(x + c);
-      float4 xb = *(const float4*)(x + c + 4);
-      const uint16_t* h = (const uint16_t*)&pk;
-      float xv[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+    const uint64_t row = (uint64_t)blockIdx.x * nw + wv;
+    if (row < 512) {
+      const uint16_t* r = rw + row * cols;
+      float acc = 0.f;
+      if (cols == 2560) {
+        uint4 cpk = *(const uint4*)(r + lane * 8);
 #pragma unroll
-      for (int j = 0; j < 8; j++) {
-        uint32_t u = (uint32_t)h[j] << 16;
-        float wf;
-        memcpy(&wf, &u, 4);
-        acc += wf * xv[j];
+        for (int it = 0; it < 10; it++) {
+          uint4 npk = {0, 0, 0, 0};
+          if (it + 1 < 10) npk = *(const uint4*)(r + (it + 1) * 256 + lane * 8);
+          const uint4 pk = cpk;
+          cpk = npk;
+          const uint64_t c = (uint64_t)it * 256 + lane * 8;
+          const float4 xa = *(const float4*)(xsrc + c);
+          const float4 xb = *(const float4*)(xsrc + c + 4);
+          const uint16_t* h = (const uint16_t*)&pk;
+          const float xv[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+#pragma unroll
+          for (int j = 0; j < 8; j++) {
+            uint32_t u = (uint32_t)h[j] << 16;
+            float wf;
+            memcpy(&wf, &u, 4);
+            acc += wf * xv[j];
+          }
+        }
+      } else {
+        for (uint64_t c = lane * 8; c < (uint64_t)cols; c += 32 * 8) {
+          uint4 pk = *(const uint4*)(r + c);
+          float4 xa = *(const float4*)(xsrc + c);
+          float4 xb = *(const float4*)(xsrc + c + 4);
+          const uint16_t* h = (const uint16_t*)&pk;
+          float xv[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+#pragma unroll
+          for (int j = 0; j < 8; j++) {
+            uint32_t u = (uint32_t)h[j] << 16;
+            float wf;
+            memcpy(&wf, &u, 4);
+            acc += wf * xv[j];
+          }
+        }
       }
-    }
-    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down(acc, off, 32);
-    if (lane == 0) logits[row] = acc;
+      for (int off = 16; off > 0; off >>= 1) acc += __shfl_down(acc, off, 32);
+      if (lane == 0) logits[row] = acc;
     }
   }
   {
     const int nb = n >> 7;
-    const int gw = blockIdx.x * 16 + wv;
+    const int gw = (int)blockIdx.x * nw + wv;
     if (gw < nb) {
       const int b = gw;
       float v[4];
 #pragma unroll
       for (int j = 0; j < 4; j++) {
         const int i = j * 32 + lane;
-        v[j] = x[b * 128 + i] * suh[b * 128 + i];
+        v[j] = xsrc[b * 128 + i] * suh[b * 128 + i];
       }
       hv2::fwht128(v[0], v[1], v[2], v[3], lane);
 #pragma unroll
@@ -1929,7 +2406,6 @@ __global__ __launch_bounds__(512) void k_moe_pre(const uint16_t* __restrict__ rw
   __shared__ int s_last;
   __threadfence();
   __syncthreads();
-  const int n_rt_blk = seg_w ? (int)gridDim.x - 1 : (int)gridDim.x;
   if (threadIdx.x == 0) s_last = atomicAdd(cnt, 1) == n_rt_blk - 1;
   __syncthreads();
   if (!s_last) return;
@@ -2003,6 +2479,306 @@ __global__ __launch_bounds__(512) void k_moe_pre(const uint16_t* __restrict__ rw
 #pragma unroll
     for (int j = 0; j < k; j++) ws[j] = raw[j] / sw;
     if (vt.ring) viz::store_route(vt, 0, ids, ws, k, sw, vz_ent);
+  }
+}
+
+// ============================================================================
+__global__ __launch_bounds__(256) void k_moe_pre_segu(
+    const uint16_t* __restrict__ rw, const float* __restrict__ x, int cols,
+    float* __restrict__ logits, const float* __restrict__ gu_suh,
+    float* __restrict__ xr, int n, int* __restrict__ ids, float* __restrict__ ws,
+    int* __restrict__ rt_cnt, VizTap vt,
+    const uint8_t* __restrict__ seg_data, float* __restrict__ seg_out,
+    int se_nty, int se_nty0, int se_tpb, int se_tpc,
+    const uint8_t* __restrict__ sg_codes, const float* __restrict__ sg_suh,
+    const float* __restrict__ sg_svh, float* __restrict__ sg_y, int sg_nrows,
+    const uint8_t* __restrict__ su_codes, const float* __restrict__ su_suh,
+    const float* __restrict__ su_svh, float* __restrict__ su_y, int su_nrows,
+    float* __restrict__ ht_zs, int* __restrict__ ht_cnt) {
+  extern __shared__ __align__(16) unsigned char sh_raw[];
+  __shared__ int s_last;
+  const int tid = threadIdx.x, lane = tid & 31, wv = tid >> 5;
+  const int bid = blockIdx.x;
+
+  if (bid < 64) {
+    const uint64_t row = (uint64_t)bid * 8 + wv;
+    if (row < 512) {
+      const uint16_t* r = rw + row * cols;
+      float acc = 0.f;
+      for (uint64_t c = lane * 8; c < (uint64_t)cols; c += 32 * 8) {
+        uint4 pk = *(const uint4*)(r + c);
+        float4 xa = *(const float4*)(x + c);
+        float4 xb = *(const float4*)(x + c + 4);
+        const uint16_t* h = (const uint16_t*)&pk;
+        float xv[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+          uint32_t u = (uint32_t)h[j] << 16;
+          float wf;
+          memcpy(&wf, &u, 4);
+          acc += wf * xv[j];
+        }
+      }
+      for (int off = 16; off > 0; off >>= 1) acc += __shfl_down(acc, off, 32);
+      if (lane == 0) logits[row] = acc;
+    }
+    const int nb = n >> 7;
+    const int gw = bid * 8 + wv;
+    if (gw < nb) {
+      float v[4];
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        const int i = j * 32 + lane;
+        v[j] = x[gw * 128 + i] * gu_suh[gw * 128 + i];
+      }
+      hv2::fwht128(v[0], v[1], v[2], v[3], lane);
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        const int i = gw * 128 + j * 32 + lane;
+        xr[i] = v[j] * hv2::kRs128 * 1.f;
+      }
+    }
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) s_last = (atomicAdd(rt_cnt, 1) == 63);
+    __syncthreads();
+    if (!s_last) return;
+    __threadfence();
+    if (wv != 0) return;
+    if (lane == 0) atomicExch(rt_cnt, 0);
+    constexpr int k = 10;
+    float v[16], p[16];
+#pragma unroll
+    for (int j = 0; j < 16; j++) v[j] = __builtin_nontemporal_load(logits + lane + 32 * j);
+    float mx = v[0];
+#pragma unroll
+    for (int j = 1; j < 16; j++) mx = fmaxf(mx, v[j]);
+#pragma unroll
+    for (int o = 16; o; o >>= 1) mx = fmaxf(mx, __shfl_xor(mx, o, 32));
+#pragma unroll
+    for (int j = 0; j < 16; j++) p[j] = expf(v[j] - mx);
+    float a[16];
+#pragma unroll
+    for (int j = 0; j < 16; j++) a[j] = p[j];
+#pragma unroll
+    for (int j = 0; j < 8; j++) a[j] += a[j + 8];
+#pragma unroll
+    for (int j = 0; j < 4; j++) a[j] += a[j + 4];
+#pragma unroll
+    for (int j = 0; j < 2; j++) a[j] += a[j + 2];
+    a[0] += a[1];
+    float s = a[0];
+#pragma unroll
+    for (int o = 16; o; o >>= 1) s += __shfl_down(s, o, 32);
+    s = __shfl(s, 0, 32);
+    const float inv_se = 1.f / s;
+#pragma unroll
+    for (int j = 0; j < 16; j++) p[j] *= inv_se;
+    float vz_ent = 0.f;
+    if (vt.ring) {
+      float e = 0.f;
+#pragma unroll
+      for (int j = 0; j < 16; j++)
+        if (p[j] > 0.f) e -= p[j] * __logf(p[j]);
+#pragma unroll
+      for (int o = 16; o; o >>= 1) e += __shfl_xor(e, o, 32);
+      vz_ent = e;
+    }
+    float raw[k];
+#pragma unroll
+    for (int r = 0; r < k; r++) {
+      float bv = p[0];
+      int bi = lane;
+#pragma unroll
+      for (int j = 1; j < 16; j++)
+        if (p[j] > bv) { bv = p[j]; bi = lane + 32 * j; }
+#pragma unroll
+      for (int o = 16; o; o >>= 1) {
+        const float ov = __shfl_xor(bv, o, 32);
+        const int oi = __shfl_xor(bi, o, 32);
+        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+      }
+      raw[r] = bv;
+      if (lane == 0) ids[r] = bi;
+      if ((bi & 31) == lane) {
+#pragma unroll
+        for (int j = 0; j < 16; j++)
+          if (j == (bi >> 5)) p[j] = -1e30f;
+      }
+    }
+    if (lane == 0) {
+      float sw = 0.f;
+#pragma unroll
+      for (int j = 0; j < k; j++) sw += raw[j];
+#pragma unroll
+      for (int j = 0; j < k; j++) ws[j] = raw[j] / sw;
+      if (vt.ring) viz::store_route(vt, 0, ids, ws, k, sw, vz_ent);
+    }
+    return;
+  }
+
+  if (bid == 64) {
+    float* cbf = (float*)sh_raw;
+    const float* cb = (const float*)seg_data;
+    if (tid < 16) cbf[tid] = cb[tid];
+    __syncthreads();
+    if (wv != 0) return;
+    const uint8_t* rc0 = seg_data + 64;
+    const uint8_t* rs0 = seg_data + 64 + (cols / 2);
+    const uint64_t groups_per_row = (uint64_t)cols / 32;
+    float acc0 = 0.f;
+    for (uint64_t g = lane; g < groups_per_row; g += 32) {
+      uint4 pk0 = *(const uint4*)(rc0 + g * 16);
+      float s0 = __half2float(*(const __half*)(rs0 + g * 2));
+      const float* xg = x + g * 32;
+      float xv[32];
+#pragma unroll
+      for (int i = 0; i < 8; i++) {
+        float4 t = *(const float4*)(xg + i * 4);
+        xv[i * 4] = t.x; xv[i * 4 + 1] = t.y; xv[i * 4 + 2] = t.z; xv[i * 4 + 3] = t.w;
+      }
+      uint32_t w0[4] = {pk0.x, pk0.y, pk0.z, pk0.w};
+      float a0 = 0.f;
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        uint32_t v0 = w0[i];
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+          a0 += cbf[v0 & 0xf] * xv[i * 8 + j];
+          v0 >>= 4;
+        }
+      }
+      acc0 += a0 * s0;
+    }
+    for (int off = 16; off > 0; off >>= 1) acc0 += __shfl_down_sync(~0ull, acc0, off);
+    if (lane == 0) seg_out[0] = acc0;
+    return;
+  }
+
+  const int sb = bid - 65;
+  const int ty = sb % se_nty;
+  const int kz = sb / se_nty;
+  const int ks_total = ((int)gridDim.x - 65) / se_nty;
+  __half* xh = (__half*)sh_raw;
+  float* zl = (float*)sh_raw;
+  const bool sec = ty >= se_nty0;
+  const int tyl = sec ? ty - se_nty0 : ty;
+  const uint8_t* codes = sec ? su_codes : sg_codes;
+  const float* suh = sec ? su_suh : sg_suh;
+  const float* svh = sec ? su_svh : sg_svh;
+  float* y = sec ? su_y : sg_y;
+  const int nrows = sec ? su_nrows : sg_nrows;
+  const int O = se_nty * 128;
+
+  const int ntx = cols >> 7;
+  const int tx0 = kz * se_tpb;
+  const int nt = min(ntx, tx0 + se_tpb) - tx0;
+  const int b_ = lane >> 1;
+  const int qrowA = (lane & 1) ? ((lane & 16) ? b_ : ((b_ + 4) & 7))
+                               : ((lane & 16) ? 8 + ((b_ + 4) & 7) : b_);
+  htw_v8f acc;
+#pragma unroll
+  for (int e = 0; e < 8; e++) acc[e] = 0.f;
+  const uint8_t* base = codes + ((size_t)tyl * ntx + tx0) * 8192 + wv * 128 + lane * 4;
+  uint32_t nxt[8];
+#pragma unroll
+  for (int g = 0; g < 8; g++) nxt[g] = *(const uint32_t*)(base + g * 1024);
+  for (int t = 0; t < nt; t++) {
+    const int tc = t % se_tpc;
+    if (tc == 0) {
+      const int nc = min(se_tpc, nt - t);
+      if (t) __syncthreads();
+      for (int c = wv; c < nc; c += 8) {
+        __half* dst = xh + c * 128;
+        const int col0 = (tx0 + t + c) * 128;
+        float v[4];
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          const int i = col0 + j * 32 + lane;
+          v[j] = x[i] * suh[i];
+        }
+        hv2::fwht128(v[0], v[1], v[2], v[3], lane);
+#pragma unroll
+        for (int j = 0; j < 4; j++) dst[j * 32 + lane] = __float2half(v[j] * hv2::kRs128);
+      }
+      __syncthreads();
+    }
+    uint32_t cw[8];
+#pragma unroll
+    for (int g = 0; g < 8; g++) cw[g] = nxt[g];
+    if (t + 1 < nt) {
+      const uint8_t* tb = base + (size_t)(t + 1) * 8192;
+#pragma unroll
+      for (int g = 0; g < 8; g++) nxt[g] = *(const uint32_t*)(tb + g * 1024);
+    }
+#pragma unroll
+    for (int g = 0; g < 8; g++) {
+      const uint32_t cur = cw[g];
+      const uint32_t rr = (uint32_t)__builtin_amdgcn_mov_dpp((int)cur, 0x121, 0xf, 0xf, false);
+      const uint32_t xx = (uint32_t)__builtin_amdgcn_permlanex16((int)rr, (int)rr, 0x76543210,
+                                                                 (int)0xfedcba98, false, false);
+      const uint32_t prev = (lane & 15) ? rr : xx;
+      uint32_t own[4], oth[4];
+#pragma unroll
+      for (int j = 0; j < 4; j++)
+        own[j] = hv2::ht_h2(__builtin_amdgcn_alignbit(prev, cur, 28 - 8 * j) & 0xffffu,
+                            __builtin_amdgcn_alignbit(prev, cur, 24 - 8 * j) & 0xffffu);
+#pragma unroll
+      for (int j = 0; j < 4; j++)
+        oth[j] = (uint32_t)__builtin_amdgcn_permlanex16((int)own[j], (int)own[j], 0x76543210,
+                                                        (int)0xfedcba98, false, false);
+      const bool hi = lane >= 16;
+      uint32_t bw[8];
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        bw[j] = hi ? oth[j] : own[j];
+        bw[4 + j] = hi ? own[j] : oth[j];
+      }
+      htw_v16h bf;
+      memcpy(&bf, bw, 32);
+      const __half* ap = xh + tc * 128 + g * 16;
+      const uint4 lo = *(const uint4*)ap, hi4 = *(const uint4*)(ap + 8);
+      htw_v8u av = (htw_v8u){lo.x, lo.y, lo.z, lo.w, hi4.x, hi4.y, hi4.z, hi4.w};
+      if (qrowA >= 1) av = (htw_v8u)(0u);
+      acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32((htw_v16h)av, bf, acc);
+    }
+  }
+  __syncthreads();
+#pragma unroll
+  for (int e = 0; e < 8; e++) {
+    const int p = (lane >> 4) * 8 + e;
+    if (p < 1) zl[wv * 16 + (lane & 15)] = acc[e];
+  }
+  __syncthreads();
+  if (ks_total > 1) {
+    for (int i = tid; i < 128; i += 256)
+      ht_zs[(size_t)kz * O + ty * 128 + i] = zl[i];
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) s_last = (atomicAdd(ht_cnt + ty, 1) == ks_total - 1);
+    __syncthreads();
+    if (!s_last) return;
+    __threadfence();
+    for (int i = tid; i < 128; i += 256) {
+      const size_t o = (size_t)ty * 128 + i;
+      float s = __builtin_nontemporal_load(ht_zs + o);
+      for (int k2 = 1; k2 < ks_total; k2++)
+        s += __builtin_nontemporal_load(ht_zs + (size_t)k2 * O + o);
+      zl[i] = s;
+    }
+    if (tid == 0) atomicExch(ht_cnt + ty, 0);
+    __syncthreads();
+  }
+  if (wv == 0) {
+    float v[4];
+#pragma unroll
+    for (int j = 0; j < 4; j++) v[j] = zl[j * 32 + lane];
+    hv2::fwht128(v[0], v[1], v[2], v[3], lane);
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      const int r = tyl * 128 + j * 32 + lane;
+      if (r < nrows) y[r] = v[j] * hv2::kRs128 * svh[r];
+    }
   }
 }
 

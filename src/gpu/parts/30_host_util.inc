@@ -1244,6 +1244,9 @@ static bool ht_gemv(const WView& w, const void* x, bool xbf16, uint64_t xs, floa
   }
 }
 
+static bool dense_wmma_on();
+static bool dense_wmma_p1_on();
+
 // --- dense WMMA ht GEMV (k_ht_wmma), row-invariant for P = 1..48 ------------
 // Split-K count from the shape only (never from P): the K slicing and the kz
 // summation order are part of every row's numerics, so they must not change

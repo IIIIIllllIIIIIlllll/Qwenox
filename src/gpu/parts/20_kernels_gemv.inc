@@ -515,6 +515,49 @@ __global__ void k_bf16_gemv(const uint16_t* __restrict__ w, const float* __restr
   if (lane == 0) y[row] = acc;
 }
 
+__global__ void k_bf16_gemv_2m(const uint16_t* __restrict__ w0, float* __restrict__ y0,
+                               uint64_t rows0, unsigned b0,
+                               const uint16_t* __restrict__ w1, float* __restrict__ y1,
+                               uint64_t rows1, const float* __restrict__ x, uint64_t cols) {
+  const bool second = blockIdx.x >= b0;
+  const unsigned bx = second ? (blockIdx.x - b0) : blockIdx.x;
+  const uint64_t rows = second ? rows1 : rows0;
+  uint64_t row = (uint64_t)bx * (blockDim.x / warpSize) + threadIdx.x / warpSize;
+  if (row >= rows) return;
+  int lane = threadIdx.x % warpSize;
+  const uint16_t* rw = (second ? w1 : w0) + row * cols;
+  float acc = 0.f;
+  for (uint64_t c = lane * 8; c < cols; c += warpSize * 8) {
+    uint4 pk = *(const uint4*)(rw + c);
+    float4 xa = *(const float4*)(x + c);
+    float4 xb = *(const float4*)(x + c + 4);
+    const uint16_t* h = (const uint16_t*)&pk;
+    float xv[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+      uint32_t u = (uint32_t)h[j] << 16;
+      float wf;
+      memcpy(&wf, &u, 4);
+      acc += wf * xv[j];
+    }
+  }
+  for (int off = warpSize / 2; off > 0; off >>= 1)
+    acc += __shfl_down_sync(~0ull, acc, off);
+  if (lane == 0) (second ? y1 : y0)[row] = acc;
+}
+
+__global__ void k_f32_copy_vec4(float* __restrict__ dst, const float* __restrict__ src, size_t n) {
+  size_t n4 = n / 4;
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
+       i += (size_t)gridDim.x * blockDim.x) {
+    ((float4*)dst)[i] = ((const float4*)src)[i];
+  }
+  for (size_t i = n4 * 4 + (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += (size_t)gridDim.x * blockDim.x) {
+    dst[i] = src[i];
+  }
+}
+
 // --- q8g32 P=1 GEMV, LPR lanes per row (32/LPR rows per wave), TPB-thread
 // blocks. For the decode shapes where k_q8g32_gemv_mr<1> (2 rows per wave,
 // 512-thread blocks) runs below bandwidth: few rows (2560 x 6144: only 80
@@ -1058,6 +1101,84 @@ __global__ __launch_bounds__(512, 2) void k_gdn_step_gn(
     const float zz = z[h * 128 + t];
     out[h * 128 + t] = yv * inv * w_gn[t] / (1.f + expf(-zz));
   }
+}
+
+// Wave-aligned 192x128 variant of k_gdn_step_gn (4 blocks of 32 columns per v-head):
+// eliminates the 48-on-40 WGP tail wave (160 + 32 blocks across 20 WGPs vs 40 + 8)
+// and unrolls u=0..31 so s_reg[32] stays in static VGPRs with full MLP. Bit-identical.
+__global__ __launch_bounds__(128, 8) void k_gdn_step_gn_128(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, const float* __restrict__ g,
+    const float* __restrict__ beta, float* __restrict__ S,
+    const float* __restrict__ z, const float* __restrict__ w_gn,
+    float* __restrict__ ytmp, float* __restrict__ out,
+    int* __restrict__ cnt, float eps) {
+  const int h = blockIdx.x >> 2, bh = blockIdx.x & 3;
+  const int t = threadIdx.x;
+  const int il = t & 31, jc = t >> 5;
+  const int i = bh * 32 + il, j0 = jc * 32;
+  __shared__ float skh[128];
+  __shared__ float sqh[128];
+  __shared__ float part[4][32];
+  __shared__ int s_last;
+  skh[t] = k[(h / 3) * 128 + t];
+  sqh[t] = q[(h / 3) * 128 + t];
+  __syncthreads();
+
+  float* Sh = S + (size_t)h * 128 * 128;
+  const float alpha = expf(g[h]);
+  const float be = beta[h];
+  float s_reg[32];
+  float kv = 0.f;
+#pragma unroll
+  for (int u = 0; u < 32; u++) {
+    const int j = j0 + u;
+    float s = Sh[j * 128 + i] * alpha;
+    asm volatile("" : "+v"(s));
+    s_reg[u] = s;
+    kv += s * skh[j];
+  }
+  part[jc][il] = kv;
+  __syncthreads();
+  const float kvf = part[0][il] + part[1][il] + part[2][il] + part[3][il];
+  const float delta = (v[h * 128 + i] - kvf) * be;
+  float o = 0.f;
+#pragma unroll
+  for (int u = 0; u < 32; u++) {
+    const int j = j0 + u;
+    float s = s_reg[u] + skh[j] * delta;
+    Sh[j * 128 + i] = s;
+    o += s * sqh[j];
+  }
+  __syncthreads();
+  part[jc][il] = o;
+  __syncthreads();
+  if (jc == 0) ytmp[h * 128 + i] = part[0][il] + part[1][il] + part[2][il] + part[3][il];
+  __threadfence();
+  __syncthreads();
+  if (t == 0) s_last = atomicAdd(cnt + h, 1) == 3;
+  __syncthreads();
+  if (!s_last) return;
+  __threadfence();
+  const float yv = __builtin_nontemporal_load(ytmp + h * 128 + t);
+  skh[t] = __fmul_rn(yv, yv);
+  __syncthreads();
+  if (t < 64) skh[t] += skh[t + 64];
+  __syncthreads();
+  if (t < 32) {
+    float sv = skh[t] + skh[t + 32];
+    sv += __shfl_down(sv, 16, 32);
+    sv += __shfl_down(sv, 8, 32);
+    sv += __shfl_down(sv, 4, 32);
+    sv += __shfl_down(sv, 2, 32);
+    sv += __shfl_down(sv, 1, 32);
+    if (t == 0) skh[0] = sv;
+  }
+  if (t == 0) atomicExch(cnt + h, 0);
+  __syncthreads();
+  const float inv = rsqrtf(skh[0] / 128 + eps);
+  const float zz = z[h * 128 + t];
+  out[h * 128 + t] = yv * inv * w_gn[t] / (1.f + expf(-zz));
 }
 
 // Short speculative batches: keep the entire recurrent state in registers.
@@ -2626,6 +2747,20 @@ __global__ void k_step_incr_amx(int* __restrict__ d_pos, int* __restrict__ d_rin
     __threadfence_system();
   }
 }
+// ceil_probe R2 移植：图尾在写完 zero-copy argmax 后递增 host 可见的完成序号，
+// 让宿主侧自旋等旗标替代 hipStreamSynchronize（WDDM 上 sync 成本 ~0.4-1ms）。
+__global__ void k_step_incr_amx_seq(int* __restrict__ d_pos, int* __restrict__ d_ringpos,
+                                    const int* __restrict__ d_amx, int* __restrict__ p_amx,
+                                    uint32_t* __restrict__ p_seq) {
+  *d_pos += 1;
+  *d_ringpos = (*d_ringpos + 1) % 9;
+  if (p_amx) *p_amx = *d_amx;
+  __threadfence_system();
+  if (p_seq) {
+    uint32_t nx = *p_seq + 1u;
+    __hip_atomic_store(p_seq, nx, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+  }
+}
 // R[ch] += U[ch] + convout[ch]
 __global__ void k_add2(float* __restrict__ R, const float* __restrict__ a,
                        const float* __restrict__ b, int n) {
@@ -2867,6 +3002,28 @@ __global__ __launch_bounds__(256) void k_qsa_prep_p1(
     const size_t off = (size_t)kv_row(ptab, pos) * 512 + idx;
     ((float*)kc)[off] = kf;
     ((float*)vc)[off] = vb[idx];
+  } else if constexpr (KvMode == 3) {
+    if (kc && vc) {
+      const int lane = t & 31, group = kh * 8 + (t >> 5);
+      const float b_val = vb[idx];
+      float ak = fabsf(kf), av = fabsf(b_val);
+#pragma unroll
+      for (int d = 16; d; d >>= 1) {
+        ak = fmaxf(ak, __shfl_xor_sync(~0ull, ak, d));
+        av = fmaxf(av, __shfl_xor_sync(~0ull, av, d));
+      }
+      const __half sk = __float2half_rn(ak == 0 ? 0.f : fmaxf(ak / 127.f, 0x1p-24f));
+      const __half sv = __float2half_rn(av == 0 ? 0.f : fmaxf(av / 127.f, 0x1p-24f));
+      const float dk = __half2float(sk), dv = __half2float(sv);
+      const int qk = dk == 0 ? 0 : max(-127, min(127, __float2int_rn(kf / dk)));
+      const int qv = dv == 0 ? 0 : max(-127, min(127, __float2int_rn(b_val / dv)));
+      const size_t dst = (size_t)kv_row(ptab, pos) * 16 + group;
+      auto* kcq = (KvQ8Block*)kc;
+      auto* vcq = (KvQ8Block*)vc;
+      kcq[dst].q[lane] = (int8_t)qk;
+      vcq[dst].q[lane] = (int8_t)qv;
+      if (lane == 0) { kcq[dst].scale = sk; vcq[dst].scale = sv; }
+    }
   }
 }
 

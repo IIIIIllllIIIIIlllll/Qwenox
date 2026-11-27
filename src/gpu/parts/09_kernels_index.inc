@@ -227,31 +227,50 @@ template <bool Combined = false>
 __global__ void k_index_select_stream(const float* __restrict__ scores, int stride,
                                   int* __restrict__ selected, int first,
                                   const int* __restrict__ pos = nullptr) {
+  __shared__ unsigned s_bits[8192];
+  __shared__ unsigned wh[8][256];
   __shared__ unsigned hist[256];
   __shared__ unsigned shr_cnt[8];
   __shared__ unsigned shr_eq[8];
   __shared__ int s_passcnt, s_passbyte, s_cntgt;
   const int q = blockIdx.x, t = pos ? *pos : first + q, n = (t + 1) / 4;
   const int tid = threadIdx.x;
+  const int lane = tid % warpSize, w = tid / warpSize, nw = 256 / warpSize;
   if (n <= g_index_budget_d) {
     for (int i = tid; i < g_index_budget_d; i += 256)
       selected[(size_t)q * g_index_budget_d + i] = i < n ? i : -1;
     return;
   }
-  // First pass: combine scores and build the top-byte histogram.
-  hist[tid] = 0;
+  const bool use_lds = (n <= 8192);
+  for (int rw = 0; rw < 8; rw++) wh[rw][tid] = 0;
   __syncthreads();
   const float* qb = scores + (size_t)q * 4 * stride;
-  for (int b = tid; b < n; b += 256) {
-    float s = 0.f;
-    if constexpr (Combined) {
-      s = scores[(size_t)q * stride + b];
-    } else {
+  for (int c0 = 0; c0 < n; c0 += 256) {
+    const int b = c0 + tid;
+    unsigned bits = 0u;
+    if (b < n) {
+      float s = 0.f;
+      if constexpr (Combined) {
+        s = scores[(size_t)q * stride + b];
+      } else {
 #pragma unroll
-      for (int h = 0; h < 4; h++) s += fmaxf(0.f, qb[(size_t)h * stride + b]);
-      s *= 0.08838834764831845f;
+        for (int h = 0; h < 4; h++) s += fmaxf(0.f, qb[(size_t)h * stride + b]);
+        s *= 0.08838834764831845f;
+      }
+      bits = __float_as_uint(s);
+      if (use_lds) s_bits[b] = bits;
     }
-    atomicAdd(&hist[__float_as_uint(s) >> 24], 1u);
+    const unsigned topb = bits >> 24;
+    const unsigned long long zmask = __ballot_sync(~0ull, b < n && topb == 0u);
+    if (zmask && lane == (__ffsll(zmask) - 1)) wh[w][0] += (unsigned)__popcll(zmask);
+    if (b < n && topb != 0u) atomicAdd(&wh[w][topb], 1u);
+  }
+  __syncthreads();
+  {
+    unsigned hs = 0;
+#pragma unroll
+    for (int rw = 0; rw < 8; rw++) hs += wh[rw][tid];
+    hist[tid] = hs;
   }
   __syncthreads();
   // 4 MSD radix passes -> exact Kth-largest score bits in prefix
@@ -261,14 +280,27 @@ __global__ void k_index_select_stream(const float* __restrict__ scores, int stri
   for (int p = 0; p < 4; p++) {
     const int shift = (3 - p) * 8;
     if (p) {
-      __syncthreads();  // hist reuse
-      hist[tid] = 0;
+      for (int rw = 0; rw < 8; rw++) wh[rw][tid] = 0;
       __syncthreads();
-      for (int b = tid; b < n; b += 256) {
-        unsigned bits = __float_as_uint(index_stream_score<Combined>(scores, stride, q, b));
-        if ((bits >> (shift + 8)) == prefix)
-          atomicAdd(&hist[(bits >> shift) & 0xffu], 1u);
+      for (int c0 = 0; c0 < n; c0 += 256) {
+        const int b = c0 + tid;
+        unsigned bits = 0u;
+        bool match = false;
+        if (b < n) {
+          bits = use_lds ? s_bits[b]
+                         : __float_as_uint(index_stream_score<Combined>(scores, stride, q, b));
+          match = ((bits >> (shift + 8)) == prefix);
+        }
+        const unsigned bin = (bits >> shift) & 0xffu;
+        const unsigned long long zmask = __ballot_sync(~0ull, match && bin == 0u);
+        if (zmask && lane == (__ffsll(zmask) - 1)) wh[w][0] += (unsigned)__popcll(zmask);
+        if (match && bin != 0u) atomicAdd(&wh[w][bin], 1u);
       }
+      __syncthreads();
+      unsigned hs = 0;
+#pragma unroll
+      for (int rw = 0; rw < 8; rw++) hs += wh[rw][tid];
+      hist[tid] = hs;
       __syncthreads();
     }
     if (tid == 0) {
@@ -297,11 +329,12 @@ __global__ void k_index_select_stream(const float* __restrict__ scores, int stri
   // The old kernel's final IdSort yields ascending ids, so ties and strict
   // greaters must interleave in one id-ordered scan (not two phases).
   int outbase = 0, eqbase = 0;
-  const int lane = tid % warpSize, w = tid / warpSize, nw = 256 / warpSize;
 #pragma unroll 1
   for (int c0 = 0; c0 < n; c0 += 256) {
     const int b = c0 + tid;
-    unsigned bits = b < n ? __float_as_uint(index_stream_score<Combined>(scores, stride, q, b)) : 0u;
+    unsigned bits = b < n ? (use_lds ? s_bits[b]
+                                     : __float_as_uint(index_stream_score<Combined>(scores, stride, q, b)))
+                          : 0u;
     bool gt = b < n && bits > sstar;
     bool eq = b < n && bits == sstar;
     unsigned long long bal_eq = __ballot_sync(~0ull, eq);
@@ -740,7 +773,8 @@ __device__ __forceinline__ unsigned isel_kth(int cnt, int K, Get get, unsigned* 
 template <class ST = float>
 __global__ void __launch_bounds__(256)
 k_index_select_2p(const ST* __restrict__ scores, int stride,
-                  int* __restrict__ selected, int first, int cap = ISEL_CAP) {
+                  int* __restrict__ selected, int first, int cap = ISEL_CAP,
+                  const int* __restrict__ pos = nullptr) {
   __shared__ unsigned big[ISEL_BINS];  // pass 1 histogram; then cand bits | cand ids
   __shared__ int sel[INDEX_BUDGET];
   __shared__ unsigned h256[256];
@@ -748,7 +782,7 @@ k_index_select_2p(const ST* __restrict__ scores, int stride,
   __shared__ unsigned shr_cnt[8], shr_eq[8];
   __shared__ int sh[2];
   __shared__ int s_nsel, s_ncand, s_eq;
-  const int q = blockIdx.x, t = first + q, n = (t + 1) / 4;
+  const int q = blockIdx.x, t = pos ? *pos : first + q, n = (t + 1) / 4;
   const int tid = threadIdx.x;
   if (n <= g_index_budget_d) {
     for (int i = tid; i < g_index_budget_d; i += 256)
@@ -948,4 +982,236 @@ k_index_select_2p(const ST* __restrict__ scores, int stride,
   }
   for (int i = tid; i < g_index_budget_d; i += 256)
     selected[(size_t)q * g_index_budget_d + i] = sel[i];
+}
+
+// k_index_select_p1: P=1 专用的单内核精确 top-K（ceil_probe 版）——
+// n<=budget 直接恒等；n<=8192 走 LDS 直方图三遍收束；更大走 ISEL 直方图 +
+// 候选 + 位排序兜底。输出与 k_index_select_2p 逐位一致（探针 10K/43.5K
+// ABBA diff=0）。与 2p 的区别：单 launch、一次全局读，省一遍往返。
+__global__ __launch_bounds__(256) void k_index_select_p1(
+    const float* __restrict__ row, int* __restrict__ selected,
+    const int* __restrict__ pos) {
+  __shared__ unsigned big[ISEL_BINS];
+  __shared__ int sel[INDEX_BUDGET];
+  __shared__ unsigned h256[256];
+  __shared__ unsigned wsum[8];
+  __shared__ unsigned shr_cnt[8], shr_eq[8];
+  __shared__ int sh[2];
+  __shared__ int s_nsel, s_ncand, s_eq, s_passcnt, s_passbyte, s_cntgt;
+
+  const int t = *pos, n = (t + 1) / 4;
+  const int tid = threadIdx.x;
+  if (n <= g_index_budget_d) {
+    for (int i = tid; i < g_index_budget_d; i += 256)
+      selected[i] = i < n ? i : -1;
+    return;
+  }
+  if (n <= 8192) {
+    float* sbuf = reinterpret_cast<float*>(big);
+    h256[tid] = 0;
+    __syncthreads();
+    for (int b = tid; b < n; b += 256) {
+      float s = row[b];
+      sbuf[b] = s;
+      atomicAdd(&h256[__float_as_uint(s) >> 24], 1u);
+    }
+    __syncthreads();
+    unsigned prefix = 0;
+    int K = g_index_budget_d;
+    if (tid == 0) s_cntgt = 0;
+    for (int p = 0; p < 4; p++) {
+      const int shift = (3 - p) * 8;
+      if (p) {
+        __syncthreads();
+        h256[tid] = 0;
+        __syncthreads();
+        for (int b = tid; b < n; b += 256) {
+          unsigned bits = __float_as_uint(sbuf[b]);
+          if ((bits >> (shift + 8)) == prefix)
+            atomicAdd(&h256[(bits >> shift) & 0xffu], 1u);
+        }
+        __syncthreads();
+      }
+      if (tid == 0) {
+        int acc = 0, chosen = 255;
+        for (int i = 255; i >= 0; i--) {
+          int c = (int)h256[i];
+          if (acc + c >= K) { chosen = i; break; }
+          acc += c;
+        }
+        s_passcnt = acc;
+        s_passbyte = chosen;
+      }
+      __syncthreads();
+      K -= s_passcnt;
+      if (tid == 0) s_cntgt += s_passcnt;
+      prefix = (prefix << 8) | (unsigned)s_passbyte;
+      __syncthreads();
+    }
+    const unsigned sstar = prefix;
+    const int need = g_index_budget_d - s_cntgt;
+    int outbase = 0, eqbase = 0;
+    const int lane = tid % warpSize, w = tid / warpSize, nw = 256 / warpSize;
+#pragma unroll 1
+    for (int c0 = 0; c0 < n; c0 += 256) {
+      const int b = c0 + tid;
+      unsigned bits = b < n ? __float_as_uint(sbuf[b]) : 0u;
+      bool gt = b < n && bits > sstar;
+      bool eq = b < n && bits == sstar;
+      unsigned long long bal_eq = __ballot_sync(~0ull, eq);
+      int eq_pre = __popcll(bal_eq & (lane ? (~0ull) >> (64 - lane) : 0ull));
+      if (lane == 0) shr_eq[w] = __popcll(bal_eq);
+      __syncthreads();
+      int eq_woff = 0;
+      for (int i = 0; i < nw; i++) eq_woff += i < w ? (int)shr_eq[i] : 0;
+      bool pick = gt || (eq && eqbase + eq_woff + eq_pre < need);
+      unsigned long long bal_sel = __ballot_sync(~0ull, pick);
+      if (lane == 0) shr_cnt[w] = __popcll(bal_sel);
+      __syncthreads();
+      int woff = 0, wtot = 0, eqtot = 0;
+      for (int i = 0; i < nw; i++) {
+        int c = (int)shr_cnt[i];
+        woff += i < w ? c : 0;
+        wtot += c;
+        eqtot += (int)shr_eq[i];
+      }
+      if (pick)
+        selected[outbase + woff + __popcll(bal_sel & (lane ? (~0ull) >> (64 - lane) : 0ull))] = b;
+      outbase += wtot;
+      eqbase = min(eqbase + eqtot, need);
+      __syncthreads();
+    }
+    return;
+  }
+
+  const int cap = ISEL_CAP;
+  for (int i = tid; i < ISEL_BINS; i += 256) big[i] = 0;
+  if (tid == 0) s_nsel = s_ncand = s_eq = 0;
+  __syncthreads();
+  for (int b0 = tid; b0 < n; b0 += 256 * 8) {
+    unsigned v[8];
+#pragma unroll
+    for (int k = 0; k < 8; k++) v[k] = b0 + 256 * k < n ? isel_bits(row[b0 + 256 * k]) : 0u;
+#pragma unroll
+    for (int k = 0; k < 8; k++)
+      if (b0 + 256 * k < n) atomicAdd(&big[isel_bin(v[k])], 1u);
+  }
+  __syncthreads();
+  isel_find_desc<ISEL_BINS / 256>(big, g_index_budget_d, sh, wsum);
+  const int cnt_gt = sh[0];
+  const unsigned T = (unsigned)sh[1];
+  const int ncand = (int)big[T];
+  __syncthreads();
+  if (ncand > cap) {
+    unsigned prefix = T;
+    int K = g_index_budget_d - cnt_gt, cgt = cnt_gt;
+    const int shifts[3] = {10, 2, 0}, widths[3] = {8, 8, 2};
+#pragma unroll 1
+    for (int p = 0; p < 3; p++) {
+      const int shift = shifts[p], wdt = widths[p];
+      h256[tid] = 0;
+      __syncthreads();
+      for (int b = tid; b < n; b += 256) {
+        const unsigned bits = isel_bits(row[b]);
+        if ((p == 0 ? isel_bin(bits) : bits >> (shift + wdt)) == prefix)
+          atomicAdd(&h256[(bits >> shift) & ((1u << wdt) - 1u)], 1u);
+      }
+      __syncthreads();
+      isel_find_desc<1>(h256, K, sh, wsum);
+      K -= sh[0];
+      cgt += sh[0];
+      prefix = (prefix << wdt) | (unsigned)sh[1];
+      __syncthreads();
+    }
+    const unsigned sstar = prefix;
+    const int need = g_index_budget_d - cgt;
+    int outbase = 0, eqbase = 0;
+    const int lane = tid % warpSize, w = tid / warpSize, nw = 256 / warpSize;
+#pragma unroll 1
+    for (int c0 = 0; c0 < n; c0 += 256) {
+      const int b = c0 + tid;
+      unsigned bits = b < n ? isel_bits(row[b]) : 0u;
+      bool gt = b < n && bits > sstar;
+      bool eq = b < n && bits == sstar;
+      unsigned long long bal_eq = __ballot_sync(~0ull, eq);
+      int eq_pre = __popcll(bal_eq & (lane ? (~0ull) >> (64 - lane) : 0ull));
+      if (lane == 0) shr_eq[w] = __popcll(bal_eq);
+      __syncthreads();
+      int eq_woff = 0;
+      for (int i = 0; i < nw; i++) eq_woff += i < w ? (int)shr_eq[i] : 0;
+      bool pick = gt || (eq && eqbase + eq_woff + eq_pre < need);
+      unsigned long long bal_sel = __ballot_sync(~0ull, pick);
+      if (lane == 0) shr_cnt[w] = __popcll(bal_sel);
+      __syncthreads();
+      int woff = 0, wtot = 0, eqtot = 0;
+      for (int i = 0; i < nw; i++) {
+        int c = (int)shr_cnt[i];
+        woff += i < w ? c : 0;
+        wtot += c;
+        eqtot += (int)shr_eq[i];
+      }
+      if (pick)
+        selected[outbase + woff + __popcll(bal_sel & (lane ? (~0ull) >> (64 - lane) : 0ull))] = b;
+      outbase += wtot;
+      eqbase = min(eqbase + eqtot, need);
+      __syncthreads();
+    }
+    return;
+  }
+  unsigned* cbits = big;
+  int* cid = reinterpret_cast<int*>(big + ISEL_CAP);
+  for (int b0 = tid; b0 < n; b0 += 256 * 8) {
+    unsigned v[8];
+#pragma unroll
+    for (int k = 0; k < 8; k++) v[k] = b0 + 256 * k < n ? isel_bits(row[b0 + 256 * k]) : 0u;
+#pragma unroll
+    for (int k = 0; k < 8; k++) {
+      const int b = b0 + 256 * k;
+      const unsigned bin = isel_bin(v[k]);
+      if (b >= n) continue;
+      if (bin > T) sel[atomicAdd(&s_nsel, 1)] = b;
+      else if (bin == T) {
+        const int i = atomicAdd(&s_ncand, 1);
+        cbits[i] = v[k];
+        cid[i] = b;
+      }
+    }
+  }
+  __syncthreads();
+  int gt2;
+  const unsigned sstar = isel_kth(
+      ncand, g_index_budget_d - cnt_gt, [&](int i, unsigned& k) { k = cbits[i]; return true; },
+      h256, sh, wsum, gt2);
+  const int need = g_index_budget_d - cnt_gt - gt2;
+  for (int i = tid; i < ncand; i += 256)
+    if (cbits[i] == sstar) atomicAdd(&s_eq, 1);
+  __syncthreads();
+  const int E = s_eq;
+  unsigned idk = 0u;
+  if (E > need) {
+    int g;
+    idk = isel_kth(
+        ncand, need,
+        [&](int i, unsigned& k) { k = ~(unsigned)cid[i]; return cbits[i] == sstar; },
+        h256, sh, wsum, g);
+  }
+  for (int i = tid; i < ncand; i += 256) {
+    const unsigned bits = cbits[i];
+    if (bits > sstar || (bits == sstar && ~(unsigned)cid[i] >= idk))
+      sel[atomicAdd(&s_nsel, 1)] = cid[i];
+  }
+  __syncthreads();
+#pragma unroll 1
+  for (int k = 2; k <= g_index_budget_d; k <<= 1) {
+#pragma unroll 1
+    for (int j = k >> 1; j > 0; j >>= 1) {
+      for (int c = tid; c < g_index_budget_d / 2; c += 256) {
+        const int i = (c / j) * 2 * j + (c % j), p = i + j;
+        const int a = sel[i], b = sel[p];
+        if ((a > b) == ((i & k) == 0)) { sel[i] = b; sel[p] = a; }
+      }
+      __syncthreads();
+    }
+  }
+  for (int i = tid; i < g_index_budget_d; i += 256) selected[i] = sel[i];
 }

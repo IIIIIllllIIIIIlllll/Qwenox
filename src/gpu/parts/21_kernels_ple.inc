@@ -75,9 +75,20 @@ __device__ inline float fp8e4m3_f32_dev(uint8_t v) {
   return s ? -r : r;
 }
 
+__device__ __forceinline__ void ple_wait_ready(const uint32_t* ple_ready) {
+  if (ple_ready) {
+    if (threadIdx.x == 0) {
+      while (__hip_atomic_load(ple_ready, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) == 0u) {}
+    }
+    __syncthreads();
+  }
+}
+
 __global__ void k_ple_fp8_dequant(const uint8_t* __restrict__ src,
                                   float* __restrict__ dst, float scale,
-                                  size_t n16) {  // n16 = elements/16
+                                  size_t n16,
+                                  const uint32_t* ple_ready = nullptr) {  // n16 = elements/16
+  ple_wait_ready(ple_ready);
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n16) return;
   uint4 raw = ((const uint4*)src)[i];
@@ -99,7 +110,9 @@ __global__ void k_ple_fp8_dequant(const uint8_t* __restrict__ src,
 __constant__ int8_t c_kvalues_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
                                            1,    13,   25,  38,  53,  69,  89,  113};
 __global__ void k_ple_iq4nl_dequant(const uint8_t* __restrict__ src,
-                                    float* __restrict__ dst, size_t nblk) {
+                                    float* __restrict__ dst, size_t nblk,
+                                    const uint32_t* ple_ready = nullptr) {
+  ple_wait_ready(ple_ready);
   size_t b = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (b >= nblk) return;
   const uint8_t* p = src + b * 18;
@@ -118,7 +131,9 @@ __global__ void k_ple_iq4nl_dequant(const uint8_t* __restrict__ src,
 // f32 embeddings (block b -> dst[32b..32b+31]). Bit-exact with
 // gguf::dequant_row(Q5_0) (fp16->f32 exact, one f32 multiply per element).
 __global__ void k_ple_q50_dequant(const uint8_t* __restrict__ src,
-                                  float* __restrict__ dst, size_t nblk) {
+                                  float* __restrict__ dst, size_t nblk,
+                                  const uint32_t* ple_ready = nullptr) {
+  ple_wait_ready(ple_ready);
   size_t b = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (b >= nblk) return;
   const uint8_t* p = src + b * 22;
@@ -147,7 +162,9 @@ __device__ __forceinline__ float ple_bf16_f32(uint16_t v) {
 }
 __global__ void k_ple_bf16_dequant(const uint8_t* __restrict__ src,
                                    float* __restrict__ dst,
-                                   size_t n16) {  // n16 = elements/16
+                                   size_t n16,
+                                   const uint32_t* ple_ready = nullptr) {  // n16 = elements/16
+  ple_wait_ready(ple_ready);
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n16) return;
   uint4 raw0 = ((const uint4*)src)[i * 2];

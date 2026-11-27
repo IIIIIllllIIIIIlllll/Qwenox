@@ -977,6 +977,78 @@ __global__ void k_index_append(const float* proj, const float* norm, float* ring
                   keys16 ? keys16 + (size_t)ik_blk(ptab, t / 4) * 128 : nullptr);
 }
 
+// Fused P=1 decode indexer Q (blocks 0..3) + pooled key append (block 4).
+// ceil_probe 版：单 inorm 基址（q 用 inorm[0..128)，k 用 inorm[128..256)）。
+__global__ void k_index_qa_p1(const float* __restrict__ proj,
+                              const float* __restrict__ inorm,
+                              float* __restrict__ queries,
+                              float* __restrict__ ring,
+                              float* __restrict__ keys,
+                              const int* __restrict__ pos,
+                              float eps, double theta,
+                              const int* __restrict__ d_rdelta = nullptr,
+                              const int* __restrict__ ptab = nullptr,
+                              uint16_t* __restrict__ keys16 = nullptr) {
+  const int t = *pos;
+  if (blockIdx.x < 4) {
+    const int h = blockIdx.x;
+    int position = t + (d_rdelta ? *d_rdelta : 0);
+    index_norm_rope(proj[h * 128 + threadIdx.x], inorm, queries + h * 128,
+                    position, eps, theta, nullptr, 0, nullptr);
+    return;
+  }
+  const int d = threadIdx.x;
+  ring[(t % 4) * 128 + d] = proj[512 + d];
+  __syncthreads();
+  if (t % 4 != 3) return;
+  float v = 0.f;
+  for (int j = 0; j < 4; j++) v += ring[j * 128 + d];
+  int position = t - 3 + (d_rdelta ? *d_rdelta : 0);
+  index_norm_rope(v * 0.25f, inorm + 128, keys + (size_t)ik_blk(ptab, t / 4) * 128,
+                  position, eps, theta, nullptr, 0,
+                  keys16 ? keys16 + (size_t)ik_blk(ptab, t / 4) * 128 : nullptr);
+}
+
+// Persistent grid-stride P=1 indexer score kernel: stages queries[512] in LDS,
+// loads each pooled key block ONCE (instead of 4x), and writes combined ReLU scores.
+__global__ __launch_bounds__(256) void k_index_scores_p1(
+    const float* __restrict__ queries, const float* __restrict__ keys,
+    float* __restrict__ scores, const int* __restrict__ pos,
+    const int* __restrict__ ptab = nullptr) {
+  const int t = *pos;
+  if (t < qsa_index_first()) return;
+  __shared__ float sq[512];
+  for (int i = threadIdx.x; i < 512; i += 256) sq[i] = queries[i];
+  __syncthreads();
+  const int n = (t + 1) / 4;
+  const int lane = threadIdx.x % warpSize;
+  const int w = threadIdx.x / warpSize;
+  const int gw0 = blockIdx.x * (256 / warpSize) + w;
+  const int gstride = gridDim.x * (256 / warpSize);
+  for (int b = gw0; b < n; b += gstride) {
+    const float* kb = keys + (size_t)ik_blk(ptab, b) * 128;
+    const float k0 = kb[lane];
+    const float k1 = kb[lane + 32];
+    const float k2 = kb[lane + 64];
+    const float k3 = kb[lane + 96];
+    float cs = 0.f;
+#pragma unroll
+    for (int h = 0; h < 4; h++) {
+      const float* qh = sq + h * 128;
+      float sum = 0.f;
+      sum += qh[lane] * k0;
+      sum += qh[lane + 32] * k1;
+      sum += qh[lane + 64] * k2;
+      sum += qh[lane + 96] * k3;
+#pragma unroll
+      for (int s = warpSize / 2; s > 0; s >>= 1)
+        sum += __shfl_down_sync(~0ull, sum, s);
+      if (!lane) cs += fmaxf(0.f, sum);
+    }
+    if (!lane) scores[b] = cs * 0.08838834764831845f;
+  }
+}
+
 __global__ void k_index_scores(const float* queries, const float* keys, float* scores,
                                 int stride, const int* pos,
                                 const int* __restrict__ ptab = nullptr) {
