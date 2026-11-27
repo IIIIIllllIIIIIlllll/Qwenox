@@ -189,6 +189,17 @@ struct GpuModel {
     const char* v = getenv(k);
     return v && v[0] == '0' && v[1] == 0;
   }
+  // Windows decode switches default ON (2026-11-28 decision: measured +5.6%
+  // MTP throughput, acceptance-neutral on Windows; Linux stays opt-in because
+  // the same switches cost acceptance there). Set the var to 0 to opt out.
+  static bool win_default_on(const char* k) {
+#ifdef _WIN32
+    return !env_zero(k);
+#else
+    const char* v = getenv(k);
+    return v && v[0] != 0 && v[0] != '0';
+#endif
+  }
   // ---- dense dequant look-ahead (dpf, 10-14) ----------------------------------
   // Prefill GEMMs read the dense weights as bf16. gemm_wbf16 used to dequantize
   // each weight into d_wbf16 right before its GEMM, serialized on g_str (a
@@ -1187,17 +1198,11 @@ struct GpuModel {
   struct HcQ4Entry { uint8_t* data = nullptr; int st4 = 0; };
   std::unordered_map<std::string, HcQ4Entry> hc_q4_cache_;
   static bool router_q8_on() {
-    static const bool v = [] {
-      const char* e = getenv("QWENOX_ROUTER_Q8");
-      return e && e[0] != 0 && e[0] != '0';
-    }();
+    static const bool v = win_default_on("QWENOX_ROUTER_Q8");
     return v;
   }
   static bool hc_q4_on() {
-    static const bool v = [] {
-      const char* e = getenv("QWENOX_HC_Q4");
-      return e && e[0] != 0 && e[0] != '0';
-    }();
+    static const bool v = win_default_on("QWENOX_HC_Q4");
     return v;
   }
   RouterQ8Entry ensure_router_q8(int l, const WView& rtw) {
@@ -14502,7 +14507,7 @@ struct GpuModel {
     // configs fall back to the host path per request.
     hipGraph_t gpipe = nullptr;
     static const bool pipe_env =
-        getenv("QWENOX_SAMP_GPU") != nullptr && !env_zero("QWENOX_SAMP_GPU");
+        win_default_on("QWENOX_SAMP_GPU");
     if (use_gall && gall_hi_st_ && pipe_env && p_sm_ci && p_sm_cv && d_sm_ci_zc &&
         d_sm_cv_zc && (!ple_on || (!ple_iq4 && !ple_q50 && !ple_bf16))) {
       if (!d_sm_scratch) DALLOC(&d_sm_scratch, (size_t)SMS_ROWS * g_cfg.vocab * 4);
@@ -15725,10 +15730,7 @@ struct GpuModel {
   // replaces the mutex/CV worker kick: the graph reaches its ple_wait_ready
   // ~0.5 ms after the launch, the gather takes ~0.02 ms.
   static bool gdn_state_bf16_on() {
-    static const bool v = [] {
-      const char* e = getenv("QWENOX_GDN_STATE_BF16");
-      return e && e[0] != 0 && e[0] != '0';
-    }();
+    static const bool v = win_default_on("QWENOX_GDN_STATE_BF16");
     return v;
   }
   void gdn_s_to_bf16(hipStream_t st) {

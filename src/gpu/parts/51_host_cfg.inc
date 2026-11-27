@@ -4321,7 +4321,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       // Eligibility: sampling request, no logprobs, no llama penalties, no
       // ckpt tokens, fp8 PLE. Everything else takes the serial loop below.
       static const bool pipe_env =
-          getenv("QWENOX_SAMP_GPU") != nullptr && !GpuModel::env_zero("QWENOX_SAMP_GPU");
+          GpuModel::win_default_on("QWENOX_SAMP_GPU");
       int i0 = 0;
       bool pipe_cancelled = false;
       if (pipe_env)
