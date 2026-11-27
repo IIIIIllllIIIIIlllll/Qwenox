@@ -2362,6 +2362,207 @@ __global__ __launch_bounds__(256, 4) void k_hcf_upc_coal(const uint8_t* __restri
   }
 }
 
+// ---- Direction 2B: HC Q4G64 requantization & decode kernels (QWENOX_HC_Q4=1) ----
+// Compact Q4G64 row layout for C elements (ng = C/64):
+//   [0 .. C/2): 4-bit nibbles (32 B/group, low nibble first)
+//   [C/2 .. C/2 + ng*4): fp16 (sc, bi) per group (4 B/group)
+// Saves ~30% DRAM traffic (~159 MB/tok across 97 down + 97 upc) and eliminates
+// the high-2-bit pointer stream & bit-unpack ALU completely.
+__global__ void k_q6g64_to_q4g64(const uint8_t* __restrict__ src, int st6,
+                                 uint8_t* __restrict__ dst, int st4, int R, int C) {
+  const int ng = C >> 6;
+  const int idx = (int)blockIdx.x * blockDim.x + threadIdx.x;
+  const int r = idx / ng, g = idx - r * ng;
+  if (r >= R) return;
+  const uint8_t* sr = src + (size_t)r * st6;
+  uint8_t* dr = dst + (size_t)r * st4;
+  const uint32_t sb = *(const uint32_t*)(sr + 3 * C / 4 + g * 4);
+  const float sc = __half2float(__ushort_as_half((unsigned short)(sb & 0xffffu)));
+  const float bi = __half2float(__ushort_as_half((unsigned short)(sb >> 16)));
+  int c6[64];
+  int cmin = 63, cmax = 0;
+  for (int i8 = 0; i8 < 8; i8++) {
+    const uint32_t lw = *(const uint32_t*)(sr + g * 32 + i8 * 4);
+    const uint32_t hw = (uint32_t)*(const uint16_t*)(sr + C / 2 + g * 16 + i8 * 2);
+    for (int e = 0; e < 8; e++) {
+      int v = (int)(((lw >> (4 * e)) & 15u) | (((hw >> (2 * e)) & 3u) << 4));
+      c6[i8 * 8 + e] = v;
+      if (v < cmin) cmin = v;
+      if (v > cmax) cmax = v;
+    }
+  }
+  const int span = cmax - cmin;
+  const float sc4 = span > 0 ? sc * (float)span / 15.0f : 0.0f;
+  const float bi4 = bi + sc * (float)cmin;
+  const float inv = span > 0 ? 15.0f / (float)span : 0.0f;
+  for (int i8 = 0; i8 < 8; i8++) {
+    uint32_t outw = 0u;
+    for (int e = 0; e < 8; e++) {
+      int q = span > 0 ? (int)rintf((float)(c6[i8 * 8 + e] - cmin) * inv) : 0;
+      q = max(0, min(15, q));
+      outw |= ((uint32_t)q << (4 * e));
+    }
+    *(uint32_t*)(dr + g * 32 + i8 * 4) = outw;
+  }
+  const uint16_t hsc = __half_as_ushort(__float2half(sc4));
+  const uint16_t hbi = __half_as_ushort(__float2half(bi4));
+  *(uint32_t*)(dr + C / 2 + g * 4) = (uint32_t)hsc | ((uint32_t)hbi << 16);
+}
+
+__global__ __launch_bounds__(256) void k_hcf_down_q4(const uint8_t* __restrict__ wq,
+                                                     const float* __restrict__ x,
+                                                     float* __restrict__ part,
+                                                     float* __restrict__ t,
+                                                     int R, int C, int st4, int gps,
+                                                     int* __restrict__ cnt) {
+  const int tid = threadIdx.x, li = tid & 31;
+  const int r = blockIdx.x * 8 + (tid >> 5);
+  const int s = blockIdx.y;
+  if (r < R) {
+    const int g0 = s * gps, g1 = min(C >> 6, g0 + gps);
+    const uint8_t* row = wq + (size_t)r * st4;
+    const int sub = li & 7, gq = li >> 3;
+    float acc = 0.f;
+    int g = g0 + gq;
+    if (g < g1) {
+      uint32_t clw = *(const uint32_t*)(row + g * 32 + sub * 4);
+      uint32_t csb = *(const uint32_t*)(row + C / 2 + g * 4);
+      for (; g < g1; g += 4) {
+        uint32_t nlw = 0, nsb = 0;
+        const int gn = g + 4;
+        if (gn < g1) {
+          nlw = *(const uint32_t*)(row + gn * 32 + sub * 4);
+          nsb = *(const uint32_t*)(row + C / 2 + gn * 4);
+        }
+        const uint32_t lw = clw, sb = csb;
+        clw = nlw; csb = nsb;
+        const float sc = __half2float(__ushort_as_half((unsigned short)(sb & 0xffffu)));
+        const float bi = __half2float(__ushort_as_half((unsigned short)(sb >> 16)));
+        float xv[8];
+        hv2::ldx8(x + g * 64 + sub * 8, xv);
+        float dx = 0.f, sx = 0.f;
+#pragma unroll
+        for (int e = 0; e < 8; e++) {
+          dx = fmaf((float)((lw >> (4 * e)) & 15u), xv[e], dx);
+          sx += xv[e];
+        }
+        acc += fmaf(sc, dx, bi * sx);
+      }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor(acc, off, 32);
+    if (li == 0) part[(size_t)s * R + r] = acc;
+  }
+  __shared__ int s_last;
+  __threadfence();
+  __syncthreads();
+  if (tid == 0) s_last = atomicAdd(cnt + blockIdx.x, 1) == (int)gridDim.y - 1;
+  __syncthreads();
+  if (!s_last) return;
+  __threadfence();
+  if (tid < 8) {
+    const int rr = blockIdx.x * 8 + tid;
+    if (rr < R) {
+      float v = __builtin_nontemporal_load(part + rr);
+      for (int k = 1; k < (int)gridDim.y; k++) v += __builtin_nontemporal_load(part + (size_t)k * R + rr);
+      const float xx = v * 0.25f;
+      t[rr] = xx / (1.f + expf(-xx));
+    }
+  }
+  if (tid == 0) atomicExch(cnt + blockIdx.x, 0);
+}
+
+__global__ __launch_bounds__(256, 4) void k_hcf_upc_q4(const uint8_t* __restrict__ wq,
+                                                       const float* __restrict__ t,
+                                                       const float* __restrict__ rh,
+                                                       float* __restrict__ xo, int st4) {
+  const int tid = threadIdx.x;
+  __shared__ float st_sh[320];
+  __shared__ float ssx[5];
+  __shared__ float sG[32];
+  st_sh[tid] = t[tid];
+  if (tid < 64) st_sh[256 + tid] = t[256 + tid];
+  __syncthreads();
+  if (tid < 5) {
+    float sx = 0.f;
+#pragma unroll
+    for (int k = 0; k < 64; k++) sx += st_sh[tid * 64 + k];
+    ssx[tid] = sx;
+  }
+  __syncthreads();
+  const int rr = tid >> 3, li = tid & 7;
+  const int b = rr >> 3, j = rr & 7;
+  const int r = b * 2560 + blockIdx.x * 8 + j;
+  const uint8_t* row = wq + (size_t)r * st4;
+  float term[5];
+#pragma unroll
+  for (int g = 0; g < 5; g++) {
+    const uint32_t lw = *(const uint32_t*)(row + g * 32 + li * 4);
+    const float4 a = *(const float4*)(st_sh + g * 64 + li * 8);
+    const float4 bv = *(const float4*)(st_sh + g * 64 + li * 8 + 4);
+    const float xv[8] = {a.x, a.y, a.z, a.w, bv.x, bv.y, bv.z, bv.w};
+    float dx = 0.f;
+#pragma unroll
+    for (int e = 0; e < 8; e++) {
+      dx = fmaf((float)((lw >> (4 * e)) & 15u), xv[e], dx);
+    }
+    dx += __shfl_xor(dx, 4, 32);
+    dx += __shfl_xor(dx, 2, 32);
+    dx += __shfl_xor(dx, 1, 32);
+    if (li == 0) {
+      const uint32_t sb = *(const uint32_t*)(row + 160 + g * 4);
+      const float sc = __half2float(__ushort_as_half((unsigned short)(sb & 0xffffu)));
+      const float bi = __half2float(__ushort_as_half((unsigned short)(sb >> 16)));
+      term[g] = fmaf(sc, dx, bi * ssx[g]);
+    }
+  }
+  if (li == 0) {
+    float s0 = term[0] + term[4];
+    float G = (s0 + term[2]) + (term[1] + term[3]);
+    sG[rr] = 1.f / (1.f + expf(-G));
+  }
+  __syncthreads();
+  if (tid < 8) {
+    const int i = blockIdx.x * 8 + tid;
+    float a = 0.f;
+#pragma unroll
+    for (int bb = 0; bb < 4; bb++) a += sG[bb * 8 + tid] * rh[(size_t)bb * 2560 + i];
+    xo[i] = a / 4;
+  }
+}
+
+// ---- Direction 2A: Router BF16 -> per-row symmetric Q8 (QWENOX_ROUTER_Q8=1) ----
+__global__ void k_quant_bf16_to_q8row(const uint16_t* __restrict__ src,
+                                      int8_t* __restrict__ dst,
+                                      float* __restrict__ rscale, int rows, int cols) {
+  const int r = blockIdx.x;
+  if (r >= rows) return;
+  __shared__ float smx[256];
+  const uint16_t* sr = src + (size_t)r * cols;
+  int8_t* dr = dst + (size_t)r * cols;
+  float mx = 0.f;
+  for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+    uint32_t u = (uint32_t)sr[c] << 16;
+    float v = __uint_as_float(u);
+    mx = fmaxf(mx, fabsf(v));
+  }
+  smx[threadIdx.x] = mx;
+  __syncthreads();
+  for (int off = 128; off > 0; off >>= 1) {
+    if (threadIdx.x < off) smx[threadIdx.x] = fmaxf(smx[threadIdx.x], smx[threadIdx.x + off]);
+    __syncthreads();
+  }
+  const float sc = smx[0] > 0.f ? smx[0] / 127.0f : 0.f;
+  const float inv = sc > 0.f ? 127.0f / smx[0] : 0.f;
+  if (threadIdx.x == 0) rscale[r] = sc;
+  for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+    uint32_t u = (uint32_t)sr[c] << 16;
+    float v = __uint_as_float(u);
+    int q = (int)rintf(v * inv);
+    dr[c] = (int8_t)max(-127, min(127, q));
+  }
+}
+
 // mix-up GEMV (branches*d rows x C, C < 1024, k_q6g64_gemv<1,float,8> lane
 // math) + sigmoid combine. Block = 8 output columns i for all 4 branches.
 __global__ __launch_bounds__(256) void k_hcf_upc(const uint8_t* __restrict__ wq,
@@ -2679,6 +2880,7 @@ __global__ __launch_bounds__(512) void k_moe_pre(const uint16_t* __restrict__ rw
 }
 
 // ============================================================================
+template <bool RouterQ8 = false>
 __global__ __launch_bounds__(256) void k_moe_pre_segu(
     const uint16_t* __restrict__ rw, const float* __restrict__ x, int cols,
     float* __restrict__ logits, const float* __restrict__ gu_suh,
@@ -2690,7 +2892,9 @@ __global__ __launch_bounds__(256) void k_moe_pre_segu(
     const float* __restrict__ sg_svh, float* __restrict__ sg_y, int sg_nrows,
     const uint8_t* __restrict__ su_codes, const float* __restrict__ su_suh,
     const float* __restrict__ su_svh, float* __restrict__ su_y, int su_nrows,
-    float* __restrict__ ht_zs, int* __restrict__ ht_cnt) {
+    float* __restrict__ ht_zs, int* __restrict__ ht_cnt,
+    const int8_t* __restrict__ rw_q8 = nullptr,
+    const float* __restrict__ rw_sc = nullptr) {
   extern __shared__ __align__(16) unsigned char sh_raw[];
   __shared__ int s_last;
   const int tid = threadIdx.x, lane = tid & 31, wv = tid >> 5;
@@ -2699,20 +2903,39 @@ __global__ __launch_bounds__(256) void k_moe_pre_segu(
   if (bid < 64) {
     const uint64_t row = (uint64_t)bid * 8 + wv;
     if (row < 512) {
-      const uint16_t* r = rw + row * cols;
       float acc = 0.f;
-      for (uint64_t c = lane * 8; c < (uint64_t)cols; c += 32 * 8) {
-        uint4 pk = *(const uint4*)(r + c);
-        float4 xa = *(const float4*)(x + c);
-        float4 xb = *(const float4*)(x + c + 4);
-        const uint16_t* h = (const uint16_t*)&pk;
-        float xv[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+      if constexpr (RouterQ8) {
+        const int8_t* rq = rw_q8 + row * cols;
+        for (uint64_t c = lane * 8; c < (uint64_t)cols; c += 32 * 8) {
+          uint2 pk = *(const uint2*)(rq + c);
+          float4 xa = *(const float4*)(x + c);
+          float4 xb = *(const float4*)(x + c + 4);
+          const int8_t* q = (const int8_t*)&pk;
+          acc = fmaf((float)q[0], xa.x, acc);
+          acc = fmaf((float)q[1], xa.y, acc);
+          acc = fmaf((float)q[2], xa.z, acc);
+          acc = fmaf((float)q[3], xa.w, acc);
+          acc = fmaf((float)q[4], xb.x, acc);
+          acc = fmaf((float)q[5], xb.y, acc);
+          acc = fmaf((float)q[6], xb.z, acc);
+          acc = fmaf((float)q[7], xb.w, acc);
+        }
+        acc *= rw_sc[row];
+      } else {
+        const uint16_t* r = rw + row * cols;
+        for (uint64_t c = lane * 8; c < (uint64_t)cols; c += 32 * 8) {
+          uint4 pk = *(const uint4*)(r + c);
+          float4 xa = *(const float4*)(x + c);
+          float4 xb = *(const float4*)(x + c + 4);
+          const uint16_t* h = (const uint16_t*)&pk;
+          float xv[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
 #pragma unroll
-        for (int j = 0; j < 8; j++) {
-          uint32_t u = (uint32_t)h[j] << 16;
-          float wf;
-          memcpy(&wf, &u, 4);
-          acc += wf * xv[j];
+          for (int j = 0; j < 8; j++) {
+            uint32_t u = (uint32_t)h[j] << 16;
+            float wf;
+            memcpy(&wf, &u, 4);
+            acc += wf * xv[j];
+          }
         }
       }
       for (int off = 16; off > 0; off >>= 1) acc += __shfl_down(acc, off, 32);

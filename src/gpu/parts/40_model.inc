@@ -1181,6 +1181,51 @@ struct GpuModel {
   int* d_pipe_out_flag_ = nullptr;
   uint16_t* d_samp_hist = nullptr;   // vocab count array for GPU-side penalties
   std::vector<int> sms_ord_;       // reused sort index scratch for samp_wait_draw
+  // Direction 2A/2B optional decode weight mirrors (opt-in, default off):
+  struct RouterQ8Entry { int8_t* q = nullptr; float* sc = nullptr; };
+  std::vector<RouterQ8Entry> rt_q8_;
+  struct HcQ4Entry { uint8_t* data = nullptr; int st4 = 0; };
+  std::unordered_map<std::string, HcQ4Entry> hc_q4_cache_;
+  static bool router_q8_on() {
+    static const bool v = [] {
+      const char* e = getenv("QWENOX_ROUTER_Q8");
+      return e && e[0] != 0 && e[0] != '0';
+    }();
+    return v;
+  }
+  static bool hc_q4_on() {
+    static const bool v = [] {
+      const char* e = getenv("QWENOX_HC_Q4");
+      return e && e[0] != 0 && e[0] != '0';
+    }();
+    return v;
+  }
+  RouterQ8Entry ensure_router_q8(int l, const WView& rtw) {
+    if ((int)rt_q8_.size() < g_cfg.layers) rt_q8_.resize((size_t)g_cfg.layers);
+    auto& e = rt_q8_[(size_t)l];
+    if (!e.q && rtw.dtype == 0 && rtw.rows == 512) {
+      DALLOC(&e.q, (size_t)rtw.rows * rtw.cols);
+      DALLOC(&e.sc, (size_t)rtw.rows * 4);
+      k_quant_bf16_to_q8row<<<(unsigned)rtw.rows, 256, 0, g_str>>>(
+          (const uint16_t*)rtw.data, e.q, e.sc, (int)rtw.rows, (int)rtw.cols);
+    }
+    return e;
+  }
+  HcQ4Entry ensure_hc_q4(const char* name, const WView& w) {
+    auto it = hc_q4_cache_.find(name);
+    if (it != hc_q4_cache_.end()) return it->second;
+    HcQ4Entry e{};
+    if (w.dtype == 24) {
+      const int ng = (int)(w.cols >> 6);
+      e.st4 = ((int)(w.cols / 2) + ng * 4 + 15) & ~15;
+      DALLOC(&e.data, (size_t)w.rows * e.st4);
+      const unsigned total = (unsigned)(w.rows * ng);
+      k_q6g64_to_q4g64<<<(total + 255) / 256, 256, 0, g_str>>>(
+          w.data, (int)w.scale_stride, e.data, e.st4, (int)w.rows, (int)w.cols);
+    }
+    hc_q4_cache_.emplace(name, e);
+    return e;
+  }
   // Rollback snapshots (spec verify): S/convst per accepted depth, indexer
   // proj rows per QSA layer. Written only when spec_snap is set. One slot's
   // verify chunk needs gamma+1 <= 9 rows (gamma <= 8); kVSnapRows reserves
@@ -3688,13 +3733,24 @@ struct GpuModel {
           const int sg_tpc = std::max(1, std::min(sg_tpb, 24 * 1024 / (128 * 2)));
           const size_t lds2 = std::max((size_t)(sg_tpc * 128 + 8) * 2, (size_t)512);
           const unsigned total_blk = (unsigned)(65 + nty2 * sg_ks);
-          k_moe_pre_segu<<<total_blk, 256, lds2, g_str>>>(
-              (const uint16_t*)rtw.data, x, (int)rtw.cols, d_router, gu.suh,
-              d_moe_xr, g_cfg.d, d_topids, d_topw, moepp_cnt_, vz_tap(l, false),
-              se_gw.data, d_se_sg, nty2, na2, sg_tpb, sg_tpc,
-              sg.data, sg.suh, sg.svh, d_se_guv, (int)sg.rows,
-              su.data, su.suh, su.svh, d_se_guv + 640, (int)su.rows,
-              g_ht_zs, g_ht_cnt);
+          if (router_q8_on() && rtw.dtype == 0 && rtw.rows == 512) {
+            const auto rq = ensure_router_q8(l, rtw);
+            k_moe_pre_segu<true><<<total_blk, 256, lds2, g_str>>>(
+                (const uint16_t*)rtw.data, x, (int)rtw.cols, d_router, gu.suh,
+                d_moe_xr, g_cfg.d, d_topids, d_topw, moepp_cnt_, vz_tap(l, false),
+                se_gw.data, d_se_sg, nty2, na2, sg_tpb, sg_tpc,
+                sg.data, sg.suh, sg.svh, d_se_guv, (int)sg.rows,
+                su.data, su.suh, su.svh, d_se_guv + 640, (int)su.rows,
+                g_ht_zs, g_ht_cnt, rq.q, rq.sc);
+          } else {
+            k_moe_pre_segu<false><<<total_blk, 256, lds2, g_str>>>(
+                (const uint16_t*)rtw.data, x, (int)rtw.cols, d_router, gu.suh,
+                d_moe_xr, g_cfg.d, d_topids, d_topw, moepp_cnt_, vz_tap(l, false),
+                se_gw.data, d_se_sg, nty2, na2, sg_tpb, sg_tpc,
+                sg.data, sg.suh, sg.svh, d_se_guv, (int)sg.rows,
+                su.data, su.suh, su.svh, d_se_guv + 640, (int)su.rows,
+                g_ht_zs, g_ht_cnt);
+          }
         } else {
         se_gate_up(buf, ub, x, d_se_guv, d_se_guv + 640, 1, true);
         if (se_gw.dtype == 5) {
@@ -4291,22 +4347,22 @@ struct GpuModel {
   }
   // down + silu, up + combine on the current Rhat
   void hcf_rest(const char* prefix, float* x_out) {
-    char b[160];
-    snprintf(b, sizeof b, "%s.input_mix_weight_down.weight", prefix);
-    const WView dn = wview(ckpt.at(b));
-    snprintf(b, sizeof b, "%s.input_mix_weight_up.weight", prefix);
-    const WView up = wview(ckpt.at(b));
+    char b_dn[160], b_up[160];
+    snprintf(b_dn, sizeof b_dn, "%s.input_mix_weight_down.weight", prefix);
+    const WView dn = wview(ckpt.at(b_dn));
+    snprintf(b_up, sizeof b_up, "%s.input_mix_weight_up.weight", prefix);
+    const WView up = wview(ckpt.at(b_up));
     static const bool hcf_fast = !env_zero("QWENOX_HCF_FAST");
-    // QWENOX_HCF_DOWN_NSK (experiment, default off): the 80x128 no-split-K
-    // down kernel. Bit-identical to k_hcf_down, but its 320-wave grid is
-    // DRAM-latency-bound in production (serve g_sync +0.31 ms vs the generic
-    // 200-block form), so the generic stays the default.
     static const bool hcf_down_nsk =
         getenv("QWENOX_HCF_DOWN_NSK") != nullptr && !env_zero("QWENOX_HCF_DOWN_NSK");
     static const bool hcf_down_c10k =
         getenv("QWENOX_HCF_DOWN_C10K") != nullptr && !env_zero("QWENOX_HCF_DOWN_C10K");
     const int gps = 32, ns = (int)((dn.cols / 64 + gps - 1) / gps);
-    if (hcf_fast && hcf_down_nsk && dn.rows == 320 && dn.cols == 10240 && ns == 5) {
+    if (hcf_fast && hc_q4_on() && dn.dtype == 24) {
+      const auto q4d = ensure_hc_q4(b_dn, dn);
+      k_hcf_down_q4<<<dim3((unsigned)((dn.rows + 7) / 8), (unsigned)ns), 256, 0, g_str>>>(
+          q4d.data, hcf_rh_, hcf_part_, d_t320, (int)dn.rows, (int)dn.cols, q4d.st4, gps, hcf_cnt_);
+    } else if (hcf_fast && hcf_down_nsk && dn.rows == 320 && dn.cols == 10240 && ns == 5) {
       k_hcf_down_c10k_nsk<<<80, 128, 0, g_str>>>(dn.data, hcf_rh_, d_t320,
                                                (int)dn.scale_stride);
     } else if (hcf_fast && hcf_down_c10k && dn.rows == 320 && dn.cols == 10240 && ns == 5) {
@@ -4319,7 +4375,10 @@ struct GpuModel {
     }
     static const bool hcf_upc_coal =
         getenv("QWENOX_HCF_UPC_COAL") != nullptr && !env_zero("QWENOX_HCF_UPC_COAL");
-    if (hcf_fast && hcf_upc_coal && up.rows == 10240 && up.cols == 320) {
+    if (hcf_fast && hc_q4_on() && up.dtype == 24 && up.rows == 10240 && up.cols == 320) {
+      const auto q4u = ensure_hc_q4(b_up, up);
+      k_hcf_upc_q4<<<320, 256, 0, g_str>>>(q4u.data, d_t320, hcf_rh_, x_out, q4u.st4);
+    } else if (hcf_fast && hcf_upc_coal && up.rows == 10240 && up.cols == 320) {
       k_hcf_upc_coal<<<320, 256, 0, g_str>>>(up.data, d_t320, hcf_rh_, x_out,
                                              (int)up.scale_stride);
     } else if (hcf_fast && up.rows == 10240 && up.cols == 320) {
@@ -14261,6 +14320,34 @@ struct GpuModel {
       }
     }
     ensure_hcnorm("hyper_connection_mixer");
+    if (router_q8_on()) {
+      for (int l = 0; l < g_cfg.layers; l++) {
+        char p[128];
+        snprintf(p, sizeof p, "layers.%d.mlp.gate.weight", l);
+        ensure_router_q8(l, wview(ckpt.at(p)));
+      }
+      CK(hipDeviceSynchronize());
+      fprintf(stderr, "router q8: 48 layers quantized to per-row int8 (QWENOX_ROUTER_Q8=1)\n");
+    }
+    if (hc_q4_on() && hcf_active()) {
+      auto prep_hc = [&](const char* pfx) {
+        char b[160];
+        snprintf(b, sizeof b, "%s.input_mix_weight_down.weight", pfx);
+        ensure_hc_q4(b, wview(ckpt.at(b)));
+        snprintf(b, sizeof b, "%s.input_mix_weight_up.weight", pfx);
+        ensure_hc_q4(b, wview(ckpt.at(b)));
+      };
+      for (int l = 0; l < g_cfg.layers; l++) {
+        char p[128];
+        snprintf(p, sizeof p, "layers.%d.attn_hyper_connection", l);
+        prep_hc(p);
+        snprintf(p, sizeof p, "layers.%d.mlp_hyper_connection", l);
+        prep_hc(p);
+      }
+      prep_hc("hyper_connection_mixer");
+      CK(hipDeviceSynchronize());
+      fprintf(stderr, "hc q4: 194 HC weights quantized to q4g64 (QWENOX_HC_Q4=1)\n");
+    }
     hipStream_t cap;
     CK(hipStreamCreate(&cap));
     g_str = cap;

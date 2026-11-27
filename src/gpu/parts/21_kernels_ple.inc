@@ -447,16 +447,17 @@ __global__ void k_samp_prepare_draw(const int* __restrict__ cand_ids,
     }
     return;
   }
-  for (int i = threadIdx.x; i < SAMP_CAP; i += blockDim.x) {
+  int sort_n = 32;
+  while (sort_n < cn && sort_n < SAMP_CAP) sort_n <<= 1;
+  for (int i = threadIdx.x; i < sort_n; i += blockDim.x) {
     s_id[i] = i < cn ? cand_ids[i] : INT_MAX;
     s_val[i] = i < cn ? cand_vals[i] : -INFINITY;
   }
   __syncthreads();
-  // bitonic sort by (val desc, id asc): a strict total order (ids are
-  // unique), so any correct sort yields the same permutation as std::sort
-  for (int kk = 2; kk <= SAMP_CAP; kk <<= 1)
+  // bitonic sort by (val desc, id asc) over dynamic power-of-2 sort_n <= SAMP_CAP
+  for (int kk = 2; kk <= sort_n; kk <<= 1)
     for (int stride = kk >> 1; stride > 0; stride >>= 1) {
-      for (int i = threadIdx.x; i < SAMP_CAP; i += blockDim.x) {
+      for (int i = threadIdx.x; i < sort_n; i += blockDim.x) {
         const int j = i ^ stride;
         if (j > i) {
           const float vi = s_val[i], vj = s_val[j];
@@ -477,34 +478,33 @@ __global__ void k_samp_prepare_draw(const int* __restrict__ cand_ids,
     const float top_p = __int_as_float(hdr[5]);
     const float min_p = __int_as_float(hdr[6]);
     const int n0 = k < cn ? k : cn;
-    float lmax = -INFINITY;
-    for (int j = 0; j < n0; j++) lmax = fmaxf(lmax, s_val[j]);
-    for (int j = 0; j < n0; j++) s_w[j] = expf((s_val[j] - lmax) / temp);
+    const float lmax = s_val[0];
+    const float inv_t = 1.0f / temp;
+    float total = 0.0f;
+    for (int j = 0; j < n0; j++) {
+      const float wv = expf((s_val[j] - lmax) * inv_t);
+      s_w[j] = wv;
+      total += wv;
+    }
     int n = n0;
     if (top_p > 0.0f && top_p < 1.0f && n > 0) {
-      // largest threshold t with mass(p >= t) >= top_p * total
-      double total = 0;
-      for (int j = 0; j < n; j++) total += s_w[j];
-      double lo = 0, hi = 1.0;  // probs are scaled so max == 1
-      for (int it = 0; it < 50; it++) {
-        double mid = 0.5 * (lo + hi), m = 0;
-        for (int j = 0; j < n; j++)
-          if (s_w[j] >= (float)mid) m += s_w[j];
-        if (m >= top_p * total) lo = mid; else hi = mid;
-      }
-      int w = 0;
-      for (int j = 0; j < n; j++)
-        if (s_w[j] >= (float)lo) {
-          s_w[w] = s_w[j];
-          s_id[w] = s_id[j];
-          w++;
+      // s_w[0..n-1] is already sorted descending: single-pass FP32 prefix sum
+      // (avoids 50-iter serial FP64 binary search on 1/16-rate RDNA3 FP64).
+      const float target = top_p * total;
+      float cum = 0.0f;
+      int keep = n;
+      for (int j = 0; j < n; j++) {
+        cum += s_w[j];
+        if (cum >= target) {
+          keep = j + 1;
+          while (keep < n && s_w[keep] == s_w[j]) keep++;
+          break;
         }
-      n = w;
+      }
+      n = keep;
     }
     if (min_p > 0.0f && n > 0) {
-      float pmax = 0;
-      for (int j = 0; j < n; j++) pmax = fmaxf(pmax, s_w[j]);
-      const float thr = min_p * pmax;
+      const float thr = min_p * s_w[0];
       int w = 0;
       for (int j = 0; j < n; j++)
         if (s_w[j] >= thr) {
@@ -512,11 +512,12 @@ __global__ void k_samp_prepare_draw(const int* __restrict__ cand_ids,
           s_id[w] = s_id[j];
           w++;
         }
-      if (w > 0) n = w;  // never empty the candidate set
+      if (w > 0) n = w;
     }
-    double z = 0;
+    float z = 0.0f;
     for (int j = 0; j < n; j++) z += s_w[j];
-    for (int j = 0; j < n; j++) s_w[j] = (float)(s_w[j] / z);
+    const float inv_z = 1.0f / z;
+    for (int j = 0; j < n; j++) s_w[j] *= inv_z;
     if (dbg_ids && dbg_pr && dbg_n) {
       *dbg_n = n;
       for (int j = 0; j < n; j++) {
@@ -524,22 +525,20 @@ __global__ void k_samp_prepare_draw(const int* __restrict__ cand_ids,
         dbg_pr[j] = s_w[j];
       }
     }
-    double z2 = 0;
-    for (int j = 0; j < n; j++) z2 += s_w[j];
     const uint64_t st = rng_state[0] + 0x9E3779B97F4A7C15ull;  // splitmix64 next64
     rng_state[0] = st;
-    double u = (double)(samp_mix64(st) >> 11) * (1.0 / 9007199254740992.0) * z2;
+    float u = (float)((double)(samp_mix64(st) >> 11) * (1.0 / 9007199254740992.0));
     int si = n - 1;
     for (int j = 0; j < n; j++) {
       u -= s_w[j];
-      if (u <= 0) {
+      if (u <= 0.0f) {
         si = j;
         break;
       }
     }
     const int sel = s_id[si];
     *out_tok = sel;
-    *out_lp = (float)(log((double)s_w[si]) - log(z2));
+    *out_lp = __logf(fmaxf(s_w[si], 1e-30f));
     *out_flag = 0;
     if ((hdr[7] & 1) && hist_counts) hist_counts[sel] += 1;
   }
