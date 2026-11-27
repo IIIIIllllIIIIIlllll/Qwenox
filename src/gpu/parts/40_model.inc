@@ -10257,8 +10257,14 @@ struct GpuModel {
     // Pack each segment's rollback-snapshot window at its batch row offset so
     // the post-verify restore/ingest (vsnap_row0_-relative) finds its own rows.
     int voff = 0;
+    const size_t s_elems = (size_t)(g_cfg.layers - g_cfg.layers / 4) * 48 * 128 * 128;
     for (int s = 0; s < nseg; s++) {
-      slot_vsnap_row0_(segs[s].slot) = voff;
+      const int sl = segs[s].slot;
+      if (slot_d_S_bf16(sl) && slot_s_bf16_valid(sl)) {
+        k_bf16_to_f32_vec<<<256, 256, 0, g_str>>>(slot_d_S_bf16(sl), slot_d_S(sl), s_elems);
+        slot_s_bf16_valid(sl) = false;
+      }
+      slot_vsnap_row0_(sl) = voff;
       voff += (int)segs[s].toks->size();
     }
     KP("vseg_begin");
@@ -11945,6 +11951,7 @@ struct GpuModel {
   }
 
   void ngram_ckpt_save() {
+    if (s_bf16_valid) gdn_s_to_f32(g_str);
     CK(hipMemcpyAsync(d_ckpt,d_S,ckpt_S,hipMemcpyDeviceToDevice,g_str));
     CK(hipMemcpyAsync(d_ckpt+ckpt_S/4,d_convst,ckpt_convst,hipMemcpyDeviceToDevice,g_str));
     float* p=d_ckpt+(ckpt_S+ckpt_convst)/4; CK(hipMemcpyAsync(p,d_ring,ckpt_ring,hipMemcpyDeviceToDevice,g_str)); p+=ckpt_ring/4;
@@ -11952,6 +11959,7 @@ struct GpuModel {
   }
   void ngram_ckpt_restore() {
     CK(hipMemcpyAsync(d_S,d_ckpt,ckpt_S,hipMemcpyDeviceToDevice,g_str));
+    s_bf16_valid = false;
     CK(hipMemcpyAsync(d_convst,d_ckpt+ckpt_S/4,ckpt_convst,hipMemcpyDeviceToDevice,g_str));
     const float* p=d_ckpt+(ckpt_S+ckpt_convst)/4; CK(hipMemcpyAsync(d_ring,p,ckpt_ring,hipMemcpyDeviceToDevice,g_str)); p+=ckpt_ring/4;
     if(ckpt_iraw) CK(hipMemcpyAsync(d_iraw,p,ckpt_iraw,hipMemcpyDeviceToDevice,g_str));

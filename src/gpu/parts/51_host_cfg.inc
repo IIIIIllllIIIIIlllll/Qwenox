@@ -1011,6 +1011,7 @@ static void capture_impl(GpuModel& m, const std::vector<int>& toks, bool mtp,
     }
     p += sz;
   };
+  if (!rc && m.s_bf16_valid) m.gdn_s_to_f32();
   blob(m.d_S, rc ? rc->s.data() : nullptr, h.s_b);
   blob(m.d_convst, rc ? rc->convst.data() : nullptr, h.conv_b);
   blob(m.d_ring, rc ? rc->ring.data() : nullptr, h.ring_b);
@@ -1521,6 +1522,7 @@ static int restore_body(GpuModel& m, const CkEnt& e, const std::vector<int>& pro
     src += sz;
   };
   blob(m.d_S, h.s_b, true);
+  m.s_bf16_valid = false;
   blob(m.d_convst, h.conv_b, true);
   blob(m.d_ring, h.ring_b, true);
   blob(m.d_iraw, h.iraw_b, true);
