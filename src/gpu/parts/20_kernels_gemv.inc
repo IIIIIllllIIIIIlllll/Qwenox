@@ -1468,18 +1468,21 @@ __global__ __launch_bounds__(256) void k_gdn_step_gn_f2(
 // Row t inputs: k at kb + t*rs + (h/3)*128, v[i] at vb + t*rs + h*128 + i,
 // log-decay g at gb + t*gs + h, beta at bb + t*gs + h; OUT: q at
 // qb + t*rs + (h/3)*128 and out row at ob + t*rs + h*128 (may alias v).
-template <bool kOut, bool kWs>
+template <bool kOut, bool kWs, typename ST = float>
 __device__ __forceinline__ void gdn_rec_body(const int h, const float* qb, const float* kb,
                                              const float* vb, size_t rs, const float* gb,
-                                             const float* bb, int gs, float* S, float* ob,
+                                             const float* bb, int gs, ST* S, float* ob,
                                              int P) {
   const int lane = threadIdx.x % warpSize;
   const int i = (threadIdx.x / warpSize) * (warpSize / 4) + (lane >> 2);
   const int jc = lane & 3, j0 = jc * 32, jb = lane & ~3;
-  float* Sh = S + (size_t)h * 128 * 128;
+  ST* Sh = S + (size_t)h * 128 * 128;
   float state[32];
 #pragma unroll
-  for (int j = 0; j < 32; ++j) state[j] = Sh[(j0 + j) * 128 + i];
+  for (int j = 0; j < 32; ++j) {
+    if constexpr (sizeof(ST) == 2) state[j] = bf2f(Sh[(j0 + j) * 128 + i]);
+    else state[j] = Sh[(j0 + j) * 128 + i];
+  }
   for (int row = 0; row < P; ++row) {
     const float* k = kb + (size_t)row * rs + (h / 3) * 128;
     const float value = vb[(size_t)row * rs + h * 128 + i];
@@ -1516,16 +1519,19 @@ __device__ __forceinline__ void gdn_rec_body(const int h, const float* qb, const
   }
   if constexpr (kWs) {
 #pragma unroll
-    for (int j = 0; j < 32; ++j) Sh[(j0 + j) * 128 + i] = state[j];
+    for (int j = 0; j < 32; ++j) {
+      if constexpr (sizeof(ST) == 2) Sh[(j0 + j) * 128 + i] = f2bf(state[j]);
+      else Sh[(j0 + j) * 128 + i] = state[j];
+    }
   }
 }
 // qkv-row form of the body (rows of [q 2048 | k 2048 | v 6144], stride).
-template <bool kOut, bool kWs>
+template <bool kOut, bool kWs, typename ST = float>
 __device__ __forceinline__ void gdn_verify_body(const int h, const float* qkv,
-                                                const float* g48, const float* b48, float* S,
+                                                const float* g48, const float* b48, ST* S,
                                                 float* out, int P, int stride) {
-  gdn_rec_body<kOut, kWs>(h, qkv, qkv + 2048, qkv + 4096, (size_t)stride, g48, b48, 48, S,
-                        out + 4096, P);
+  gdn_rec_body<kOut, kWs, ST>(h, qkv, qkv + 2048, qkv + 4096, (size_t)stride, g48, b48, 48, S,
+                              out + 4096, P);
 }
 __global__ void k_gdn_verify(const float* qkv, const float* g48,
                              const float* b48, float* S, float* out,
@@ -1536,6 +1542,10 @@ __global__ void k_gdn_verify(const float* qkv, const float* g48,
 __global__ void k_gdn_verify_ro(const float* qkv, const float* g48, const float* b48,
                                 float* S, float* out, int P, int stride) {
   gdn_verify_body<true, false>(blockIdx.x, qkv, g48, b48, S, out, P, stride);
+}
+__global__ void k_gdn_verify_ro_bf16(const float* qkv, const float* g48, const float* b48,
+                                     uint16_t* S, float* out, int P, int stride) {
+  gdn_verify_body<true, false, uint16_t>(blockIdx.x, qkv, g48, b48, S, out, P, stride);
 }
 // Per-row replay inputs of a spec verify round, layout per (row, GDN layer):
 // [k 2048 | v 6144 | g 48 | beta 48] floats (post conv/l2norm, post gates).
@@ -1561,6 +1571,12 @@ __global__ void k_gdn_commit(const float* __restrict__ rows, size_t rs, float* S
   const float* r = rows + (size_t)gi * kGdnRowF;
   gdn_rec_body<false, true>(blockIdx.x, nullptr, r, r + 2048, rs, r + 8192, r + 8240, (int)rs,
                             S + (size_t)gi * 48 * 128 * 128, nullptr, n);
+}
+__global__ void k_gdn_commit_bf16(const float* __restrict__ rows, size_t rs, uint16_t* S, int n) {
+  const int gi = blockIdx.y;
+  const float* r = rows + (size_t)gi * kGdnRowF;
+  gdn_rec_body<false, true, uint16_t>(blockIdx.x, nullptr, r, r + 2048, rs, r + 8192, r + 8240,
+                                      (int)rs, S + (size_t)gi * 48 * 128 * 128, nullptr, n);
 }
 
 // --- indexer proj snapshot: keep every verify row's raw ring value (the

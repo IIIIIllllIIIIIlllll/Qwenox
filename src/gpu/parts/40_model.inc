@@ -4179,17 +4179,44 @@ struct GpuModel {
     if (!vhc_on_ || !prefill_fused || !gr_bf16 || P < 1 || P > 48 || P > gemvmr_maxp())
       return false;
     if ((((uintptr_t)d_Rhatbf16 | (uintptr_t)d_xb | (uintptr_t)d_xbf16) & 15) != 0) return false;
-    char b[160];
-    snprintf(b, sizeof b, "%s.input_mix_weight_down.weight", prefix.c_str());
-    const Tensor* td = ckpt.find(b);
-    snprintf(b, sizeof b, "%s.input_mix_weight_up.weight", prefix.c_str());
-    const Tensor* tu = ckpt.find(b);
+    char b_dn[160], b_up[160];
+    snprintf(b_dn, sizeof b_dn, "%s.input_mix_weight_down.weight", prefix.c_str());
+    const Tensor* td = ckpt.find(b_dn);
+    snprintf(b_up, sizeof b_up, "%s.input_mix_weight_up.weight", prefix.c_str());
+    const Tensor* tu = ckpt.find(b_up);
     if (!td || !tu || td->dtype != 24 || tu->dtype != 24) return false;
     const WView dn = wview(*td), up = wview(*tu);
     if (dn.rows != 320 || dn.cols != 10240 || up.rows != 10240 || up.cols != 320) return false;
     // q6g64_wmma's config for these shapes at defaults: down ns 3 x gps 54, up 4x2 no split
     const int R = 320, C = 10240, gps = 54, ns = 3, dd = 2560;
     const uint16_t* xr = d_Rhatbf16;
+    if (hc_q4_on()) {
+      const auto q4d = ensure_hc_q4(b_dn, dn);
+      const auto q4u = ensure_hc_q4(b_up, up);
+      if (q4d.data && q4u.data) {
+#define QWENOX_VHC4_DN(NPT, XP)                                                             \
+  k_vhc_q4_wmma<NPT, 1, 8, uint16_t, 1, XP><<<dim3(R / 16, ns), 256, 0, g_str>>>(           \
+      q4d.data, xr, (uint64_t)C, vhc_part_, R, C, q4d.st4, gps, P, d_t320b, vhc_cnt_,       \
+      nullptr, 0, nullptr, nullptr)
+        if (P <= 4) QWENOX_VHC4_DN(1, 4);
+        else if (P <= 16) QWENOX_VHC4_DN(1, 0);
+        else if (P <= 32) QWENOX_VHC4_DN(2, 0);
+        else QWENOX_VHC4_DN(3, 0);
+#undef QWENOX_VHC4_DN
+#define QWENOX_VHC4_UP(NPT, XP)                                                             \
+  k_vhc_q4_wmma<NPT, 4, 2, float, 2, XP><<<dim3(dd / 16, 1), 256, 0, g_str>>>(              \
+      q4u.data, d_t320b, (uint64_t)320, nullptr, (int)up.rows, 320, q4u.st4, 5, P, nullptr, \
+      nullptr, xr, dd, d_xb, d_xbf16)
+        if (P <= 16) QWENOX_VHC4_UP(1, 16);
+        else if (P <= 32) QWENOX_VHC4_UP(2, 0);
+        else QWENOX_VHC4_UP(3, 0);
+#undef QWENOX_VHC4_UP
+        xf16_src = d_xb;
+        xf16_xs = xf16_K = g_cfg.d;
+        xf16_P = P;
+        return true;
+      }
+    }
 #define QWENOX_VHC_DN(NPT, XP)                                                              \
   k_vhc_wmma<NPT, 1, 8, uint16_t, 1, XP><<<dim3(R / 16, ns), 256, 0, g_str>>>(              \
       dn.data, xr, (uint64_t)C, vhc_part_, R, C, (int)dn.scale_stride, gps, P, d_t320b,     \
@@ -5712,8 +5739,16 @@ struct GpuModel {
         k_gdn_rowsave<<<P, 256, 0, g_str>>>(
             convb, g48b, beta48b, d_grow + ((size_t)vrow0 * ngdn + gi) * kGdnRowF,
             (size_t)ngdn * kGdnRowF, P);
-        k_gdn_verify_ro<<<48, 512, 0, g_str>>>(convb, g48b, beta48b, S, convb, P, 10240);
-      } else if (ung && !ngram_legacy_gdn && P <= 65) {
+        if (d_S_bf16 && gdn_state_bf16_on() && bs == bound_) {
+          if (!vg_capturing_ && !s_bf16_valid) gdn_s_to_bf16(g_str);
+          k_gdn_verify_ro_bf16<<<48, 512, 0, g_str>>>(
+              convb, g48b, beta48b, d_S_bf16 + (size_t)gi * 48 * 128 * 128, convb, P, 10240);
+        } else {
+          k_gdn_verify_ro<<<48, 512, 0, g_str>>>(convb, g48b, beta48b, S, convb, P, 10240);
+        }
+      } else {
+        if (bs == bound_ && s_bf16_valid) gdn_s_to_f32(g_str);
+      if (ung && !ngram_legacy_gdn && P <= 65) {
         k_gdn_verify<<<48, 512, 0, g_str>>>(
             convb, g48b, beta48b, S, convb, P, 10240);
       } else if (gdn_nosplit) {
@@ -5814,6 +5849,7 @@ struct GpuModel {
           }
         }
         if (pipe) CK(hipStreamWaitEvent(g_str, ev_s[lastw & 1], 0));
+      }
       }
       KP_SUB_END();
 #ifdef QWENOX_NPU
@@ -7372,7 +7408,19 @@ struct GpuModel {
     const bool direct_output = pp_moe_out && P > 8 && !vseg;
     float* const acc = direct_output ? d_yb : d_moeaccb;
     snprintf(buf, sizeof buf, "layers.%d.mlp.gate.weight", l);
-    gemm(wview(ckpt.at(buf)), d_xb, d_routerb, P);
+    const WView rtw = wview(ckpt.at(buf));
+    if (router_q8_on() && P <= 16 && rtw.dtype == 0 && rtw.rows == 512 &&
+        (rtw.cols & 15) == 0) {
+      const auto rq = ensure_router_q8(l, rtw);
+      if (P <= 8)
+        k_router_q8_gemm_b<8><<<128, 128, 0, g_str>>>(rq.q, rq.sc, d_xb, d_routerb,
+                                                      (int)rtw.cols, P);
+      else
+        k_router_q8_gemm_b<16><<<128, 128, 0, g_str>>>(rq.q, rq.sc, d_xb, d_routerb,
+                                                       (int)rtw.cols, P);
+    } else {
+      gemm(rtw, d_xb, d_routerb, P);
+    }
     int k = g_cfg.topk;
     router_topk_b(P, k, vz_tap(l, true, false, P));  // vseg rows: per-row table
     if (l == g_cfg.layers - 1) vz_publish(P, true);
@@ -11941,8 +11989,13 @@ struct GpuModel {
   void gdn_commit(int n) {
     if (n < 1) return;
     const int ngdn = g_cfg.layers - g_cfg.layers / 4;
-    k_gdn_commit<<<dim3(48, (unsigned)ngdn), 512, 0, g_str>>>(
-        d_grow + (size_t)vsnap_row0_ * ngdn * kGdnRowF, (size_t)ngdn * kGdnRowF, d_S, n);
+    if (d_S_bf16 && gdn_state_bf16_on() && s_bf16_valid) {
+      k_gdn_commit_bf16<<<dim3(48, (unsigned)ngdn), 512, 0, g_str>>>(
+          d_grow + (size_t)vsnap_row0_ * ngdn * kGdnRowF, (size_t)ngdn * kGdnRowF, d_S_bf16, n);
+    } else {
+      k_gdn_commit<<<dim3(48, (unsigned)ngdn), 512, 0, g_str>>>(
+          d_grow + (size_t)vsnap_row0_ * ngdn * kGdnRowF, (size_t)ngdn * kGdnRowF, d_S, n);
+    }
   }
 
   // QWENOX_SPEC_CONF=θ (sampled MTP rounds; default 0.9, 0 = GammaCtl):
@@ -14329,7 +14382,7 @@ struct GpuModel {
       CK(hipDeviceSynchronize());
       fprintf(stderr, "router q8: 48 layers quantized to per-row int8 (QWENOX_ROUTER_Q8=1)\n");
     }
-    if (hc_q4_on() && hcf_active()) {
+    if (hc_q4_on() && (hcf_active() || vhc_on_)) {
       auto prep_hc = [&](const char* pfx) {
         char b[160];
         snprintf(b, sizeof b, "%s.input_mix_weight_down.weight", pfx);
@@ -14711,6 +14764,7 @@ struct GpuModel {
   void vgraph_run(const std::vector<int>& tokens, int base, int* vout) {
     const int P = (int)tokens.size();
     VGraph& G = vg_[P - 2];
+    if (d_S_bf16 && gdn_state_bf16_on() && !s_bf16_valid) gdn_s_to_bf16(g_str);
     if (d_iraw) vg_dump_buf("irH0", 2, d_iraw, 512 * 4);  // P3-B bisect
     kv_prepare(base, base + P);
     *p_vgbase = base;
