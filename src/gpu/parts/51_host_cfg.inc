@@ -4312,7 +4312,183 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       mtp_live = false;  // plain decode leaves the MTP layer stale
     }
     if (!use_spec && !use_ngram && !use_chain && !use_df2) {
-      for (int i = 0; i < g.max_tokens; i++) {
+      // Pipelined GPU self-drive sampling (QWENOX_SAMP_GPU, opt-in): the
+      // decode graph's tail samples on device (splitmix64 identical to the
+      // host; device expf distribution-equivalent, not bit-exact), so launches
+      // run depth-2 ahead without waiting, hiding the WDDM submit window.
+      // Eligibility: sampling request, no logprobs, no llama penalties, no
+      // ckpt tokens, fp8 PLE. Everything else takes the serial loop below.
+      static const bool pipe_env =
+          getenv("QWENOX_SAMP_GPU") != nullptr && !GpuModel::env_zero("QWENOX_SAMP_GPU");
+      int i0 = 0;
+      bool pipe_cancelled = false;
+      if (pipe_env)
+        fprintf(stderr, "pipe gate: ckpt_toks=%zu\n", ckpt_toks.size());
+      if (pipe_env && g.sample && !g.logprobs && !g.llama_penalties &&
+          m.gall_pipe_exec != nullptr && m.pipe_setup(smp)) {
+        const int depth = 2;
+        int launched = 0, drained = 0, waited = 0;
+        const size_t cbase = m.chist.size();
+        bool stop = false, overflow = false;
+        if (eos.count(cur)) {
+          reason = "done";
+          stop = true;
+        } else if (!send_tok(cur, g.logprobs, cur_lp)) {
+          stop = true;  // client gone
+        }
+        i0 = 1;  // cur_0 sent (or not, when stopped)
+        while (!stop && !overflow) {
+          while (!stop && launched - drained < depth &&
+                 launched < g.max_tokens - 1 && !cancel) {
+            // placeholder for the fed token; launch 1's fed is the current
+            // token (already known), later ones are fixed when the ring drains
+            m.chist.push_back(launched == 0 ? cur : 0);
+            m.pipe_launch();
+            launched++;
+            m.pipe_ple_flush(launched, drained);
+          }
+          if (launched == drained) break;
+          const auto wt0 = std::chrono::steady_clock::now();
+          while (*(volatile uint32_t*)m.p_pipe_ring_w_ == (uint32_t)drained) {
+            if (cancel) {
+              stop = true;
+              pipe_cancelled = true;
+              break;
+            }
+#ifdef _WIN32
+            YieldProcessor();
+#endif
+            if (std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - wt0).count() > 30000.0) {
+              overflow = true;
+              hipError_t qe = hipStreamQuery(m.gall_hi_st_);
+              fprintf(stderr,
+                      "pipeline: ring wedged (drained=%d launched=%d waited=%d ringw=%u plecnt=%u seq=%u q=%d flag=%d lasterr=%d)\n",
+                      drained, launched, waited, *(volatile uint32_t*)m.p_pipe_ring_w_,
+                      *(volatile uint32_t*)m.p_zc_ple_cnt,
+                      __atomic_load_n(m.p_gall_seq_, __ATOMIC_ACQUIRE), (int)qe,
+                      *(volatile int*)m.p_pipe_out_flag_, (int)hipGetLastError());
+              break;
+            }
+          }
+          if (stop || overflow) break;
+          {
+            const double wms = std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - wt0)
+                                   .count();
+            if (wms > 1000.0)
+              fprintf(stderr,
+                      "pipeline: slow drain drained=%d wait=%.0f ms ringw=%u plecnt=%u seq=%u\n",
+                      drained, wms, *(volatile uint32_t*)m.p_pipe_ring_w_,
+                      *(volatile uint32_t*)m.p_zc_ple_cnt,
+                      __atomic_load_n(m.p_gall_seq_, __ATOMIC_ACQUIRE));
+          }
+          const int tok = m.p_pipe_ring_tok[drained & 127];
+          const float lp = m.p_pipe_ring_lp[drained & 127];
+          drained++;
+          if (tok == -1) {
+            overflow = true;
+            fprintf(stderr,
+                    "pipeline: candidate overflow; dense resample + serial resume\n");
+            // the kernel fed its top candidate as the dummy next input; the
+            // following graph (if any) ingests it, so the chist placeholder
+            // records it. The stream token is re-sampled densely below.
+            m.chist[cbase + (size_t)drained] = *(volatile const int*)m.p_zc_tok;
+            break;
+          }
+          hist.push_back(tok);
+          smp.remember(tok);
+          m.chist[cbase + (size_t)drained] = tok;
+          cur = tok;
+          cur_lp = lp;
+          const auto phf0 = std::chrono::steady_clock::now();
+          m.pipe_ple_flush(launched, drained);
+          const auto phf1 = std::chrono::steady_clock::now();
+          if (ckpt_toks.count(tok)) {
+            // ckpt token: checkpoint right after it commits (after the graph
+            // that ingests it completes), mirroring the serial loop.
+            fprintf(stderr, "pipeline: ckpt branch fired tok=%d drained=%d launched=%d waited=%d\n",
+                    tok, drained, launched, waited);
+            while (launched <= drained) {
+              m.chist.push_back(tok);  // the ingester's fed is the ckpt token
+              m.pipe_launch();
+              launched++;
+              m.pipe_ple_flush(launched, drained);
+            }
+            while (waited <= drained) {  // wait for the ingester (graph d+1)
+              m.gall_wait_zc();
+              waited++;
+            }
+            m.gdn_s_to_f32();
+            const auto sv0 = std::chrono::steady_clock::now();
+            const bool svok = rckpt::save(m, hist, false);
+            fprintf(stderr, "pipeline: ckpt save(%d) took %.1f ms\n", (int)svok,
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - sv0)
+                        .count());
+            if (svok) {
+              fprintf(stderr,
+                      "%s ckpt: saved %zu tokens (after token %d, req %lld, save=%.1f ms)\n",
+                      log_ts(), hist.size(), tok, (long long)g.req,
+                      std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - sv0)
+                          .count());
+              note_pause(hist.size(), tok);
+            }
+          }
+          if (eos.count(tok)) {
+            reason = "done";
+            stop = true;
+            continue;
+          }
+          const auto phs1 = std::chrono::steady_clock::now();
+          if (!send_tok(tok, g.logprobs, lp)) {
+            stop = true;
+            continue;
+          }
+          i0++;
+          const auto phs2 = std::chrono::steady_clock::now();
+          dl_tick();
+          const auto phs3 = std::chrono::steady_clock::now();
+          {
+            const double flush_ms =
+                std::chrono::duration<double, std::milli>(phf1 - phf0).count();
+            const double ck_ms =
+                std::chrono::duration<double, std::milli>(phs1 - phf1).count();
+            const double send_ms =
+                std::chrono::duration<double, std::milli>(phs2 - phs1).count();
+            const double tick_ms =
+                std::chrono::duration<double, std::milli>(phs3 - phs2).count();
+            if (flush_ms > 1000.0 || ck_ms > 1000.0 || send_ms > 1000.0 ||
+                tick_ms > 1000.0)
+              fprintf(stderr,
+                      "pipeline: slow phases drained=%d flush=%.0f ckpt=%.0f send=%.0f tick=%.0f ms\n",
+                      drained, flush_ms, ck_ms, send_ms, tick_ms);
+          }
+          dl_tick();
+        }
+        // Wait for every outstanding graph (keeps the gall seq counter
+        // consistent for later gall_wait_zc callers) and fix the remaining
+        // chist placeholders from the ring; those tokens were ingested but
+        // are never sent to the client.
+        for (int j = drained + 1; j <= launched; j++) {
+          const int tok2 = m.p_pipe_ring_tok[(j - 1) & 127];
+          m.chist[cbase + (size_t)j] = tok2;
+          m.gall_wait_zc();
+          waited++;
+        }
+        smp.rng = *(volatile uint64_t*)m.p_pipe_rng_;
+        if (overflow) {
+          // Host dense fallback for the overflow step: logits of the overflow
+          // graph are pristine in d_logits. The kernel fed its top candidate
+          // as the dummy state input; the real token replaces it only in the
+          // emitted stream (rare path, state divergence logged above).
+          m.get_logits(lbuf);
+          cur = smp.sample(lbuf, &cur_lp);
+          smp.remember(cur);
+        }
+      }
+      for (int i = i0; i < g.max_tokens && !pipe_cancelled; i++) {
         if (eos.count(cur)) {
           reason = "done";
           break;

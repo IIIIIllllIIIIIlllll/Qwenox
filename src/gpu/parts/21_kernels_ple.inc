@@ -103,6 +103,39 @@ __global__ void k_ple_fp8_dequant(const uint8_t* __restrict__ src,
   d4[3] = make_float4(t[12], t[13], t[14], t[15]);
 }
 
+// Pipeline variant of k_ple_fp8_dequant (QWENOX_SAMP_GPU): the graph ordinal
+// in the request is d_pos - req_base + 1 (d_pos only advances at graph tails,
+// so it is stable mid-graph); wait for the monotonic gather counter to reach
+// that value, then read this graph's parity rows buffer (double buffered, so
+// the host may gather step t+1 while step t is still in flight).
+__global__ void k_ple_fp8_dequant_pipe(const uint8_t* __restrict__ src2,
+                                       float* __restrict__ dst, float scale,
+                                       size_t n16, size_t rows_bytes,
+                                       const uint32_t* cnt,
+                                       const int* __restrict__ d_pos,
+                                       const int* __restrict__ req_base) {
+  if (threadIdx.x == 0) {
+    const uint32_t exp = (uint32_t)(*d_pos - *req_base + 1);
+    while (__hip_atomic_load(cnt, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < exp) {
+    }
+  }
+  __syncthreads();
+  const int ord = *d_pos - *req_base;  // ordinal - 1
+  const uint8_t* src = src2 + (size_t)(ord & 1) * rows_bytes;
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n16) return;
+  uint4 raw = ((const uint4*)src)[i];
+  const uint8_t* b = (const uint8_t*)&raw;
+  float t[16];
+#pragma unroll
+  for (int j = 0; j < 16; j++) t[j] = fp8e4m3_f32_dev(b[j]) * scale;
+  float4* d4 = (float4*)dst + i * 4;
+  d4[0] = make_float4(t[0], t[1], t[2], t[3]);
+  d4[1] = make_float4(t[4], t[5], t[6], t[7]);
+  d4[2] = make_float4(t[8], t[9], t[10], t[11]);
+  d4[3] = make_float4(t[12], t[13], t[14], t[15]);
+}
+
 // --- PLE IQ4_NL staging dequant (GGUF table, dtype 11): raw 18 B blocks
 // [fp16 d][16 B nibbles], 5 per 160-wide row, packed 16 rows per token ->
 // f32 embeddings (block b -> dst[32b..32b+31]). Bit-exact with
@@ -342,6 +375,173 @@ __global__ void k_corr_apply_hdr(float* __restrict__ x, int stride,
     float& v = xr[ci[nb + i]];
     if (repeat != 1.0f) v = v <= 0.0f ? v * repeat : v / repeat;
     v -= cv[nb + i];
+  }
+}
+
+// k_corr_apply_hdr variant for the GPU sampling tail (QWENOX_SAMP_GPU): bias
+// phase identical (coherent ci/cv list, hdr[0]=nb); the penalty phase scans
+// the full vocab histogram instead of a per-row list: counts[id] > 0 ->
+// logits[id] -= presence + frequency * count, bit-exact with
+// HostSampler::correct's legacy penalty (__fmul_rn/__fadd_rn keep the mul and
+// add unfused, as on the host). hdr[8]=presence bits, hdr[9]=frequency bits.
+// Single block like k_corr_apply_hdr: every bias add must complete before any
+// penalty touches the same id, which a multi-block grid cannot order.
+__global__ void k_corr_apply_hist(float* __restrict__ x, int stride,
+                                  const int* __restrict__ ci,
+                                  const float* __restrict__ cv,
+                                  const int* __restrict__ hdr,
+                                  const uint16_t* __restrict__ counts) {
+  const int nb = hdr[0];
+  const float presence = __int_as_float(hdr[8]);
+  const float frequency = __int_as_float(hdr[9]);
+  if (nb == 0 && presence == 0.0f && frequency == 0.0f) return;
+  float* xr = x + (size_t)blockIdx.y * stride;
+  for (int i = threadIdx.x; i < nb; i += blockDim.x) xr[ci[i]] += cv[i];
+  __syncthreads();
+  if (presence != 0.0f || frequency != 0.0f)
+    for (int id = threadIdx.x; id < stride; id += blockDim.x) {
+      const unsigned c = counts[id];
+      if (c) xr[id] -= __fadd_rn(presence, __fmul_rn(frequency, (float)c));
+    }
+}
+
+// --- GPU sampling tail (QWENOX_SAMP_GPU): prepare_sparse + draw_sparse ---
+// Replays HostSampler::prepare_sparse/draw_sparse (51_host_cfg.inc) on the
+// radix top-k collect output: cand_n[0] unordered (id, corrected logit)
+// pairs, capacity SAMP_CAP. Bit-exact with the host except expf/log (device
+// libm vs UCRT); the splitmix64 rng, the (val desc, id asc) sort and every
+// fp64 accumulation order match the host. hdr: [2]=k, [4]=temp bits,
+// [5]=top_p bits, [6]=min_p bits, [7]=flags (bit0: bump hist_counts).
+// Collect overflow (cand_n > SAMP_CAP) or empty input: out_flag=1,
+// out_tok=-1 (host fallback). dbg_ids/dbg_pr/dbg_n (nullable) receive the
+// filtered candidates and their normalized probabilities.
+constexpr int SAMP_CAP = 512;
+__device__ __forceinline__ uint64_t samp_mix64(uint64_t z) {  // splitmix64 finalizer
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+  return z ^ (z >> 31);
+}
+__global__ void k_samp_prepare_draw(const int* __restrict__ cand_ids,
+                                    const float* __restrict__ cand_vals,
+                                    const int* __restrict__ cand_n,
+                                    const int* __restrict__ hdr,
+                                    uint64_t* __restrict__ rng_state,
+                                    uint16_t* __restrict__ hist_counts,
+                                    int* __restrict__ out_tok,
+                                    float* __restrict__ out_lp,
+                                    int* __restrict__ out_flag,
+                                    int* __restrict__ dbg_ids,
+                                    float* __restrict__ dbg_pr,
+                                    int* __restrict__ dbg_n) {
+  __shared__ int s_id[SAMP_CAP];
+  __shared__ float s_val[SAMP_CAP];
+  __shared__ float s_w[SAMP_CAP];
+  const int cn = cand_n[0];
+  const int k = hdr[2];
+  if (cn <= 0 || cn > SAMP_CAP || k <= 0) {
+    if (threadIdx.x == 0) {
+      *out_flag = 1;
+      // Feed the top candidate as the dummy state input: the next graph must
+      // embed a valid token while the host recovers this step densely.
+      *out_tok = cn > 0 ? cand_ids[0] : 0;
+    }
+    return;
+  }
+  for (int i = threadIdx.x; i < SAMP_CAP; i += blockDim.x) {
+    s_id[i] = i < cn ? cand_ids[i] : INT_MAX;
+    s_val[i] = i < cn ? cand_vals[i] : -INFINITY;
+  }
+  __syncthreads();
+  // bitonic sort by (val desc, id asc): a strict total order (ids are
+  // unique), so any correct sort yields the same permutation as std::sort
+  for (int kk = 2; kk <= SAMP_CAP; kk <<= 1)
+    for (int stride = kk >> 1; stride > 0; stride >>= 1) {
+      for (int i = threadIdx.x; i < SAMP_CAP; i += blockDim.x) {
+        const int j = i ^ stride;
+        if (j > i) {
+          const float vi = s_val[i], vj = s_val[j];
+          const int ii = s_id[i], ij = s_id[j];
+          const bool i_later = vi < vj || (vi == vj && ii > ij);
+          if (((i & kk) == 0) == i_later) {
+            s_val[i] = vj;
+            s_id[i] = ij;
+            s_val[j] = vi;
+            s_id[j] = ii;
+          }
+        }
+      }
+      __syncthreads();
+    }
+  if (threadIdx.x == 0) {
+    const float temp = __int_as_float(hdr[4]);
+    const float top_p = __int_as_float(hdr[5]);
+    const float min_p = __int_as_float(hdr[6]);
+    const int n0 = k < cn ? k : cn;
+    float lmax = -INFINITY;
+    for (int j = 0; j < n0; j++) lmax = fmaxf(lmax, s_val[j]);
+    for (int j = 0; j < n0; j++) s_w[j] = expf((s_val[j] - lmax) / temp);
+    int n = n0;
+    if (top_p > 0.0f && top_p < 1.0f && n > 0) {
+      // largest threshold t with mass(p >= t) >= top_p * total
+      double total = 0;
+      for (int j = 0; j < n; j++) total += s_w[j];
+      double lo = 0, hi = 1.0;  // probs are scaled so max == 1
+      for (int it = 0; it < 50; it++) {
+        double mid = 0.5 * (lo + hi), m = 0;
+        for (int j = 0; j < n; j++)
+          if (s_w[j] >= (float)mid) m += s_w[j];
+        if (m >= top_p * total) lo = mid; else hi = mid;
+      }
+      int w = 0;
+      for (int j = 0; j < n; j++)
+        if (s_w[j] >= (float)lo) {
+          s_w[w] = s_w[j];
+          s_id[w] = s_id[j];
+          w++;
+        }
+      n = w;
+    }
+    if (min_p > 0.0f && n > 0) {
+      float pmax = 0;
+      for (int j = 0; j < n; j++) pmax = fmaxf(pmax, s_w[j]);
+      const float thr = min_p * pmax;
+      int w = 0;
+      for (int j = 0; j < n; j++)
+        if (s_w[j] >= thr) {
+          s_w[w] = s_w[j];
+          s_id[w] = s_id[j];
+          w++;
+        }
+      if (w > 0) n = w;  // never empty the candidate set
+    }
+    double z = 0;
+    for (int j = 0; j < n; j++) z += s_w[j];
+    for (int j = 0; j < n; j++) s_w[j] = (float)(s_w[j] / z);
+    if (dbg_ids && dbg_pr && dbg_n) {
+      *dbg_n = n;
+      for (int j = 0; j < n; j++) {
+        dbg_ids[j] = s_id[j];
+        dbg_pr[j] = s_w[j];
+      }
+    }
+    double z2 = 0;
+    for (int j = 0; j < n; j++) z2 += s_w[j];
+    const uint64_t st = rng_state[0] + 0x9E3779B97F4A7C15ull;  // splitmix64 next64
+    rng_state[0] = st;
+    double u = (double)(samp_mix64(st) >> 11) * (1.0 / 9007199254740992.0) * z2;
+    int si = n - 1;
+    for (int j = 0; j < n; j++) {
+      u -= s_w[j];
+      if (u <= 0) {
+        si = j;
+        break;
+      }
+    }
+    const int sel = s_id[si];
+    *out_tok = sel;
+    *out_lp = (float)(log((double)s_w[si]) - log(z2));
+    *out_flag = 0;
+    if ((hdr[7] & 1) && hist_counts) hist_counts[sel] += 1;
   }
 }
 

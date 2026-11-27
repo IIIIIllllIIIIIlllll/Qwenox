@@ -3100,6 +3100,19 @@ __global__ void k_step_incr_amx_seq(int* __restrict__ d_pos, int* __restrict__ d
     __hip_atomic_store(p_seq, nx, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
   }
 }
+
+// Emit one pipeline token (+ its logprob) into the coherent ring, then publish
+// the write counter. Runs right after k_samp_prepare_draw in the graph tail;
+// tok == -1 marks a candidate-overflow marker for the host fallback.
+__global__ void k_pipe_emit(const int* __restrict__ tok, const float* __restrict__ lp,
+                            const int* __restrict__ flag, int* __restrict__ ring_tok,
+                            float* __restrict__ ring_lp, uint32_t* __restrict__ ring_w) {
+  const uint32_t w = *ring_w;
+  ring_tok[w & 127] = *flag ? -1 : *tok;
+  ring_lp[w & 127] = *lp;
+  __threadfence_system();
+  __hip_atomic_store(ring_w, w + 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+}
 // R[ch] += U[ch] + convout[ch]
 __global__ void k_add2(float* __restrict__ R, const float* __restrict__ a,
                        const float* __restrict__ b, int n) {

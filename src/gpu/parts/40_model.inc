@@ -1159,6 +1159,27 @@ struct GpuModel {
   int* d_sm_cand_ids_zc = nullptr;
   float* p_sm_cand_vals_zc = nullptr;
   float* d_sm_cand_vals_zc = nullptr;
+  // Pipelined GPU self-drive sampling (QWENOX_SAMP_GPU, opt-in): the decode
+  // graph's tail samples on device (RNG splitmix64 identical to the host;
+  // device expf is distribution-equivalent, NOT bit-exact vs host), and the
+  // host submits the next graph without waiting for the previous one.
+  uint32_t* p_zc_ple_cnt = nullptr;  // monotonic ple gather counter (coherent)
+  uint32_t* d_zc_ple_cnt = nullptr;
+  uint8_t* p_zc_ple2 = nullptr;      // 2x ple rows double buffer (coherent)
+  uint8_t* d_zc_ple2 = nullptr;
+  int* p_pipe_req_base_ = nullptr;   // d_pos at pipeline start (coherent)
+  int* d_pipe_req_base_ = nullptr;
+  int* p_pipe_ring_tok = nullptr;    // coherent ring (128): tokens
+  float* p_pipe_ring_lp = nullptr;   // coherent ring (128): logprobs
+  uint32_t* p_pipe_ring_w_ = nullptr;  // ring write counter (device writes)
+  uint32_t* d_pipe_ring_w_ = nullptr;
+  uint64_t* p_pipe_rng_ = nullptr;   // splitmix64 state (coherent)
+  uint64_t* d_pipe_rng_ = nullptr;
+  float* p_pipe_out_lp_ = nullptr;   // k_samp_prepare_draw lp output buffer
+  float* d_pipe_out_lp_ = nullptr;
+  int* p_pipe_out_flag_ = nullptr;   // overflow flag output buffer
+  int* d_pipe_out_flag_ = nullptr;
+  uint16_t* d_samp_hist = nullptr;   // vocab count array for GPU-side penalties
   std::vector<int> sms_ord_;       // reused sort index scratch for samp_wait_draw
   // Rollback snapshots (spec verify): S/convst per accepted depth, indexer
   // proj rows per QSA layer. Written only when spec_snap is set. One slot's
@@ -1211,7 +1232,8 @@ struct GpuModel {
         *d_cR = nullptr, *d_cmiraw = nullptr;
   bool cut_busy = false;
   hipGraphExec_t g1_exec = nullptr, g2_exec = nullptr, gall_exec = nullptr,
-                 gall_samp_exec = nullptr;  // per-slot decode graphs
+                 gall_samp_exec = nullptr, gall_pipe_exec = nullptr,
+                 gall_pipe_exec2 = nullptr;  // per-slot decode graphs
 
   // ---- Sequence slots (concurrent serve, QWENOX_PARALLEL) ----
   // Everything one sequence carries from step to step: host mirrors, GDN /
@@ -1240,7 +1262,7 @@ struct GpuModel {
   X(last_spec_proposed) X(last_ng_rounds) X(last_ng_proposed)                \
   X(last_ng_accepted) X(live_spec_rounds) X(live_spec_commits)                \
   X(live_spec_proposed) X(g1_exec) X(g2_exec) X(gall_exec) X(gall_samp_exec)   \
-  X(d_S) X(d_S_bf16) X(s_bf16_valid) X(d_convst) X(d_ring) X(d_iraw) X(d_R) X(d_pos) X(d_ringpos) \
+  X(gall_pipe_exec) X(gall_pipe_exec2) X(d_S) X(d_S_bf16) X(s_bf16_valid) X(d_convst) X(d_ring) X(d_iraw) X(d_R) X(d_pos) X(d_ringpos) \
   X(d_miraw) X(d_mpos) X(d_ckpt) X(d_mring_ckpt)
   struct SeqState {
 #define QWENOX_SLOT_DECL(f) decltype(GpuModel::f) f{};
@@ -1714,6 +1736,26 @@ struct GpuModel {
       CK(hipHostMalloc((void**)&p_sm_cand_vals_zc,
                        (size_t)SMS_ROWS * SMS_TCAP * sizeof(float), zc_flags));
       CK(hipHostGetDevicePointer((void**)&d_sm_cand_vals_zc, p_sm_cand_vals_zc, 0));
+      CK(hipHostMalloc((void**)&p_zc_ple_cnt, 16, zc_flags));
+      *p_zc_ple_cnt = 0u;
+      CK(hipHostGetDevicePointer((void**)&d_zc_ple_cnt, p_zc_ple_cnt, 0));
+      CK(hipHostMalloc((void**)&p_zc_ple2, 2 * 16 * 320, zc_flags));
+      CK(hipHostGetDevicePointer((void**)&d_zc_ple2, p_zc_ple2, 0));
+      CK(hipHostMalloc((void**)&p_pipe_req_base_, 16, zc_flags));
+      *p_pipe_req_base_ = 0;
+      CK(hipHostGetDevicePointer((void**)&d_pipe_req_base_, p_pipe_req_base_, 0));
+      CK(hipHostMalloc((void**)&p_pipe_ring_tok, 128 * sizeof(int), zc_flags));
+      CK(hipHostMalloc((void**)&p_pipe_ring_lp, 128 * sizeof(float), zc_flags));
+      CK(hipHostMalloc((void**)&p_pipe_ring_w_, 16, zc_flags));
+      *p_pipe_ring_w_ = 0u;
+      CK(hipHostGetDevicePointer((void**)&d_pipe_ring_w_, p_pipe_ring_w_, 0));
+      CK(hipHostMalloc((void**)&p_pipe_rng_, 16, zc_flags));
+      CK(hipHostGetDevicePointer((void**)&d_pipe_rng_, p_pipe_rng_, 0));
+      CK(hipHostMalloc((void**)&p_pipe_out_lp_, 16, zc_flags));
+      CK(hipHostGetDevicePointer((void**)&d_pipe_out_lp_, p_pipe_out_lp_, 0));
+      CK(hipHostMalloc((void**)&p_pipe_out_flag_, 16, zc_flags));
+      *p_pipe_out_flag_ = 0;
+      CK(hipHostGetDevicePointer((void**)&d_pipe_out_flag_, p_pipe_out_flag_, 0));
     }
     DALLOC(&d_keys, 10240 * 4);
     DALLOC(&d_v, 2560 * 4);
@@ -1743,6 +1785,7 @@ struct GpuModel {
     DALLOC(&d_sm_pids, (size_t)SMS_ROWS * SMS_LCAP * sizeof(int));
     DALLOC(&d_sm_pvals, (size_t)SMS_ROWS * SMS_LCAP * sizeof(float));
     DALLOC(&d_sm_pn, SMS_ROWS * sizeof(int));
+    DALLOC(&d_samp_hist, (size_t)g_cfg.vocab * sizeof(uint16_t));
     h_sm_ids.resize((size_t)SMS_ROWS * SMS_TCAP);
     h_sm_vals.resize((size_t)SMS_ROWS * SMS_TCAP);
     // Trunk checkpoint belongs to the verifier, independently of MTP weights.
@@ -3926,6 +3969,14 @@ struct GpuModel {
     } else {
       k_ple_fp8_dequant<<<1, 256, 0, g_str>>>(d_zc_ple, d_e, ple_tscale, 2560 / 16, d_zc_ple_seq);
     }
+    ple_gpu_proj_tail();
+  }
+  // Pipeline variant (QWENOX_SAMP_GPU): fp8 tables only; graph ordinal comes
+  // from d_pos - req_base, gather counter is monotonic, rows double buffered.
+  void enq_ple_zc_pipe() {
+    k_ple_fp8_dequant_pipe<<<1, 256, 0, g_str>>>(d_zc_ple2, d_e, ple_tscale,
+                                                 2560 / 16, 16 * 320, d_zc_ple_cnt,
+                                                 d_pos, d_pipe_req_base_);
     ple_gpu_proj_tail();
   }
 
@@ -14173,7 +14224,9 @@ struct GpuModel {
     (void)hipStreamQuery(gall_hi_st_);
     const auto wt0 = std::chrono::steady_clock::now();
     uint32_t it = 0;
-    while (__atomic_load_n(p_gall_seq_, __ATOMIC_ACQUIRE) != target) {
+    // seq 单调递增；等「至少 target 次完成」。等号判等在积压等待（seq 已超过
+    // target）下会每次白烧 500ms 兜底。
+    while (__atomic_load_n(p_gall_seq_, __ATOMIC_ACQUIRE) < target) {
 #ifdef _WIN32
       YieldProcessor();
 #endif
@@ -14292,6 +14345,55 @@ struct GpuModel {
                                             d_gall_seq_);
       CK(hipStreamEndCapture(cap, &gsamp));
     }
+    // gall_pipe (QWENOX_SAMP_GPU, opt-in): the sampling tail runs fully on
+    // device (GPU penalties from the vocab count array, splitmix64 draw) and
+    // emits each token into the coherent ring, so the host submits the next
+    // graph without waiting for the previous one (depth-2 pipeline). Opt-in:
+    // device expf cannot replicate host expf bit-exactly (RNG identical,
+    // distribution-equivalent). fp8 PLE tables only; unsupported sampler
+    // configs fall back to the host path per request.
+    hipGraph_t gpipe = nullptr;
+    static const bool pipe_env =
+        getenv("QWENOX_SAMP_GPU") != nullptr && !env_zero("QWENOX_SAMP_GPU");
+    if (use_gall && gall_hi_st_ && pipe_env && p_sm_ci && p_sm_cv && d_sm_ci_zc &&
+        d_sm_cv_zc && (!ple_on || (!ple_iq4 && !ple_q50 && !ple_bf16))) {
+      if (!d_sm_scratch) DALLOC(&d_sm_scratch, (size_t)SMS_ROWS * g_cfg.vocab * 4);
+      hcf_ready_ = false;
+      hcf_rh_ = d_Rhat;
+      CK(hipStreamBeginCapture(cap, hipStreamCaptureModeGlobal));
+      enq_embed_src(d_zc_tok);
+      enq_layer(0);
+      if (ple_on) enq_ple_zc_pipe();
+      for (int l = 1; l < g_cfg.layers; l++) enq_layer(l);
+      enq_final(false);
+      const int vocab = g_cfg.vocab;
+      k_f32_copy_vec4_hdr<<<std::min<unsigned>(256u, (unsigned)((vocab / 4 + 255) / 256)),
+                            256, 0, cap>>>(d_sm_scratch, d_logits, vocab, d_zc_sm_hdr);
+      k_corr_apply_hist<<<dim3(1, 1), 256, 0, cap>>>(
+          d_sm_scratch, vocab, d_sm_ci_zc, d_sm_cv_zc, d_zc_sm_hdr, d_samp_hist);
+      k_tk_init_hdr<<<1, 32, 0, cap>>>(d_sm_ctrl, d_zc_sm_hdr);
+      k_zero_u32<<<1, 256, 0, cap>>>(d_sm_hist, 4096);
+      k_tk_hist_hdr<0><<<dim3(8, 1), 256, 0, cap>>>(d_logits, d_sm_scratch, vocab, vocab,
+                                                    d_sm_ctrl, d_sm_hist, d_zc_sm_hdr);
+      k_tk_scan<0><<<dim3(1, 1), 256, 0, cap>>>(d_sm_hist, d_sm_ctrl, d_sm_cand_n_zc);
+      k_zero_u32<<<1, 256, 0, cap>>>(d_sm_hist, 4096);
+      k_tk_hist_hdr<1><<<dim3(8, 1), 256, 0, cap>>>(d_logits, d_sm_scratch, vocab, vocab,
+                                                    d_sm_ctrl, d_sm_hist, d_zc_sm_hdr);
+      k_tk_scan<1><<<dim3(1, 1), 256, 0, cap>>>(d_sm_hist, d_sm_ctrl, d_sm_cand_n_zc);
+      k_tk_collect_hdr<<<dim3(8, 1), 256, 0, cap>>>(d_logits, d_sm_scratch, vocab, vocab,
+                                                    d_sm_ctrl, d_sm_cand_ids_zc,
+                                                    d_sm_cand_vals_zc, d_sm_cand_n_zc,
+                                                    SMS_TCAP, d_zc_sm_hdr);
+      k_samp_prepare_draw<<<1, 256, 0, cap>>>(
+          d_sm_cand_ids_zc, d_sm_cand_vals_zc, d_sm_cand_n_zc, d_zc_sm_hdr,
+          d_pipe_rng_, d_samp_hist, d_zc_tok, d_pipe_out_lp_, d_pipe_out_flag_,
+          nullptr, nullptr, nullptr);
+      k_pipe_emit<<<1, 1, 0, cap>>>(d_zc_tok, d_pipe_out_lp_, d_pipe_out_flag_,
+                                    p_pipe_ring_tok, p_pipe_ring_lp, d_pipe_ring_w_);
+      k_step_incr_amx_seq<<<1, 1, 0, cap>>>(d_pos, d_ringpos, d_argmax, p_zc_amx,
+                                            d_gall_seq_);
+      CK(hipStreamEndCapture(cap, &gpipe));
+    }
     g_str = nullptr;
     g_kprof_mute = false;
     CK(hipGraphInstantiate(&g1_exec, g1, nullptr, nullptr, 0));
@@ -14303,6 +14405,12 @@ struct GpuModel {
     if (gsamp) {
       CK(hipGraphInstantiate(&gall_samp_exec, gsamp, nullptr, nullptr, 0));
       CK(hipGraphDestroy(gsamp));
+    }
+    if (gpipe) {
+      CK(hipGraphInstantiate(&gall_pipe_exec, gpipe, nullptr, nullptr, 0));
+      CK(hipGraphInstantiate(&gall_pipe_exec2, gpipe, nullptr, nullptr, 0));
+      CK(hipGraphDestroy(gpipe));
+      fprintf(stderr, "pipeline graph captured (gall_pipe_exec ok)\n");
     }
     CK(hipGraphDestroy(g1));
     CK(hipGraphDestroy(g2));
@@ -15534,6 +15642,110 @@ struct GpuModel {
     sms_prep(s, 0, true, sd, k);
     *out = s.draw_sparse(sd, lp, true);
     return true;
+  }
+
+  // QWENOX_SAMP_GPU pipeline setup for one request: sampler params into the
+  // coherent header, splitmix64 state, zeroed GPU hist counts, bias list into
+  // the coherent list. False when the config needs the host path (dup bias
+  // ids, oversized bias list, k == 0).
+  template <typename Sampler>
+  bool pipe_setup(const Sampler& s) {
+    if (!gall_pipe_exec) {
+      fprintf(stderr, "pipe_setup: no gall_pipe_exec\n");
+      return false;
+    }
+    if (!sms_bias_ok(s)) {
+      fprintf(stderr, "pipe_setup: dup bias ids\n");
+      return false;
+    }
+    sm_nb = (int)s.bias.size();
+    if (sm_nb > SMS_BIAS_CAP) {
+      fprintf(stderr, "pipe_setup: bias overflow\n");
+      return false;
+    }
+    {
+      int w = 0;
+      for (auto& b : s.bias) {
+        p_sm_ci[w] = b.first;
+        p_sm_cv[w] = b.second;
+        w++;
+      }
+    }
+    const int k = sms_serial_k(s);
+    if (k <= 0) {
+      fprintf(stderr, "pipe_setup: k==0\n");
+      return false;
+    }
+    sm_repeat = 1.0f;  // llama penalties are gated out on this path
+    p_zc_sm_hdr[0] = sm_nb;
+    p_zc_sm_hdr[1] = (s.presence != 0.0f || s.frequency != 0.0f) ? 1 : 0;
+    p_zc_sm_hdr[2] = k;
+    int rb;
+    memcpy(&rb, &sm_repeat, 4);
+    p_zc_sm_hdr[3] = rb;
+    memcpy(&rb, &s.temp, 4);
+    p_zc_sm_hdr[4] = rb;
+    memcpy(&rb, &s.top_p, 4);
+    p_zc_sm_hdr[5] = rb;
+    memcpy(&rb, &s.min_p, 4);
+    p_zc_sm_hdr[6] = rb;
+    p_zc_sm_hdr[7] = p_zc_sm_hdr[1];
+    memcpy(&rb, &s.presence, 4);
+    p_zc_sm_hdr[8] = rb;
+    memcpy(&rb, &s.frequency, 4);
+    p_zc_sm_hdr[9] = rb;
+    *p_pipe_rng_ = s.rng;
+    *p_pipe_ring_w_ = 0u;
+    *p_zc_ple_cnt = 0u;
+    ple_next_ = 1;
+    *p_pipe_req_base_ = pos;
+    *p_pipe_out_flag_ = 0;
+    CK(hipMemset(d_samp_hist, 0, (size_t)g_cfg.vocab * sizeof(uint16_t)));
+    return true;
+  }
+
+  // One pipelined launch: prepare the KV row, gather this step's PLE rows
+  // into the parity buffer, submit without waiting. The graph's tail samples
+  // on device and emits the token into the coherent ring.
+  // One pipelined launch: prepare the KV row and submit without waiting. The
+  // graph's tail samples on device and emits the token into the ring. PLE
+  // rows are gathered lazily (pipe_ple_flush): the gather hash needs the
+  // previous produced token, which may not be drained yet.
+  void pipe_launch() {
+    kv_prepare(pos, pos + 1);
+    static double t_pipe_lch = 0;
+    static int t_pipe_n = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    // graphExec 与其自身并发执行是未定义行为：depth-2 流水线按序号奇偶在
+    // 两份相同实例间交替，保证相邻在飞图永不同实例。
+    hipGraphExec_t ge =
+        ((pos - *p_pipe_req_base_) & 1) ? gall_pipe_exec2 : gall_pipe_exec;
+    CK(hipGraphLaunch(ge, gall_hi_st_));
+    if (getenv("QWENOX_TIME")) {
+      t_pipe_lch += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+      if (++t_pipe_n % 16 == 0)
+        fprintf(stderr, "TIME: pipe_launch=%.2f ms avg over %d\n", t_pipe_lch / t_pipe_n,
+                t_pipe_n);
+    }
+    pos++;
+  }
+
+  // Flush pending PLE gathers for pipeline graphs: graph g's rows are hashed
+  // from produced_(g-1) (chist[req_base + g - 2]); gather as soon as that
+  // token is drained and the graph is launched. The graph's ple kernel waits
+  // for the monotonic counter, so a late gather is safe (it spins < 0.5 ms).
+  int ple_next_ = 1;  // next pipeline graph ordinal awaiting its PLE gather
+  void pipe_ple_flush(int launched, int drained) {
+    if (!ple_on || !p_zc_ple_cnt) return;
+    const int req_base = *p_pipe_req_base_;
+    while (ple_next_ <= launched && ple_next_ <= drained + 1) {
+      const int ord = ple_next_ - 1;
+      ple_rows_fp8(req_base + ord, p_zc_ple2 + (size_t)(ord & 1) * (16 * 320));
+      __atomic_store_n(p_zc_ple_cnt, (uint32_t)(ord + 1), __ATOMIC_RELEASE);
+      ple_next_++;
+    }
   }
 
   void perf_report() {
