@@ -1221,6 +1221,12 @@ static void ht_gemv_p(const WView& w, const void* x, bool xbf16, uint64_t xs, fl
   // than they win (microbench 10240x2048 / 2048x4096). LDS holds tpc tiles
   // of rotated x per pass (<= 24 tile-rows) or the 8 wave partials.
   int ks = std::max(1, std::min((80 + nty - 1) / nty, ntx));
+  // QWENOX_HT_KS_CAP (experiment, default off): clamp the split-K count. Note
+  // ks participates in the FP reduction bracketing, so capping ks changes
+  // results by ulps -- not bit-exact vs the default rule.
+  static const int ks_cap =
+      getenv("QWENOX_HT_KS_CAP") ? atoi(getenv("QWENOX_HT_KS_CAP")) : 0;
+  if (ks_cap > 0 && ks > ks_cap) ks = ks_cap;
   // deterministic split-K needs ks separate slots: shrink ks to fit
   while (ks > 1 && (size_t)ks * P * nty * 128 > kHtZs) ks = (ks + 1) / 2;
   const int tpb = (ntx + ks - 1) / ks;

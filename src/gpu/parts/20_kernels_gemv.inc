@@ -1181,6 +1181,174 @@ __global__ __launch_bounds__(128, 8) void k_gdn_step_gn_128(
   out[h * 128 + t] = yv * inv * w_gn[t] / (1.f + expf(-zz));
 }
 
+// Two-kernel split of k_gdn_step_gn_128 (QWENOX_GDN_STEP_F3): phase kernel
+// (192 blocks, same wave-aligned occupancy) ends after the yv partial write —
+// no threadfence/atomic at all — and the tail RMSNorm runs as a separate tiny
+// 48-block kernel on the same ytmp buffer with the exact same offset/shfl
+// reduction order as _128's winner block. Bit-identical to k_gdn_step_gn_128.
+__global__ __launch_bounds__(128, 8) void k_gdn_step_gn_yt(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, const float* __restrict__ g,
+    const float* __restrict__ beta, float* __restrict__ S,
+    const float* __restrict__ z, float* __restrict__ ytmp) {
+  const int h = blockIdx.x >> 2, bh = blockIdx.x & 3;
+  const int t = threadIdx.x;
+  const int il = t & 31, jc = t >> 5;
+  const int i = bh * 32 + il, j0 = jc * 32;
+  __shared__ float skh[128];
+  __shared__ float sqh[128];
+  __shared__ float part[4][32];
+  skh[t] = k[(h / 3) * 128 + t];
+  sqh[t] = q[(h / 3) * 128 + t];
+  __syncthreads();
+
+  float* Sh = S + (size_t)h * 128 * 128;
+  const float alpha = expf(g[h]);
+  const float be = beta[h];
+  float s_reg[32];
+  float kv = 0.f;
+#pragma unroll
+  for (int u = 0; u < 32; u++) {
+    const int j = j0 + u;
+    float s = Sh[j * 128 + i] * alpha;
+    asm volatile("" : "+v"(s));
+    s_reg[u] = s;
+    kv += s * skh[j];
+  }
+  part[jc][il] = kv;
+  __syncthreads();
+  const float kvf = part[0][il] + part[1][il] + part[2][il] + part[3][il];
+  const float delta = (v[h * 128 + i] - kvf) * be;
+  float o = 0.f;
+#pragma unroll
+  for (int u = 0; u < 32; u++) {
+    const int j = j0 + u;
+    float s = s_reg[u] + skh[j] * delta;
+    Sh[j * 128 + i] = s;
+    o += s * sqh[j];
+  }
+  __syncthreads();
+  part[jc][il] = o;
+  __syncthreads();
+  if (jc == 0) ytmp[h * 128 + i] = part[0][il] + part[1][il] + part[2][il] + part[3][il];
+}
+
+// Tail RMSNorm of the F3 split: identical reduction order to _128's winner.
+__global__ __launch_bounds__(128) void k_gdn_norm_128(const float* __restrict__ ytmp,
+                                                      const float* __restrict__ z,
+                                                      const float* __restrict__ w_gn,
+                                                      float* __restrict__ out, float eps) {
+  const int h = blockIdx.x;
+  const int t = threadIdx.x;
+  __shared__ float sred[128];
+  const float yv = __builtin_nontemporal_load(ytmp + h * 128 + t);
+  sred[t] = __fmul_rn(yv, yv);
+  __syncthreads();
+  if (t < 64) sred[t] += sred[t + 64];
+  __syncthreads();
+  if (t < 32) {
+    float sv = sred[t] + sred[t + 32];
+    sv += __shfl_down(sv, 16, 32);
+    sv += __shfl_down(sv, 8, 32);
+    sv += __shfl_down(sv, 4, 32);
+    sv += __shfl_down(sv, 2, 32);
+    sv += __shfl_down(sv, 1, 32);
+    if (t == 0) sred[0] = sv;
+  }
+  __syncthreads();
+  const float inv = rsqrtf(sred[0] / 128 + eps);
+  const float zz = z[h * 128 + t];
+  out[h * 128 + t] = yv * inv * w_gn[t] / (1.f + expf(-zz));
+}
+
+// Single-block-per-head variant of k_gdn_step_gn_128 (48 blocks of 256 threads;
+// thread = 2 consecutive columns x its jc 32-row shard with float2 S access).
+// Per-column partials keep the exact 32-row chains and the p0+p1+p2+p3 add
+// order, and the tail RMSNorm runs in LDS replicating the same offset-64/32
+// adds + shfl chain -> bit-identical, with 0 threadfence/atomic/ytmp per head.
+__global__ __launch_bounds__(256) void k_gdn_step_gn_f2(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, const float* __restrict__ g,
+    const float* __restrict__ beta, float* __restrict__ S,
+    const float* __restrict__ z, const float* __restrict__ w_gn,
+    float* __restrict__ out, float eps) {
+  const int h = blockIdx.x;
+  const int t = threadIdx.x;
+  const int i2 = (t & 63) * 2, jc = t >> 6;
+  const int j0 = jc * 32;
+  __shared__ float skh[128];
+  __shared__ float sqh[128];
+  __shared__ float part[4][128];
+  __shared__ float sdelta[128];
+  if (t < 128) {
+    skh[t] = k[(h / 3) * 128 + t];
+    sqh[t] = q[(h / 3) * 128 + t];
+  }
+  __syncthreads();
+
+  float* Sh = S + (size_t)h * 128 * 128;
+  const float alpha = expf(g[h]);
+  const float be = beta[h];
+  float2 sr[32];
+  float kvx = 0.f, kvy = 0.f;
+#pragma unroll
+  for (int u = 0; u < 32; u++) {
+    const int j = j0 + u;
+    float2 s = *(const float2*)(Sh + j * 128 + i2);
+    s.x *= alpha;
+    s.y *= alpha;
+    asm volatile("" : "+v"(s.x), "+v"(s.y));
+    sr[u] = s;
+    kvx += s.x * skh[j];
+    kvy += s.y * skh[j];
+  }
+  part[jc][i2] = kvx;
+  part[jc][i2 + 1] = kvy;
+  __syncthreads();
+  const float kvfx = part[0][i2] + part[1][i2] + part[2][i2] + part[3][i2];
+  const float kvfy = part[0][i2 + 1] + part[1][i2 + 1] + part[2][i2 + 1] + part[3][i2 + 1];
+  const float dx = (v[h * 128 + i2] - kvfx) * be;
+  const float dy = (v[h * 128 + i2 + 1] - kvfy) * be;
+  float ox = 0.f, oy = 0.f;
+#pragma unroll
+  for (int u = 0; u < 32; u++) {
+    const int j = j0 + u;
+    float2 s;
+    s.x = sr[u].x + skh[j] * dx;
+    s.y = sr[u].y + skh[j] * dy;
+    *(float2*)(Sh + j * 128 + i2) = s;
+    ox += s.x * sqh[j];
+    oy += s.y * sqh[j];
+  }
+  __syncthreads();
+  part[jc][i2] = ox;
+  part[jc][i2 + 1] = oy;
+  __syncthreads();
+  if (t < 128) {
+    const float yv = part[0][t] + part[1][t] + part[2][t] + part[3][t];
+    sdelta[t] = __fmul_rn(yv, yv);
+  }
+  __syncthreads();
+  if (t < 64) sdelta[t] += sdelta[t + 64];
+  __syncthreads();
+  if (t < 32) {
+    float sv = sdelta[t] + sdelta[t + 32];
+    sv += __shfl_down(sv, 16, 32);
+    sv += __shfl_down(sv, 8, 32);
+    sv += __shfl_down(sv, 4, 32);
+    sv += __shfl_down(sv, 2, 32);
+    sv += __shfl_down(sv, 1, 32);
+    if (t == 0) sdelta[0] = sv;
+  }
+  __syncthreads();
+  if (t < 128) {
+    const float yv = part[0][t] + part[1][t] + part[2][t] + part[3][t];
+    const float inv = rsqrtf(sdelta[0] / 128 + eps);
+    const float zz = z[h * 128 + t];
+    out[h * 128 + t] = yv * inv * w_gn[t] / (1.f + expf(-zz));
+  }
+}
+
 // Short speculative batches: keep the entire recurrent state in registers.
 // The four partial reductions and accumulation order follow k_gdn_step.
 // Thread map: the four jc shards of one column i sit in adjacent lanes of

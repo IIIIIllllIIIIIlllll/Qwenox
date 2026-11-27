@@ -322,6 +322,28 @@ __global__ void k_corr_apply(float* __restrict__ x, int stride,
   }
 }
 
+// Graph-capture variant of k_corr_apply for the decode sampling tail: the list
+// head and counts live in a coherent control header (hdr[0]=nb, hdr[1]=nh,
+// hdr[3]=repeat bits) instead of launch params, so one captured node serves
+// every round. ids/vals are the coherent round-shared list (bias [0,nb) then
+// hist [nb,nb+nh)); serial decode has no draft-prefix list. Same per-phase
+// math and order as k_corr_apply.
+__global__ void k_corr_apply_hdr(float* __restrict__ x, int stride,
+                                 const int* __restrict__ ci,
+                                 const float* __restrict__ cv,
+                                 const int* __restrict__ hdr) {
+  float* xr = x + (size_t)blockIdx.y * stride;
+  const int nb = hdr[0], nh = hdr[1];
+  const float repeat = __int_as_float(hdr[3]);
+  for (int i = threadIdx.x; i < nb; i += blockDim.x) xr[ci[i]] += cv[i];
+  __syncthreads();
+  for (int i = threadIdx.x; i < nh; i += blockDim.x) {
+    float& v = xr[ci[nb + i]];
+    if (repeat != 1.0f) v = v <= 0.0f ? v * repeat : v / repeat;
+    v -= cv[nb + i];
+  }
+}
+
 // Radix top-k over fp32 logits via their monotonic u32 keys (same map as
 // amx_pack). Two 12-bit histogram passes narrow the k-th value to a 24-bit
 // prefix; collect then writes every key >= T (the true top-k is a subset).
@@ -434,6 +456,19 @@ __global__ void k_tk_init(int* __restrict__ ctrl, int k) {
     c[0] = 0;
     c[1] = 0;
     c[2] = k;
+    c[3] = 0;
+    c[4] = 0;
+    c[5] = 0;
+  }
+}
+
+// Graph-capture variant of k_tk_init: k from the coherent header (hdr[2]).
+__global__ void k_tk_init_hdr(int* __restrict__ ctrl, const int* __restrict__ hdr) {
+  int* c = ctrl + (size_t)blockIdx.x * 8;
+  if (threadIdx.x == 0) {
+    c[0] = 0;
+    c[1] = 0;
+    c[2] = hdr[2];
     c[3] = 0;
     c[4] = 0;
     c[5] = 0;

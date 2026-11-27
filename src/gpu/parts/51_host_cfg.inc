@@ -4317,6 +4317,41 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
           reason = "done";
           break;
         }
+        // Graph-tail sampling (QWENOX_SMS_GRAPH): corrections + top-k run in
+        // the decode graph's tail; send_tok/dl_tick/hist overlap the GPU
+        // window between samp_launch and samp_wait_draw. Penalties for this
+        // round were finalized by the previous round's draw, so the coherent
+        // lists can be written before the launch.
+        const bool samp_graph = g.sample && m.gall_samp_exec != nullptr;
+        int gk = 0;
+        bool gs = false;
+        if (samp_graph && i + 1 < g.max_tokens) {
+          gk = m.sms_serial_k(smp);
+          gs = gk > 0 && m.sms_round_shared(smp);
+        }
+        if (gs) {
+          int fed = cur;  // the token the graph ingests (pre-sampling)
+          m.samp_launch(fed, gk);
+          const bool sent = send_tok(cur, g.logprobs, cur_lp);
+          dl_tick();
+          if (!m.samp_wait_draw(smp, &cur, &cur_lp)) {
+            m.get_logits(lbuf);
+            cur = smp.sample(lbuf, &cur_lp);
+          }
+          hist.push_back(fed);
+          // Serial decode advances one token at a time: checkpoint right
+          // after a ckpt token (mtp is stale on this path).
+          if (!ckpt_toks.empty() && ckpt_toks.count(fed) &&
+              rckpt::save(m, hist, false)) {
+            fprintf(stderr, "%s ckpt: saved %zu tokens (after token %d, req %lld)\n",
+                    log_ts(), hist.size(), fed, (long long)g.req);
+            note_pause(hist.size(), fed);
+          }
+          if (cancel) break;
+          m.yield_point();
+          if (!sent) break;  // client gone mid-round
+          continue;
+        }
         if (!send_tok(cur, g.logprobs, cur_lp)) break;
         if (i + 1 < g.max_tokens) {
           int fed = cur;  // the token forward() ingests (pre-sampling)

@@ -1145,6 +1145,18 @@ struct GpuModel {
   std::vector<float> h_sm_pv;      //   shared H2D may still be in flight)
   std::vector<int> sms_out_ids;    // truncated top-k results [rows][k]
   std::vector<float> sms_out_vals;
+  // Graph-tail sampling (QWENOX_SMS_GRAPH, default on when available): the
+  // decode graph's tail runs the corrections + radix top-k chain itself,
+  // reading a coherent control header and writing candidates into coherent
+  // zero-copy memory, so the host round has no eager launches and no D2H.
+  int* p_zc_sm_hdr = nullptr;      // coherent [4]: nb, nh, k, repeat bits
+  int* d_zc_sm_hdr = nullptr;
+  int* p_sm_cand_n_zc = nullptr;   // coherent cand_n [SMS_ROWS]
+  int* d_sm_cand_n_zc = nullptr;
+  int* p_sm_cand_ids_zc = nullptr; // coherent cand ids [SMS_ROWS][SMS_TCAP]
+  int* d_sm_cand_ids_zc = nullptr;
+  float* p_sm_cand_vals_zc = nullptr;
+  float* d_sm_cand_vals_zc = nullptr;
   // Rollback snapshots (spec verify): S/convst per accepted depth, indexer
   // proj rows per QSA layer. Written only when spec_snap is set. One slot's
   // verify chunk needs gamma+1 <= 9 rows (gamma <= 8); kVSnapRows reserves
@@ -1195,7 +1207,8 @@ struct GpuModel {
   float *d_cS = nullptr, *d_cconvst = nullptr, *d_cring = nullptr, *d_ciraw = nullptr,
         *d_cR = nullptr, *d_cmiraw = nullptr;
   bool cut_busy = false;
-  hipGraphExec_t g1_exec = nullptr, g2_exec = nullptr, gall_exec = nullptr;  // per-slot decode graphs
+  hipGraphExec_t g1_exec = nullptr, g2_exec = nullptr, gall_exec = nullptr,
+                 gall_samp_exec = nullptr;  // per-slot decode graphs
 
   // ---- Sequence slots (concurrent serve, QWENOX_PARALLEL) ----
   // Everything one sequence carries from step to step: host mirrors, GDN /
@@ -1223,7 +1236,7 @@ struct GpuModel {
   X(prog_last) X(prog_snap_last) X(prog_snap_last_est) X(last_spec_rounds) X(last_spec_commit) X(last_spec_rollbacks) \
   X(last_spec_proposed) X(last_ng_rounds) X(last_ng_proposed)                \
   X(last_ng_accepted) X(live_spec_rounds) X(live_spec_commits)                \
-  X(live_spec_proposed) X(g1_exec) X(g2_exec) X(gall_exec)                    \
+  X(live_spec_proposed) X(g1_exec) X(g2_exec) X(gall_exec) X(gall_samp_exec)   \
   X(d_S) X(d_convst) X(d_ring) X(d_iraw) X(d_R) X(d_pos) X(d_ringpos)         \
   X(d_miraw) X(d_mpos) X(d_ckpt) X(d_mring_ckpt)
   struct SeqState {
@@ -1682,6 +1695,16 @@ struct GpuModel {
       CK(hipHostMalloc((void**)&p_sm_cv, (SMS_BIAS_CAP + SMS_HIST_CAP) * sizeof(float),
                        zc_flags));
       CK(hipHostGetDevicePointer((void**)&d_sm_cv_zc, p_sm_cv, 0));
+      CK(hipHostMalloc((void**)&p_zc_sm_hdr, 16, zc_flags));
+      CK(hipHostGetDevicePointer((void**)&d_zc_sm_hdr, p_zc_sm_hdr, 0));
+      CK(hipHostMalloc((void**)&p_sm_cand_n_zc, SMS_ROWS * sizeof(int), zc_flags));
+      CK(hipHostGetDevicePointer((void**)&d_sm_cand_n_zc, p_sm_cand_n_zc, 0));
+      CK(hipHostMalloc((void**)&p_sm_cand_ids_zc,
+                       (size_t)SMS_ROWS * SMS_TCAP * sizeof(int), zc_flags));
+      CK(hipHostGetDevicePointer((void**)&d_sm_cand_ids_zc, p_sm_cand_ids_zc, 0));
+      CK(hipHostMalloc((void**)&p_sm_cand_vals_zc,
+                       (size_t)SMS_ROWS * SMS_TCAP * sizeof(float), zc_flags));
+      CK(hipHostGetDevicePointer((void**)&d_sm_cand_vals_zc, p_sm_cand_vals_zc, 0));
     }
     DALLOC(&d_keys, 10240 * 4);
     DALLOC(&d_v, 2560 * 4);
@@ -2910,9 +2933,24 @@ struct GpuModel {
     pf_fork(l);  // decode prefetch: overlaps step/norm/out_proj
     static const bool gdn_step_gn = !env_zero("QWENOX_GDN_STEP_GN");
     static const bool gdn_step_fast = !env_zero("QWENOX_GDN_STEP_FAST");
+    static const bool gdn_step_f2 =
+        getenv("QWENOX_GDN_STEP_F2") != nullptr && !env_zero("QWENOX_GDN_STEP_F2");
+    static const bool gdn_step_f3 =
+        getenv("QWENOX_GDN_STEP_F3") != nullptr && !env_zero("QWENOX_GDN_STEP_F3");
     if (gdn_step_gn) {
       if (!gdn_pair) gemv(zw, x, d_z);
-      if (gdn_step_fast && d_gdn_ytmp_ && gdn_step_cnt_) {
+      if (gdn_step_fast && gdn_step_f3 && d_gdn_ytmp_) {
+        k_gdn_step_gn_yt<<<192, 128, 0, g_str>>>(
+            qp, kp, vp, d_g48, d_beta48, d_S + (size_t)gi * 48 * 128 * 128, d_z,
+            d_gdn_ytmp_);
+        k_gdn_norm_128<<<48, 128, 0, g_str>>>(d_gdn_ytmp_, d_z,
+                                              d_gdnnorm + (size_t)gi * 128, vp,
+                                              g_cfg.norm_eps);
+      } else if (gdn_step_fast && gdn_step_f2) {
+        k_gdn_step_gn_f2<<<48, 256, 0, g_str>>>(
+            qp, kp, vp, d_g48, d_beta48, d_S + (size_t)gi * 48 * 128 * 128, d_z,
+            d_gdnnorm + (size_t)gi * 128, vp, g_cfg.norm_eps);
+      } else if (gdn_step_fast && d_gdn_ytmp_ && gdn_step_cnt_) {
         k_gdn_step_gn_128<<<192, 128, 0, g_str>>>(
             qp, kp, vp, d_g48, d_beta48, d_S + (size_t)gi * 48 * 128 * 128, d_z,
             d_gdnnorm + (size_t)gi * 128, d_gdn_ytmp_, vp, gdn_step_cnt_, g_cfg.norm_eps);
@@ -4187,11 +4225,29 @@ struct GpuModel {
     snprintf(b, sizeof b, "%s.input_mix_weight_up.weight", prefix);
     const WView up = wview(ckpt.at(b));
     static const bool hcf_fast = !env_zero("QWENOX_HCF_FAST");
+    // QWENOX_HCF_DOWN_NSK (experiment, default off): the 80x128 no-split-K
+    // down kernel. Bit-identical to k_hcf_down, but its 320-wave grid is
+    // DRAM-latency-bound in production (serve g_sync +0.31 ms vs the generic
+    // 200-block form), so the generic stays the default.
+    static const bool hcf_down_nsk =
+        getenv("QWENOX_HCF_DOWN_NSK") != nullptr && !env_zero("QWENOX_HCF_DOWN_NSK");
     const int gps = 32, ns = (int)((dn.cols / 64 + gps - 1) / gps);
-    k_hcf_down<<<dim3((unsigned)((dn.rows + 7) / 8), (unsigned)ns), 256, 0, g_str>>>(
-        dn.data, hcf_rh_, hcf_part_, d_t320, (int)dn.rows, (int)dn.cols, (int)dn.scale_stride,
-        gps, hcf_cnt_);
-    if (hcf_fast && up.rows == 10240 && up.cols == 320) {
+    if (hcf_fast && hcf_down_nsk && dn.rows == 320 && dn.cols == 10240 && ns == 5) {
+      k_hcf_down_c10k_nsk<<<80, 128, 0, g_str>>>(dn.data, hcf_rh_, d_t320,
+                                               (int)dn.scale_stride);
+    } else {
+      k_hcf_down<<<dim3((unsigned)((dn.rows + 7) / 8), (unsigned)ns), 256, 0, g_str>>>(
+          dn.data, hcf_rh_, hcf_part_, d_t320, (int)dn.rows, (int)dn.cols,
+          (int)dn.scale_stride, gps, hcf_cnt_);
+    }
+    // QWENOX_HCF_UPC_U4 (experiment, default off): uint4-vectorized
+    // k_hcf_upc_160. Bit-identical and faster at L2-resident microbench
+    // (~+9%), but in the DRAM-streaming serve its lane-strided uint4 reads
+    // half-fill 32B sectors (serve g_sync +0.12 ms), so the scalar form stays
+    // the default.
+    static const bool hcf_upc_u4 =
+        getenv("QWENOX_HCF_UPC_U4") != nullptr && !env_zero("QWENOX_HCF_UPC_U4");
+    if (hcf_fast && hcf_upc_u4 && up.rows == 10240 && up.cols == 320) {
       k_hcf_upc_160<<<320, 160, 0, g_str>>>(up.data, d_t320, hcf_rh_, x_out,
                                             (int)up.scale_stride);
     } else {
@@ -14172,6 +14228,60 @@ struct GpuModel {
         k_step_incr_amx<<<1, 1, 0, cap>>>(d_pos, d_ringpos, d_argmax, p_zc_amx);
       CK(hipStreamEndCapture(cap, &gall));
     }
+    // gall_samp: the same unified decode graph, but the argmax tail is extended
+    // with the sampling chain (logits copy -> corrections -> radix top-k ->
+    // collect into coherent zero-copy memory). All round-varying inputs come
+    // from the coherent header/penalty lists, so one captured graph serves
+    // every sampling round. Output is bit-identical to the eager sms path.
+    hipGraph_t gsamp = nullptr;
+    static const bool samp_graph_on = !env_zero("QWENOX_SMS_GRAPH");
+    if (use_gall && gall_hi_st_ && samp_graph_on && p_sm_ci && p_sm_cv &&
+        d_sm_ci_zc && d_sm_cv_zc) {
+      if (!d_sm_scratch) DALLOC(&d_sm_scratch, (size_t)SMS_ROWS * g_cfg.vocab * 4);
+      // Probe hipMemsetAsync capture support first: if it is capture-illegal
+      // here, keep the eager sms path instead of failing startup.
+      bool memset_ok = false;
+      {
+        hipGraph_t probe = nullptr;
+        CK(hipStreamBeginCapture(cap, hipStreamCaptureModeGlobal));
+        hipError_t me = hipMemsetAsync(d_sm_hist, 0, 4096 * sizeof(unsigned), cap);
+        hipError_t ee = hipStreamEndCapture(cap, &probe);
+        memset_ok = me == hipSuccess && ee == hipSuccess && probe != nullptr;
+        if (probe) CK(hipGraphDestroy(probe));
+      }
+      if (!memset_ok)
+        fprintf(stderr, "sampling graph: hipMemsetAsync not capturable; eager sms path stays\n");
+      if (memset_ok) {
+      hcf_ready_ = false;
+      hcf_rh_ = d_Rhat;
+      CK(hipStreamBeginCapture(cap, hipStreamCaptureModeGlobal));
+      enq_embed_src(d_zc_tok);
+      enq_layer(0);
+      if (ple_on) enq_ple_zc();
+      for (int l = 1; l < g_cfg.layers; l++) enq_layer(l);
+      enq_final();
+      const int vocab = g_cfg.vocab;
+      k_f32_copy_vec4<<<std::min<unsigned>(256u, (unsigned)((vocab / 4 + 255) / 256)),
+                        256, 0, cap>>>(d_sm_scratch, d_logits, vocab);
+      k_corr_apply_hdr<<<dim3(1, 1), 256, 0, cap>>>(d_sm_scratch, vocab, d_sm_ci_zc,
+                                                    d_sm_cv_zc, d_zc_sm_hdr);
+      k_tk_init_hdr<<<1, 32, 0, cap>>>(d_sm_ctrl, d_zc_sm_hdr);
+      CK(hipMemsetAsync(d_sm_hist, 0, 4096 * sizeof(unsigned), cap));
+      k_tk_hist<0><<<dim3(8, 1), 256, 0, cap>>>(d_sm_scratch, vocab, vocab, d_sm_ctrl,
+                                                d_sm_hist);
+      k_tk_scan<0><<<dim3(1, 1), 256, 0, cap>>>(d_sm_hist, d_sm_ctrl, d_sm_cand_n_zc);
+      CK(hipMemsetAsync(d_sm_hist, 0, 4096 * sizeof(unsigned), cap));
+      k_tk_hist<1><<<dim3(8, 1), 256, 0, cap>>>(d_sm_scratch, vocab, vocab, d_sm_ctrl,
+                                                d_sm_hist);
+      k_tk_scan<1><<<dim3(1, 1), 256, 0, cap>>>(d_sm_hist, d_sm_ctrl, d_sm_cand_n_zc);
+      k_tk_collect<<<dim3(8, 1), 256, 0, cap>>>(d_sm_scratch, vocab, vocab, d_sm_ctrl,
+                                                d_sm_cand_ids_zc, d_sm_cand_vals_zc,
+                                                d_sm_cand_n_zc, SMS_TCAP);
+      k_step_incr_amx_seq<<<1, 1, 0, cap>>>(d_pos, d_ringpos, d_argmax, p_zc_amx,
+                                            d_gall_seq_);
+      CK(hipStreamEndCapture(cap, &gsamp));
+      }
+    }
     g_str = nullptr;
     g_kprof_mute = false;
     CK(hipGraphInstantiate(&g1_exec, g1, nullptr, nullptr, 0));
@@ -14179,6 +14289,10 @@ struct GpuModel {
     if (gall) {
       CK(hipGraphInstantiate(&gall_exec, gall, nullptr, nullptr, 0));
       CK(hipGraphDestroy(gall));
+    }
+    if (gsamp) {
+      CK(hipGraphInstantiate(&gall_samp_exec, gsamp, nullptr, nullptr, 0));
+      CK(hipGraphDestroy(gsamp));
     }
     CK(hipGraphDestroy(g1));
     CK(hipGraphDestroy(g2));
@@ -15326,6 +15440,61 @@ struct GpuModel {
     tock(4, t4);
     t_n++;
     return id;
+  }
+
+  // Launch the sampling-tail unified graph (the corrections + radix top-k
+  // chain runs in-graph) and return immediately; host protocol work should
+  // run between samp_launch and samp_wait_draw to overlap the GPU window.
+  // Caller already wrote the coherent round-shared penalty list
+  // (sms_round_shared); the header is assembled here. The inline PLE gather
+  // replaces the mutex/CV worker kick: the graph reaches its ple_wait_ready
+  // ~0.5 ms after the launch, the gather takes ~0.02 ms.
+  void samp_launch(int fed, int k) {
+    kv_prepare(pos, pos + 1);
+    *p_zc_tok = fed;
+    p_zc_sm_hdr[0] = sm_nb;
+    p_zc_sm_hdr[1] = sm_nh;
+    p_zc_sm_hdr[2] = k;
+    int rb;
+    memcpy(&rb, &sm_repeat, 4);
+    p_zc_sm_hdr[3] = rb;
+    if (ple_on && p_zc_ple_seq) __atomic_store_n(p_zc_ple_seq, 0u, __ATOMIC_RELEASE);
+    CK(hipGraphLaunch(gall_samp_exec, gall_hi_st_));
+    if (ple_on && p_zc_ple_seq) {
+      chist.push_back(fed);
+      ple_rows_fp8((int)chist.size() - 1, p_zc_ple);
+      __atomic_store_n(p_zc_ple_seq, 1u, __ATOMIC_RELEASE);
+    }
+    pos++;
+  }
+
+  // Wait for the sampling graph, truncate the coherent candidate row to the
+  // exact top-k ordered by (value desc, id asc) — the same truncation as
+  // sms_topk_rows — and draw from it. False -> caller takes the dense path
+  // (candidate overflow; d_logits is pristine because corrections ran on the
+  // in-graph scratch copy).
+  template <typename Sampler>
+  bool samp_wait_draw(Sampler& s, int* out, float* lp) {
+    gall_wait_zc();
+    const int cn = *(volatile const int*)p_sm_cand_n_zc;
+    const int k = p_zc_sm_hdr[2];
+    if (cn < k || cn > SMS_TCAP) return false;
+    const int* ids = p_sm_cand_ids_zc;
+    const float* vals = p_sm_cand_vals_zc;
+    std::vector<int> ord((size_t)cn);
+    for (int j = 0; j < cn; j++) ord[j] = j;
+    std::sort(ord.begin(), ord.end(), [&](int a, int b) {
+      if (vals[a] != vals[b]) return vals[a] > vals[b];
+      return ids[a] < ids[b];
+    });
+    for (int j = 0; j < k; j++) {
+      sms_out_ids[(size_t)j] = ids[ord[j]];
+      sms_out_vals[(size_t)j] = vals[ord[j]];
+    }
+    typename Sampler::SDist sd;
+    sms_prep(s, 0, true, sd, k);
+    *out = s.draw_sparse(sd, lp, true);
+    return true;
   }
 
   void perf_report() {

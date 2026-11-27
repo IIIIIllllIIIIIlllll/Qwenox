@@ -1929,6 +1929,26 @@ __global__ __launch_bounds__(256) void k_hcf_down_c10k(const uint8_t* __restrict
   if (tid == 0) atomicExch(cnt + blockIdx.x, 0);
 }
 
+// No-split-K variant for R=320, C=10240, gps=32 (ns=5): 80 blocks x 128 threads
+// (4 waves/block, 1 wave = 1 row; 4 blocks/WGP, zero tail wave). Each wave walks
+// the 5 K slices in order and accumulates v = slice0 + ... + slice4 with the same
+// FP32 add order as k_hcf_down's part write + skred sum -> bit-identical, with no
+// part buffer, threadfence or atomic at all.
+__global__ __launch_bounds__(128) void k_hcf_down_c10k_nsk(const uint8_t* __restrict__ wq,
+                                                           const float* __restrict__ x,
+                                                           float* __restrict__ t, int st) {
+  const int tid = threadIdx.x, li = tid & 31;
+  const int r = blockIdx.x * 4 + (tid >> 5);
+  const uint8_t* row = wq + (size_t)r * st;
+  float v = hcf::sk_lane(row, x, 10240, 0, 32, li);
+#pragma unroll
+  for (int s = 1; s < 5; s++) v += hcf::sk_lane(row, x, 10240, s * 32, s * 32 + 32, li);
+  if (li == 0) {
+    const float xx = v * 0.25f;
+    t[r] = xx / (1.f + expf(-xx));
+  }
+}
+
 // mix-down GEMV (R x C split-K, as k_q6g64_gemv_sk<1,float>) + the skred sum
 // (last-arriving K slice of each 8-row tile, slices in order) + silu(v/4).
 __global__ __launch_bounds__(256) void k_hcf_down(const uint8_t* __restrict__ wq,
@@ -2236,11 +2256,16 @@ __global__ __launch_bounds__(160, 6) void k_hcf_upc_160(const uint8_t* __restric
     const uint32_t sb = *(const uint32_t*)(row + 240 + g * 4);
     const float sc = __half2float(__ushort_as_half((unsigned short)(sb & 0xffffu)));
     const float bi = __half2float(__ushort_as_half((unsigned short)(sb >> 16)));
+    const uint4 l0 = *(const uint4*)(row + g * 32);
+    const uint4 l1 = *(const uint4*)(row + g * 32 + 16);
+    const uint4 hp = *(const uint4*)(row + 160 + g * 16);
+    const uint32_t lw8[8] = {l0.x, l0.y, l0.z, l0.w, l1.x, l1.y, l1.z, l1.w};
+    const uint32_t hw4[4] = {hp.x, hp.y, hp.z, hp.w};
     float dx = 0.f;
-#pragma unroll 2
+#pragma unroll
     for (int i8 = 0; i8 < 8; i8++) {
-      const uint32_t lw = *(const uint32_t*)(row + g * 32 + i8 * 4);
-      const uint32_t hw = (uint32_t)*(const uint16_t*)(row + 160 + g * 16 + i8 * 2);
+      const uint32_t lw = lw8[i8];
+      const uint32_t hw = (hw4[i8 >> 1] >> (16 * (i8 & 1))) & 0xffffu;
       const float4 a = *(const float4*)(st_sh + g * 64 + i8 * 8);
       const float4 bv = *(const float4*)(st_sh + g * 64 + i8 * 8 + 4);
       const float xv[8] = {a.x, a.y, a.z, a.w, bv.x, bv.y, bv.z, bv.w};
