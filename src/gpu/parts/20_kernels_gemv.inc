@@ -946,6 +946,7 @@ __global__ void k_rmsnorm_zc(const float* __restrict__ x, const float* __restric
 }
 
 __device__ inline uint16_t f2bf(float f);
+__device__ inline float bf2f(uint16_t b);
 
 // grouped zc rmsnorm over flat (ngroups x gsize): one block per group.
 // Batched: grid may exceed ngroups; weight index wraps with % ngroups.
