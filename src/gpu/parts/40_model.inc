@@ -15649,7 +15649,7 @@ struct GpuModel {
   // the coherent list. False when the config needs the host path (dup bias
   // ids, oversized bias list, k == 0).
   template <typename Sampler>
-  bool pipe_setup(const Sampler& s) {
+  bool pipe_setup(const Sampler& s, int cur) {
     if (!gall_pipe_exec) {
       fprintf(stderr, "pipe_setup: no gall_pipe_exec\n");
       return false;
@@ -15698,6 +15698,7 @@ struct GpuModel {
     *p_pipe_ring_w_ = 0u;
     *p_zc_ple_cnt = 0u;
     ple_next_ = 1;
+    *p_zc_tok = cur;  // the first graph embeds the token sampled at prefill
     *p_pipe_req_base_ = pos;
     *p_pipe_out_flag_ = 0;
     CK(hipMemset(d_samp_hist, 0, (size_t)g_cfg.vocab * sizeof(uint16_t)));
@@ -15718,9 +15719,13 @@ struct GpuModel {
     const auto t0 = std::chrono::steady_clock::now();
     // graphExec 与其自身并发执行是未定义行为：depth-2 流水线按序号奇偶在
     // 两份相同实例间交替，保证相邻在飞图永不同实例。
+    gdn_s_to_bf16(gall_hi_st_);
     hipGraphExec_t ge =
         ((pos - *p_pipe_req_base_) & 1) ? gall_pipe_exec2 : gall_pipe_exec;
     CK(hipGraphLaunch(ge, gall_hi_st_));
+    // WDDM：launch 只写用户态队列，需 hipStreamQuery 敲门铃才真正提交给 GPU；
+    // 末图没有下一张图把它挤出来，必须自己敲。
+    (void)hipStreamQuery(gall_hi_st_);
     if (getenv("QWENOX_TIME")) {
       t_pipe_lch += std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - t0)

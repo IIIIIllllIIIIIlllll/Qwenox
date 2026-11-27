@@ -4325,7 +4325,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       if (pipe_env)
         fprintf(stderr, "pipe gate: ckpt_toks=%zu\n", ckpt_toks.size());
       if (pipe_env && g.sample && !g.logprobs && !g.llama_penalties &&
-          m.gall_pipe_exec != nullptr && m.pipe_setup(smp)) {
+          m.gall_pipe_exec != nullptr && m.pipe_setup(smp, cur)) {
         const int depth = 2;
         int launched = 0, drained = 0, waited = 0;
         const size_t cbase = m.chist.size();
@@ -4349,6 +4349,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
           }
           if (launched == drained) break;
           const auto wt0 = std::chrono::steady_clock::now();
+          uint32_t wq_it = 0;
           while (*(volatile uint32_t*)m.p_pipe_ring_w_ == (uint32_t)drained) {
             if (cancel) {
               stop = true;
@@ -4358,6 +4359,8 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
 #ifdef _WIN32
             YieldProcessor();
 #endif
+            if ((++wq_it & 4095u) == 0)
+              (void)hipStreamQuery(m.gall_hi_st_);  // WDDM doorbell flush
             if (std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - wt0).count() > 30000.0) {
               overflow = true;
