@@ -1669,6 +1669,9 @@ static uint64_t fingerprint(const GpuModel& m) {
   // GGUF native dense weights (not the q8g32 requant): different numerics,
   // so snapshots of the two layouts never mix. Other setups keep their hash.
   if (g_gguf_dense && gguf_map::g_native_dense) add(0x4e41544956453031ULL);
+  // GGUF dense requantized to q6g64 (QWENOX_GGUF_DENSE_Q6): same rule —
+  // activations differ from the q8g32/native layouts, keep snapshots apart.
+  if (g_gguf_dense && gguf_map::g_dense_q6) add(0x5136473634524531ULL);
   return h;
 }
 static bool ends_with(const std::string& s, const char* suf) {

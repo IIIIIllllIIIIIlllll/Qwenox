@@ -702,6 +702,13 @@ static void gguf_dense_apply(Checkpoint& ck) {
     const char* ne = getenv("QWENOX_GGUF_NATIVE");
     gguf_map::g_native_dense = !(ne && ne[0] == '0' && ne[1] == 0);
   }
+  // QWENOX_GGUF_DENSE_Q6=1: dense matrices that would requantize to q8g32 go
+  // to dtype 24 q6g64 (~0.76x the bytes, decode GEMV is bandwidth-bound).
+  // Embed (gather kernels) and MTP head keep q8g32.
+  {
+    const char* q6 = getenv("QWENOX_GGUF_DENSE_Q6");
+    gguf_map::g_dense_q6 = q6 && q6[0] == '1' && q6[1] == 0;
+  }
   size_t n = gguf_map::build(ck, *g_gguf, g_gguf_mtp);
   // PLE n-gram table: a hgn base keeps its fp8 table by default (KLD 0.0453
   // vs 0.0511 with the GGUF's IQ4_NL one); pure GGUF / QWENOX_GGUF_PLE=1 use IQ4_NL.
@@ -717,12 +724,13 @@ static void gguf_dense_apply(Checkpoint& ck) {
   const bool ple = (pe && !strcmp(pe, "1")) || !ck.find("layers.1.ple.ngram_embedding.weight");
   if (ple) gguf_map::add_ple_table(ck, *g_gguf);
   size_t bytes = 0, nbytes = 0;
-  int n8 = 0, nn = 0;
+  int n8 = 0, nn = 0, n24 = 0;
   for (auto& kv : ck.tensors()) {
     const uint32_t dt = kv.second.dtype;
-    if (dt == 8 || dt == 1) {
+    if (dt == 8 || dt == 1 || dt == 24) {
       bytes += kv.second.data_size;
       n8 += dt == 8;
+      n24 += dt == 24;
     } else if (dt >= 100 && ggd::type_ok((int)dt - ggd::kDtypeBase)) {
       bytes += kv.second.data_size;
       nbytes += kv.second.data_size;
@@ -738,9 +746,9 @@ static void gguf_dense_apply(Checkpoint& ck) {
   }
   double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   fprintf(stderr,
-          "gguf dense: %zu tensors from GGUF%s (%d q8g32, %d native %.2f GiB, %.2f GiB synthetic, "
-          "%.1f s)%s\n",
-          n, g_gguf_mtp ? " + MTP sidecar" : "", n8, nn, nbytes / 1073741824.0,
+          "gguf dense: %zu tensors from GGUF%s (%d q8g32, %d q6g64, %d native %.2f GiB, "
+          "%.2f GiB synthetic, %.1f s)%s\n",
+          n, g_gguf_mtp ? " + MTP sidecar" : "", n8, n24, nn, nbytes / 1073741824.0,
           bytes / 1073741824.0, s,
           ple ? ple_tag : g_gguf_ple ? "; PLE table external" : "");
 }
@@ -1422,6 +1430,22 @@ static void q6g64_gemv_p(const WView& w, const void* x, bool xbf16, uint64_t xs,
       k_q6g64_gemv_sk<P, float><<<grid, 256, 0, g_str>>>(wq, (const float*)x, xs, part, R, C,
                                                         st, gps);
     k_q6g64_skred<P><<<(unsigned)((P * R + 255) / 256), 256, 0, g_str>>>(part, y, ys, R, ns);
+  } else if (C < 4096 && R >= 640 && [] {
+               // opt-in only (=1): row-invariant (bit-identical per row)
+               // 2-rows/warp prefetch variant, +4-10% on the mid-size shapes in
+               // the standalone bench but in-situ neutral (30.85 -> 31.15 ms
+               // GPU, within run noise, gfx1151 2026-11-27) — the decode loop
+               // is DRAM-stream bound, not GEMV-instruction bound.
+               const char* e = getenv("QWENOX_Q6G_R2");
+               return e && !(e[0] == '0' && e[1] == 0);
+             }()) {
+    const unsigned blocks = (unsigned)((R + 15) / 16);
+    if (xbf16)
+      k_q6g64_gemv_r2<P, uint16_t><<<blocks, 256, 0, g_str>>>(wq, (const uint16_t*)x, xs, y, ys,
+                                                              R, C, st);
+    else
+      k_q6g64_gemv_r2<P, float><<<blocks, 256, 0, g_str>>>(wq, (const float*)x, xs, y, ys, R, C,
+                                                           st);
   } else if (C >= 8192 && [] {
                // opt-in only: measured slower (P=7 21.4 -> 28.3 ms, 10-05)
                const char* e = getenv("QWENOX_Q6G_ROW256");

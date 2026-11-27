@@ -976,6 +976,116 @@ __global__ __launch_bounds__(256) void k_q6g64_gemv(const uint8_t* __restrict__ 
   }
 }
 
+// 11-27 tune (GGUF q6 dense, tools/q6g64_tune_bench.cu): 2 rows per warp
+// with next-group prefetch for the mid-size LPR=32 shapes (C in [1024,4096),
+// R >= 640). Each row keeps the per-lane group order (g = li; g += LPR) and
+// the shfl reduction tree of k_q6g64_gemv, so every row is bit-identical to
+// it; the odd-row duplicate read is never stored (as k_q8g32_gemv_mr).
+// Measured gfx1151 P=1: qkv 10240x2560 +6.2%, in_z 6144x2560 +4.3%,
+// q_proj 12288x2560 +5.2%, shexp gu 640x2560 +10.1%, lm_head +4.7%;
+// R < 640 and C >= 4096 stay on k_q6g64_gemv (dispatch in q6g64_gemv_p).
+template <int P, typename TX>
+__global__ __launch_bounds__(256) void k_q6g64_gemv_r2(const uint8_t* __restrict__ wq,
+                                                       const TX* __restrict__ x, uint64_t xs,
+                                                       float* __restrict__ y, uint64_t ys, int R,
+                                                       int C, int st) {
+  constexpr int LPR = 32;
+  const int tid = threadIdx.x;
+  const int r0 = (blockIdx.x * (256 / LPR) + tid / LPR) * 2;
+  const int li = tid % LPR;
+  if (r0 >= R) return;
+  const bool has1 = r0 + 1 < R;
+  const uint8_t* row0 = wq + (size_t)r0 * st;
+  const uint8_t* row1 = wq + (has1 ? r0 + 1 : r0) * st;
+  const int ng = C >> 6;
+  float acc0[P], acc1[P];
+#pragma unroll
+  for (int p = 0; p < P; p++) { acc0[p] = 0.f; acc1[p] = 0.f; }
+  uint4 a_l0, a_l1, a_hp, b_l0, b_l1, b_hp;
+  uint32_t a_sb = 0, b_sb = 0;
+  const bool has0 = li < ng;
+  if (has0) {
+    a_l0 = *(const uint4*)(row0 + li * 32);
+    a_l1 = *(const uint4*)(row0 + li * 32 + 16);
+    a_hp = *(const uint4*)(row0 + C / 2 + li * 16);
+    a_sb = *(const uint32_t*)(row0 + 3 * C / 4 + li * 4);
+    b_l0 = *(const uint4*)(row1 + li * 32);
+    b_l1 = *(const uint4*)(row1 + li * 32 + 16);
+    b_hp = *(const uint4*)(row1 + C / 2 + li * 16);
+    b_sb = *(const uint32_t*)(row1 + 3 * C / 4 + li * 4);
+  }
+  for (int g = li; g < ng; g += LPR) {
+    const uint4 al0 = a_l0, al1 = a_l1, ahp = a_hp, bl0 = b_l0, bl1 = b_l1, bhp = b_hp;
+    const uint32_t asb = a_sb, bsb = b_sb;
+    const int gn = g + LPR;
+    if (gn < ng) {
+      a_l0 = *(const uint4*)(row0 + gn * 32);
+      a_l1 = *(const uint4*)(row0 + gn * 32 + 16);
+      a_hp = *(const uint4*)(row0 + C / 2 + gn * 16);
+      a_sb = *(const uint32_t*)(row0 + 3 * C / 4 + gn * 4);
+      b_l0 = *(const uint4*)(row1 + gn * 32);
+      b_l1 = *(const uint4*)(row1 + gn * 32 + 16);
+      b_hp = *(const uint4*)(row1 + C / 2 + gn * 16);
+      b_sb = *(const uint32_t*)(row1 + 3 * C / 4 + gn * 4);
+    }
+    const float sca = __half2float(__ushort_as_half((unsigned short)(asb & 0xffffu)));
+    const float bia = __half2float(__ushort_as_half((unsigned short)(asb >> 16)));
+    const float scb = __half2float(__ushort_as_half((unsigned short)(bsb & 0xffffu)));
+    const float bib = __half2float(__ushort_as_half((unsigned short)(bsb >> 16)));
+    const uint32_t lw_a[8] = {al0.x, al0.y, al0.z, al0.w, al1.x, al1.y, al1.z, al1.w};
+    const uint32_t hw_a[4] = {ahp.x, ahp.y, ahp.z, ahp.w};
+    const uint32_t lw_b[8] = {bl0.x, bl0.y, bl0.z, bl0.w, bl1.x, bl1.y, bl1.z, bl1.w};
+    const uint32_t hw_b[4] = {bhp.x, bhp.y, bhp.z, bhp.w};
+    float dx0[P], sx0[P], dx1[P], sx1[P];
+#pragma unroll
+    for (int p = 0; p < P; p++) { dx0[p] = sx0[p] = 0.f; dx1[p] = sx1[p] = 0.f; }
+#pragma unroll
+    for (int i8 = 0; i8 < 8; i8++) {
+      float cf_a[8], cf_b[8];
+#pragma unroll
+      for (int e = 0; e < 8; e++) {
+        const uint32_t lo = (lw_a[i8] >> (4 * e)) & 15u;
+        const uint32_t hi = (hw_a[i8 >> 1] >> (2 * ((i8 & 1) * 8 + e))) & 3u;
+        cf_a[e] = (float)(lo | (hi << 4));
+        const uint32_t lob = (lw_b[i8] >> (4 * e)) & 15u;
+        const uint32_t hib = (hw_b[i8 >> 1] >> (2 * ((i8 & 1) * 8 + e))) & 3u;
+        cf_b[e] = (float)(lob | (hib << 4));
+      }
+#pragma unroll
+      for (int p = 0; p < P; p++) {
+        float xv[8];
+        hv2::ldx8(x + (size_t)p * xs + g * 64 + i8 * 8, xv);
+#pragma unroll
+        for (int e = 0; e < 8; e++) {
+          dx0[p] = fmaf(cf_a[e], xv[e], dx0[p]);
+          sx0[p] += xv[e];
+          dx1[p] = fmaf(cf_b[e], xv[e], dx1[p]);
+          sx1[p] += xv[e];
+        }
+      }
+    }
+#pragma unroll
+    for (int p = 0; p < P; p++) {
+      acc0[p] += sca * dx0[p] + bia * sx0[p];
+      acc1[p] += scb * dx1[p] + bib * sx1[p];
+    }
+  }
+#pragma unroll
+  for (int p = 0; p < P; p++) {
+#pragma unroll
+    for (int off = LPR / 2; off > 0; off >>= 1) {
+      acc0[p] += __shfl_xor(acc0[p], off, LPR);
+      acc1[p] += __shfl_xor(acc1[p], off, LPR);
+    }
+  }
+  if (li == 0)
+#pragma unroll
+    for (int p = 0; p < P; p++) {
+      y[(size_t)p * ys + r0] = acc0[p];
+      if (has1) y[(size_t)p * ys + r0 + 1] = acc1[p];
+    }
+}
+
 // aggr 10-05: split-K q6g64 GEMV for the K=10240 HC mix-down at P<=8. The
 // LPR=32 kernel ran 40 blocks (R=320 / 8 rows) with 5 serial groups per lane
 // (~192 us, latency-bound). Here blockIdx.y = K slice of gps groups; partial

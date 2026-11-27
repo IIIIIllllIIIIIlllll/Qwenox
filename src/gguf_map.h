@@ -124,6 +124,11 @@ inline uint16_t f2h(float f) {
 // requant (1.3-2.0x the bytes; decode GEMV is bandwidth-bound). The token
 // embedding stays q8g32 (gather kernels). Read by 26_kernels_dense_gguf.inc.
 inline bool g_native_dense = false;
+// QWENOX_GGUF_DENSE_Q6=1: dense matrices that would be requantized to q8g32
+// go to dtype 24 q6g64 instead (~0.76x the bytes; decode GEMV is
+// bandwidth-bound). The token embedding stays q8g32 (gather kernels), MTP
+// tensors keep q8g32. Consumed by the hgn v2 q6g64 kernels.
+inline bool g_dense_q6 = false;
 inline bool native_dense_ok(const std::string& name, const gguf::Tensor& t, const Map& blks) {
   if (!g_native_dense || !blks.empty() || name == "embed_tokens.weight") return false;
   if (!(t.type == gguf::Q4_K || t.type == gguf::Q5_K || t.type == gguf::Q6_K ||
@@ -134,6 +139,93 @@ inline bool native_dense_ok(const std::string& name, const gguf::Tensor& t, cons
   return be && t.ne[0] % be == 0 && t.row_bytes() % 4 == 0;  // GEMV stages dwords
 }
 
+// Any dense matrix -> dtype 24 q6g64: per 64-col group f16 scale + bias,
+// W = code * scale + bias, 6-bit codes packed as C/2 B low nibbles + C/4 B
+// high-2-bit plane; row stride align16(13 C / 16) (k_q6g64_* decode kernels).
+// Encoding mirrors tools/v2repro/v2enc.py q6g64_encode: scale candidates
+// (hi - lo) / 63 * {1.0 .. 0.85} in f16, least squared error per group.
+inline uint64_t q6g64_st(uint64_t C) { return (13 * C / 16 + 15) & ~15ull; }
+inline void add_q6(hgn::Checkpoint& ck, const std::string& name, const gguf::Tensor& t,
+                   std::initializer_list<uint64_t> dims, const Map& rows = {},
+                   const Map& blks = {}) {
+  uint32_t be, bb;
+  gguf::block_info(t.type, be, bb);
+  need(be != 0, name + " <- " + t.name + ": unsupported type " + gguf::type_name(t.type));
+  const uint64_t C = t.ne[0], R = t.rows(), nbs = C / 32, rb = t.row_bytes();
+  need(C % 32 == 0, name + ": cols not a multiple of 32");
+  const uint64_t Ro = rows.empty() ? R : rows.size();
+  const uint64_t nbo = blks.empty() ? nbs : blks.size(), Co = nbo * 32;
+  need(Co % 64 == 0, name + ": cols not a multiple of 64");
+  hgn::Tensor d = desc(name, 24, dims);
+  need(d.numel() == Ro * Co, name + ": shape mismatch vs " + t.name);
+  for (uint32_t r : rows) need(r < R, name + ": row map out of range");
+  for (uint32_t b : blks) need(b < nbs, name + ": block map out of range");
+  const uint64_t st = q6g64_st(Co), ng = Co / 64;
+  std::vector<uint8_t> buf(Ro * st);
+  static const float mults[6] = {1.0f, 0.97f, 0.94f, 0.91f, 0.88f, 0.85f};
+  par_for(Ro, [&](uint64_t r0, uint64_t r1) {
+    std::vector<float> f(Co);
+    for (uint64_t r = r0; r < r1; r++) {
+      if (blks.empty()) {
+        gguf::dequant_row(t.type, t.data + (uint64_t)(rows.empty() ? r : rows[r]) * rb,
+                          f.data(), C);
+      } else {
+        std::vector<float> tmp(C);
+        gguf::dequant_row(t.type, t.data + (uint64_t)(rows.empty() ? r : rows[r]) * rb,
+                          tmp.data(), C);
+        for (uint64_t b = 0; b < nbo; b++)
+          memcpy(f.data() + b * 32, tmp.data() + (uint64_t)blks[b] * 32, 32 * 4);
+      }
+      uint8_t* out = buf.data() + r * st;
+      uint8_t* lo4 = out;                    // [0, Co/2)
+      uint8_t* hi2 = out + Co / 2;           // [Co/2, 3Co/4)
+      uint8_t* sb = out + 3 * Co / 4;        // ng x (f16 scale, f16 bias)
+      for (uint64_t g = 0; g < ng; g++) {
+        const float* v = f.data() + g * 64;
+        float lo = v[0], hi = v[0];
+        for (int j = 1; j < 64; j++) {
+          lo = std::min(lo, v[j]);
+          hi = std::max(hi, v[j]);
+        }
+        float best_e = 0;
+        uint16_t best_s = 0, best_b = 0;
+        uint8_t best_q[64];
+        for (float m : mults) {
+          const uint16_t sh = f2h((hi - lo) / 63.f * m);
+          const uint16_t bh = f2h(lo);
+          const float sf = gguf::h2f(sh), bf = gguf::h2f(bh);
+          const float inv = sf > 0.f ? 1.f / sf : 0.f;
+          float e = 0.f;
+          uint8_t q[64];
+          for (int j = 0; j < 64; j++) {
+            const float c = std::max(0.f, std::min(63.f, std::nearbyint((v[j] - bf) * inv)));
+            q[j] = (uint8_t)c;
+            const float df = c * sf + bf - v[j];
+            e += df * df;
+          }
+          if (m == mults[0] || e < best_e) {
+            best_e = e;
+            best_s = sh;
+            best_b = bh;
+            memcpy(best_q, q, 64);
+          }
+        }
+        for (int j = 0; j < 32; j++)
+          lo4[g * 32 + j] = (best_q[2 * j] & 15) | ((best_q[2 * j + 1] & 15) << 4);
+        for (int j = 0; j < 16; j++)
+          hi2[g * 16 + j] = (uint8_t)((best_q[4 * j] >> 4) | ((best_q[4 * j + 1] >> 4) << 2) |
+                                      ((best_q[4 * j + 2] >> 4) << 4) |
+                                      ((best_q[4 * j + 3] >> 4) << 6));
+        memcpy(sb + g * 4, &best_s, 2);
+        memcpy(sb + g * 4 + 2, &best_b, 2);
+      }
+    }
+  }, 256);
+  fprintf(stderr, "gguf_map: %s <- %s requantized %s -> q6g64\n", name.c_str(), t.name.c_str(),
+          gguf::type_name(t.type));
+  put(ck, d, std::move(buf));
+}
+
 // Q8_0 [R][C] -> q8g32 [R'][C'] taking source row rows[r] (identity if empty)
 // and source 32-col block blks[b] (identity if empty). Other block types (the
 // UD-IQ4_XS lm_head is Q6_K) are dequantized (ggml semantics) and requantized
@@ -142,6 +234,21 @@ inline bool native_dense_ok(const std::string& name, const gguf::Tensor& t, cons
 inline void add_q8(hgn::Checkpoint& ck, const std::string& name, const gguf::Tensor& t,
                    std::initializer_list<uint64_t> dims, const Map& rows = {},
                    const Map& blks = {}) {
+  // Q6 dense opt-in: everything except the token embedding (gather kernels)
+  // and the MTP head goes to q6g64 instead of q8g32. Full conversion measured
+  // fastest end-to-end (30.46 ms/tok GPU vs 33.84 q8g32 vs 31.5 with the
+  // hyper_connection/shared_expert/ple/kv tensors kept on q8g32, gfx1151
+  // 2026-11-27): the q6g64 small-shape kernels' standalone-bench deficit
+  // (>96 MB cycling) does not reproduce in-situ.
+  if (g_dense_q6 && name != "embed_tokens.weight" && name.rfind("mtp.", 0) != 0) {
+    uint32_t be, bb;
+    gguf::block_info(t.type, be, bb);
+    const uint64_t Co = (blks.empty() ? t.ne[0] / 32 : blks.size()) * 32;
+    if (be != 0 && t.ne[0] % 32 == 0 && Co % 64 == 0) {
+      add_q6(ck, name, t, dims, rows, blks);
+      return;
+    }
+  }
   if (native_dense_ok(name, t, blks)) {
     const uint64_t C = t.ne[0], R = t.rows(), rb = t.row_bytes();
     const uint64_t Ro = rows.empty() ? R : rows.size();
