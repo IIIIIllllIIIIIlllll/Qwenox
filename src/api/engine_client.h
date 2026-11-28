@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -71,6 +72,7 @@ struct GenResult {
     int ng_rounds = 0;
     int ng_proposed = 0;
     int ng_accepted = 0;
+    std::optional<uint32_t> accepted;  // 明确上报的接受数，包含零；缺列时为空
 };
 
 // Called for every T line until cancellation. Return false to send `X <req>`

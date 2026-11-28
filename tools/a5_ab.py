@@ -176,7 +176,11 @@ def ngram_diff(a, b):
             continue
         if skip_rest:
             continue
-        if x != y:
+        xd, yd = x[3], y[3]
+        # 去掉耗时后旧 D 行有 13 列，新版多一列 accepted；仅在双方都有时比较它。
+        if {len(xd), len(yd)} == {13, 14}:
+            xd, yd = xd[:13], yd[:13]
+        if x[:3] != y[:3] or xd != yd:
             return i
     return None
 

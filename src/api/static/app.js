@@ -1531,7 +1531,7 @@ function acceptTitle(r) {
     parts.push("ngram " + fmtInt(r.ngram_accepted) + "/" + fmtInt(r.ngram_proposed) +
                " (" + fmtInt(r.ngram_rounds) + " " + t("req.accept_rounds") + ")");
   parts.push(t("req.accept_all") + " " + pct1(r.acceptance) + " (" +
-             fmtInt(Math.max(0, r.commit - r.rounds)) + "/" + fmtInt(r.proposed) + ")");
+             fmtInt(r.accepted ?? Math.max(0, r.commit - r.rounds)) + "/" + fmtInt(r.proposed) + ")");
   return parts.join(" · ");
 }
 

@@ -955,16 +955,16 @@ GenOutcome run_generation(GenSpec& spec,
             req_id, out.reason.c_str(), out.n_prompt, out.n_gen, out.ttft_ms,
             out.prefill_ms, out.decode_ms, out.n_cached,
             out.hit_stop ? " (stop)" : (out.client_gone ? " (client gone)" : ""));
-    if (out.rounds > 0) {
-        // all = every drafter; mtp = the draft head alone (n-gram rounds out)
-        const int acc = std::max(0, out.commit - out.rounds);
+    if (out.proposed > 0) {
+        // 合计覆盖所有起草器；草稿头的接受数扣除 n-gram 的份额。
+        const uint32_t acc = reqstat::accepted_count(r.accepted, out.commit, out.rounds);
         const int mtp_p = out.proposed - out.ng_proposed;
-        const int mtp_a = std::max(0, acc - out.ng_accepted);
+        const uint32_t mtp_a = acc - std::min(acc, (uint32_t)std::max(0, out.ng_accepted));
         fprintf(stderr,
                 "REQ %lld spec rounds=%d commit=%d proposed=%d acc=%.1f%% | mtp %.1f%% "
-                "(%d/%d) | ngram %.1f%% (%d/%d, %d rounds)\n",
+                "(%u/%d) | ngram %.1f%% (%d/%d, %d rounds)\n",
                 req_id, out.rounds, out.commit, out.proposed,
-                out.proposed ? 100.0 * acc / out.proposed : 0.0,
+                100.0 * acc / out.proposed,
                 mtp_p > 0 ? 100.0 * mtp_a / mtp_p : 0.0, mtp_a, mtp_p,
                 out.ng_proposed ? 100.0 * out.ng_accepted / out.ng_proposed : 0.0,
                 out.ng_accepted, out.ng_proposed, out.ng_rounds);
@@ -988,6 +988,7 @@ GenOutcome run_generation(GenSpec& spec,
         e.ng_rounds = (uint32_t)std::max(0, out.ng_rounds);
         e.ng_proposed = (uint32_t)std::max(0, out.ng_proposed);
         e.ng_accepted = (uint32_t)std::max(0, out.ng_accepted);
+        e.accepted = r.accepted;
         e.prefill_us = us(out.prefill_ms);
         e.decode_us = us(out.decode_ms);
         e.ttft_us = us(out.ttft_ms);
@@ -2548,9 +2549,8 @@ struct DraftSplit {
     uint32_t mtp_proposed = 0, mtp_accepted = 0;
     uint32_t ng_rounds = 0, ng_proposed = 0, ng_accepted = 0;
 };
-DraftSplit draft_split(const reqstat::QEntry& e) {
+DraftSplit draft_split(const reqstat::QEntry& e, uint32_t acc) {
     DraftSplit d;
-    const uint32_t acc = e.commit >= e.rounds ? e.commit - e.rounds : 0;
     const uint32_t drafter = (e.flags >> 4) & 0xF;  // 1 mtp, 3 ngram, 4 chain
     if (e.split) {
         d.known = true;
@@ -2614,10 +2614,10 @@ void handle_reqstat_summary(const http::Request& q, http::Response* r,
                 s.gen += e.n_gen;
                 s.decode_s += e.decode_us / 1e6;
                 if (e.proposed > 0) {
-                    const uint32_t acc = e.commit >= e.rounds ? e.commit - e.rounds : 0;
+                    const uint32_t acc = reqstat::accepted_count(e.accepted, e.commit, e.rounds);
                     s.proposed += e.proposed;
                     s.accepted += acc;
-                    const DraftSplit d = draft_split(e);
+                    const DraftSplit d = draft_split(e, acc);
                     if (d.known) {
                         s.split_requests++;
                         s.mtp_proposed += d.mtp_proposed;
@@ -2912,10 +2912,11 @@ json reqstat_record_json(const reqstat::QEntry& e) {
     o["proposed"] = e.proposed;
     o["commit"] = e.commit;
     o["rounds"] = e.rounds;
-    const uint32_t acc = e.commit >= e.rounds ? e.commit - e.rounds : 0;
+    const uint32_t acc = reqstat::accepted_count(e.accepted, e.commit, e.rounds);
+    o["accepted"] = acc;
     o["acceptance"] = e.proposed ? json(acc * 1.0 / e.proposed) : json(nullptr);
     // Draft head vs n-gram apart (null when an old record cannot tell).
-    const DraftSplit d = draft_split(e);
+    const DraftSplit d = draft_split(e, acc);
     const auto opt = [&](uint32_t v) { return d.known ? json(v) : json(nullptr); };
     o["mtp_proposed"] = opt(d.mtp_proposed);
     o["mtp_accepted"] = opt(d.mtp_accepted);

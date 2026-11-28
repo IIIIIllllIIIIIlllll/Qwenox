@@ -9,14 +9,14 @@
 //     ts_ms u64 | req_seq u64 | n_prompt u32 | n_cached u32 | n_gen u32 |
 //     proposed u32 | commit u32 | rounds u32 | prefill_us u32 | decode_us u32 |
 //     ttft_us u32 | flags u32 |
-//     v2: ng_rounds u32 | ng_proposed u32 | ng_accepted u32 | reserved u32 |
+//     v2: ng_rounds u32 | ng_proposed u32 | ng_accepted u32 | accepted_plus_one u32 |
 //         crc16 u16 (over bytes 0..71) | pad u16 | reserved u32
 //     v1: crc16 u16 (over bytes 0..55) | pad u16 | reserved u32
 //   flags: bits 0-3 finish (1 stop / 2 length / 3 cancel / 4 error),
 //          bits 4-7 drafter (0 serial / 1 mtp / 3 ngram / 4 chain), bit 8 vision.
-//   proposed / commit / rounds cover every drafter; ng_* are the n-gram
-//   (prompt lookup) rounds' share of them, so the draft head's own numbers are
-//   proposed - ng_proposed and (commit - rounds) - ng_accepted.
+//   proposed / commit / rounds 是全部起草轮的统计；ng_* 是 n-gram 的份额。
+//   v2 偏移 68 存 accepted + 1；0 表示旧记录或未知，不写入估算值。
+//   仅在读取未知值时用 max(0, commit - rounds) 估算已接受的草稿数。
 //   Version 1 files (no ng_* split) are still read; the writer only appends
 //   version 2 and rotates a version 1 reqstat.bin away on open.
 //
@@ -34,8 +34,14 @@
 // values allowed for testing).
 #pragma once
 #include <cstdint>
+#include <optional>
 
 namespace reqstat {
+
+inline uint32_t accepted_count(std::optional<uint32_t> accepted,
+                               uint32_t commit, uint32_t rounds) {
+  return accepted.value_or(commit > rounds ? commit - rounds : 0);
+}
 
 struct Entry {
   uint64_t ts_ms = 0;
@@ -52,7 +58,8 @@ struct Entry {
   uint32_t flags = 0;
   uint32_t ng_rounds = 0;    // n-gram rounds (subset of rounds)
   uint32_t ng_proposed = 0;  // drafts those rounds offered (subset of proposed)
-  uint32_t ng_accepted = 0;  // drafts they committed (subset of commit - rounds)
+  uint32_t ng_accepted = 0;  // n-gram 轮保留的草稿数
+  std::optional<uint32_t> accepted;  // 只存明确上报的接受数
 };
 
 // Record one completed request. Thread-safe; never throws. The record is on

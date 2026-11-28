@@ -98,6 +98,11 @@ bool unpack(const uint8_t* r, uint32_t recsz, QEntry* e) {
     e->ng_proposed = get32(r + 60);
     e->ng_accepted = get32(r + 64);
   }
+  const uint32_t accepted_plus_one = e->split ? get32(r + 68) : 0;
+  if (accepted_plus_one != 0)
+    e->accepted = accepted_plus_one - 1;
+  else
+    e->accepted.reset();
   e->ts_ms = get64(r + 0);
   e->req_seq = get64(r + 8);
   e->n_prompt = get32(r + 16);

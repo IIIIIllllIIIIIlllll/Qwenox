@@ -156,7 +156,7 @@ Agg aggregate(uint64_t t0, uint64_t t1, reqstat::ScanInfo* info) {
         if (e.proposed) {
           a.chain_n++;
           a.chain_prop += e.proposed;
-          a.chain_acc += e.commit - e.rounds;
+          a.chain_acc += reqstat::accepted_count(e.accepted, e.commit, e.rounds);
           if (e.split) {
             a.split_n++;
             a.ng_rounds += e.ng_rounds;
@@ -181,9 +181,19 @@ int v1_upgrade(const std::string& dir) {
   write_v1_file(dir + "/reqstat.bin", 10);
   set_env("QWENOX_REQSTAT_DIR", dir);
   set_env("QWENOX_REQSTAT_MAX_MB", "256");
-  for (int i = 0; i < 3; i++) reqstat::record(fixture_entry(1 + i));  // chain records
+  // 三条 v2 记录的 commit - rounds 都是 15，但只有第一条应使用估算值。
+  for (int i = 0; i < 3; i++) {
+    auto e = fixture_entry(1 + i);
+    if (i == 1) {
+      e.accepted = 0;
+      e.ng_accepted = 0;
+    } else if (i == 2) {
+      e.accepted = 7;
+    }
+    reqstat::record(e);
+  }
   check(fs::exists(dir + "/reqstat-000005.bin", ec), "v1 file kept as rotated reqstat-000005.bin");
-  bool v2_live = false;
+  bool v2_live = false, accepted_bytes = true;
   if (FILE* f = fopen((dir + "/reqstat.bin").c_str(), "rb")) {
     uint8_t h[16] = {};
     if (fread(h, 1, sizeof h, f) == sizeof h) {
@@ -194,9 +204,19 @@ int v1_upgrade(const std::string& dir) {
       memcpy(&seq, h + 12, 4);
       v2_live = ver == 2 && recsz == 80 && seq == 6;
     }
+    accepted_bytes = v2_live;
+    const uint8_t encoded[] = {0, 1, 8};
+    for (int i = 0; accepted_bytes && i < 3; i++) {
+      uint8_t actual[4];
+      const uint8_t expected[] = {encoded[i], 0, 0, 0};
+      accepted_bytes = fseek(f, 256 + i * 80 + 68, SEEK_SET) == 0 &&
+                       fread(actual, 1, sizeof actual, f) == sizeof actual &&
+                       memcmp(actual, expected, sizeof actual) == 0;
+    }
     fclose(f);
   }
   check(v2_live, "fresh live file is version 2, seq 6");
+  check(v2_live && accepted_bytes, "v2 偏移 68 存未知 0、精确零 1、精确 7 为 8（LE）");
   std::vector<reqstat::QEntry> out;
   reqstat::ScanInfo info;
   std::string err;
@@ -204,12 +224,22 @@ int v1_upgrade(const std::string& dir) {
   check(ok && out.size() == 13 && info.files_total == 2, "chain = 10 v1 + 3 v2 records");
   bool order = out.size() == 13;
   for (size_t i = 0; order && i < out.size(); i++)
-    order = i < 10 ? out[i].req_seq == 9000 + i && !out[i].split && out[i].proposed == 40
+    order = i < 10 ? out[i].req_seq == 9000 + i && !out[i].split && !out[i].accepted &&
+                         out[i].proposed == 40
                    : out[i].req_seq == i - 8 && out[i].split && out[i].ng_proposed == 16;
-  check(order, "v1 records read (no split), then v2 records (split)");
+  check(order, "v1 无拆分也无显式接受数，后接 v2 拆分记录");
+  check(out.size() == 13 && !out[10].accepted && out[11].accepted == 0u &&
+            out[12].accepted == 7u,
+        "tail 区分未知、精确零和精确非零");
+  uint64_t total = 0;
+  check(reqstat::page(0, 3, &out, &total, &info, &err) && total == 13 &&
+            out.size() == 3 && !out[0].accepted && out[1].accepted == 0u && out[2].accepted == 7u,
+        "page 读取相同的三种接受数");
   Agg a = aggregate(0, ~(uint64_t)0, &info);
   check(a.n == 13 && a.chain_prop == 13 * 40 && a.split_n == 3 && info.bad_crc == 0,
         "scan spans both record versions");
+  check(a.chain_acc == 11 * 15 + 0 + 7 && reqstat::accepted_count({}, 2, 3) == 0,
+        "scan 按显式值优先聚合，旧记录差值不小于零");
   fs::remove_all(dir, ec);
   return failures;
 }
@@ -327,7 +357,11 @@ int main(int argc, char** argv) {
   // Version 1 -> 2 upgrade, in a child process (fresh recorder).
   {
     const std::string vdir = (fs::temp_directory_path() / "reqstat_read_test_v1").string();
-    const std::string cmd = "\"" + std::string(argv[0]) + "\" --v1-upgrade \"" + vdir + "\"";
+    std::string cmd = "\"" + std::string(argv[0]) + "\" --v1-upgrade \"" + vdir + "\"";
+#ifdef _WIN32
+    // cmd /c 会剥掉命令首尾的一对引号，保留路径各自的引号。
+    cmd = '"' + cmd + '"';
+#endif
     check(std::system(cmd.c_str()) == 0, "v1 upgrade (child process)");
   }
   if (failures) {

@@ -88,6 +88,7 @@ class Recorder {
     put32(r + 56, e.ng_rounds);
     put32(r + 60, e.ng_proposed);
     put32(r + 64, e.ng_accepted);
+    if (e.accepted && *e.accepted < UINT32_MAX) put32(r + 68, *e.accepted + 1);
     put16(r + kCrcBytes, crc16(r, kCrcBytes));
   }
 
