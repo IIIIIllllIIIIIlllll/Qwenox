@@ -406,8 +406,10 @@ prefill 4-bit 加速（`MOE_A4`）借鉴了 warpfront 的 [hipfire](https://gith
 
 ngram 投机解码的起草思路与两级 prompt 缓存借鉴了开源项目 [llama.cpp](https://github.com/ggml-org/llama.cpp)（MIT 许可证），GGUF 权重与视觉塔（mmproj）直接复用 llama.cpp 的同一份文件；IQ3_S 码表取自 llama.cpp；ngram 声明详见 [NGRAM.md](docs/NGRAM.md) 的「来源与声明」一节。
 
-控制向量（refusal）的格式与参考向量来自 Cudecnik 的 [Qwen3.8-Flash-Next-refusal-projection](https://huggingface.co/Cudecnik/Qwen3.8-Flash-Next-refusal-projection)（Qwen Community License 1.0）；本仓库的 `refusal/qwen38-flash-next-refusal.gguf` 是该仓库参考向量的原样副本（上游 projection 与 additive 两个文件名内容相同，故只保留一份）。感谢作者公开标定结果与 llama.cpp 补丁。
+控制向量（refusal）来自 Cudecnik 的 [Qwen3.8-Flash-Next-refusal-projection](https://huggingface.co/Cudecnik/Qwen3.8-Flash-Next-refusal-projection)。`refusal/` 保留 projection 和 additive 两个文件的原样副本；两者内容相同。感谢作者公开标定结果与 llama.cpp 补丁。
 
 ## 许可证
 
 [AGPL-3.0](LICENSE)
+
+`refusal/` 中的控制向量按 [Qwen Community License 1.0](refusal/LICENSE) 分发。

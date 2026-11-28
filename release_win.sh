@@ -190,8 +190,11 @@ for f in start_win.exe launcher_settings.exe settings_win.exe qwenox-settings.ex
 done
 [[ -d docs ]] && cp -a docs "$OUT/"
 [[ -d media ]] && cp -a media "$OUT/"
-# 控制向量（refusal）：发行包默认附带，CVEC 开箱可用（见 docs/CVEC.md）。
-[[ -f refusal/qwen38-flash-next-refusal.gguf ]] || die "缺少 refusal/qwen38-flash-next-refusal.gguf"
+# 控制向量（refusal）：两个文件和共用许可证随发行包分发（见 docs/CVEC.md）。
+for f in refusal/qwen38-flash-next-refusal-projection.gguf \
+         refusal/qwen38-flash-next-refusal-additive.gguf refusal/LICENSE; do
+    [[ -s "$f" ]] || die "缺少或为空：$f"
+done
 cp -a refusal "$OUT/"
 
 cp -a "$TOK_DIR/tokenizer.json" "$OUT/data/tokenizer/"
