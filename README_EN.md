@@ -454,8 +454,10 @@ The 4-bit prefill speedup (`MOE_A4`) draws on warpfront's [hipfire](https://gith
 
 The ngram speculative drafting idea and the two-level prompt cache draw on [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT license); GGUF weights and the vision tower (mmproj) reuse the same files as llama.cpp, and the IQ3_S grid table comes from llama.cpp. See the "Attribution" section of [NGRAM_EN.md](docs/NGRAM_EN.md) for the ngram notice.
 
-The control-vector (refusal) format and reference vector come from Cudecnik's [Qwen3.8-Flash-Next-refusal-projection](https://huggingface.co/Cudecnik/Qwen3.8-Flash-Next-refusal-projection) (Qwen Community License 1.0); `refusal/qwen38-flash-next-refusal.gguf` in this repository is an unmodified copy of that reference vector (the upstream projection and additive filenames hold identical bytes, so only one copy is kept). Thanks to the author for publishing the calibration and patches.
+The refusal control vectors come from Cudecnik's [Qwen3.8-Flash-Next-refusal-projection](https://huggingface.co/Cudecnik/Qwen3.8-Flash-Next-refusal-projection). The two files in `refusal/` are unmodified copies of the upstream projection and additive files, which have identical contents. Thanks to the author for publishing the calibration and patches.
 
 ## License
 
 [AGPL-3.0](LICENSE)
+
+Control vectors in `refusal/` are distributed under the [Qwen Community License 1.0](refusal/LICENSE).

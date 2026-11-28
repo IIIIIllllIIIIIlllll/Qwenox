@@ -4,11 +4,14 @@ qwenox 可以加载 llama.cpp 格式的控制向量 GGUF，在每层 hyper-conne
 **投影消融**（project）或**加法引导**（add）。向量不修改权重，启动时决定，运行期零额外开销
 （关闭时）或每层一次残差读写（开启时）。
 
-参考向量：[Cudecnik/Qwen3.8-Flash-Next-refusal-projection](https://huggingface.co/Cudecnik/Qwen3.8-Flash-Next-refusal-projection)
-（`Qwen3.8-Flash-Next-refusal-projection.gguf`，约 480 KB；参考实现在 Cudila/llama.cpp 的
-`cvec-hooks` 分支）。qwenox 的语义、层映射和参数与它对齐。本仓库在
-`refusal/qwen38-flash-next-refusal.gguf` 保留一份原样副本；上游 projection 与 additive
-两个文件逐字节相同，因此只保留一份。
+参考向量来自 [Cudecnik/Qwen3.8-Flash-Next-refusal-projection](https://huggingface.co/Cudecnik/Qwen3.8-Flash-Next-refusal-projection)，
+参考实现在 Cudila/llama.cpp 的 `cvec-hooks` 分支。本仓库保留两份原样副本：
+
+- `project`：`refusal/qwen38-flash-next-refusal-projection.gguf`
+- `add`：`refusal/qwen38-flash-next-refusal-additive.gguf`
+
+两个文件逐字节相同，文件名用于区分用途，共用 [Qwen Community License 1.0](../refusal/LICENSE)。
+如果配置里仍引用旧的 `refusal/qwen38-flash-next-refusal.gguf`，请按模式改为对应的新文件名。
 
 ## 开启方法
 
@@ -40,7 +43,7 @@ Windows 设置面板、终端设置（`bash build.sh settings`）与网页启动
 启动日志确认加载成功：
 
 ```text
-qwenox: cvec refusal/qwen38-flash-next-refusal.gguf: mode=project dir=per-layer layers=4..44 scale=1, 41/41 directions (norm 0.999998..1.000001)
+qwenox: cvec refusal/qwen38-flash-next-refusal-projection.gguf: mode=project dir=per-layer layers=4..44 scale=1, 41/41 directions (norm 0.999998..1.000001)
 ```
 
 没有这一行就是没加载（`--check` 也会打印 `ENV QWENOX_CVEC=…`）。
