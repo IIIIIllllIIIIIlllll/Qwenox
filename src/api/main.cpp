@@ -2549,9 +2549,8 @@ struct DraftSplit {
     uint32_t mtp_proposed = 0, mtp_accepted = 0;
     uint32_t ng_rounds = 0, ng_proposed = 0, ng_accepted = 0;
 };
-DraftSplit draft_split(const reqstat::QEntry& e) {
+DraftSplit draft_split(const reqstat::QEntry& e, uint32_t acc) {
     DraftSplit d;
-    const uint32_t acc = e.commit >= e.rounds ? e.commit - e.rounds : 0;
     const uint32_t drafter = (e.flags >> 4) & 0xF;  // 1 mtp, 3 ngram, 4 chain
     if (e.split) {
         d.known = true;
@@ -2615,10 +2614,10 @@ void handle_reqstat_summary(const http::Request& q, http::Response* r,
                 s.gen += e.n_gen;
                 s.decode_s += e.decode_us / 1e6;
                 if (e.proposed > 0) {
-                    const uint32_t acc = e.commit >= e.rounds ? e.commit - e.rounds : 0;
+                    const uint32_t acc = reqstat::accepted_count(e.accepted, e.commit, e.rounds);
                     s.proposed += e.proposed;
                     s.accepted += acc;
-                    const DraftSplit d = draft_split(e);
+                    const DraftSplit d = draft_split(e, acc);
                     if (d.known) {
                         s.split_requests++;
                         s.mtp_proposed += d.mtp_proposed;
@@ -2913,10 +2912,11 @@ json reqstat_record_json(const reqstat::QEntry& e) {
     o["proposed"] = e.proposed;
     o["commit"] = e.commit;
     o["rounds"] = e.rounds;
-    const uint32_t acc = e.commit >= e.rounds ? e.commit - e.rounds : 0;
+    const uint32_t acc = reqstat::accepted_count(e.accepted, e.commit, e.rounds);
+    o["accepted"] = acc;
     o["acceptance"] = e.proposed ? json(acc * 1.0 / e.proposed) : json(nullptr);
     // Draft head vs n-gram apart (null when an old record cannot tell).
-    const DraftSplit d = draft_split(e);
+    const DraftSplit d = draft_split(e, acc);
     const auto opt = [&](uint32_t v) { return d.known ? json(v) : json(nullptr); };
     o["mtp_proposed"] = opt(d.mtp_proposed);
     o["mtp_accepted"] = opt(d.mtp_accepted);
