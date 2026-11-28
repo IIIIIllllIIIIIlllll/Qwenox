@@ -51,12 +51,13 @@ SCN = [('s1', 'A', 8, 1, ''), ('s2', 'Q2', 96, 1, ''), ('s3', 'B', 8, 1, ''),
 
 
 def acc(r):
-    # stats = [drafter, rounds, commit, n_cached, proposed]; committed drafts =
-    # commit - rounds (each round also emits the verify/bonus token)
-    d, rounds, commit, _, prop = r['stats']
+    _, rounds, commit, _, prop = r['stats']
     if not rounds or not prop:
         return None
-    return (commit - rounds) / prop
+    # D 行末尾是精确接受数；旧引擎和旧结果没有这一列时才估算。
+    cols = r.get('done', '').split()
+    accepted = int(cols[15]) if len(cols) > 15 else max(0, commit - rounds)
+    return accepted / prop
 
 
 def run(tag):

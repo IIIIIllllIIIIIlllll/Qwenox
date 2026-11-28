@@ -15,8 +15,8 @@ import sys
 
 MAGIC = 0x47525153  # "GRQS"
 HSZ = 256
-# 记录版本：1 = 64B（crc 覆盖 0..55）；2 = 80B，多 ng_rounds/ng_proposed/ng_accepted
-# （ngram 轮在 proposed / commit-rounds 里的份额，crc 覆盖 0..71）。
+# 记录版本：1 = 64B（CRC 覆盖 0..55）；2 = 80B（CRC 覆盖 0..71），
+# 含 n-gram 拆分字段，偏移 68 存 accepted + 1（0 表示未知）。
 REC_V = {
     1: (64, 56, struct.Struct("<QQ10IHHI")),
     2: (80, 72, struct.Struct("<QQ10I3IIHHI")),
@@ -66,11 +66,13 @@ class StatFile:
             "ts": f[0], "seq": f[1], "prompt": f[2], "cached": f[3],
             "gen": f[4], "proposed": f[5], "commit": f[6], "rounds": f[7],
             "prefill_us": f[8], "decode_us": f[9], "ttft_us": f[10],
-            "flags": f[11], "split": self.ver >= 2,
+            "flags": f[11], "split": self.ver >= 2, "accepted": None,
             "ng_rounds": 0, "ng_proposed": 0, "ng_accepted": 0,
         }
         if self.ver >= 2:
             r["ng_rounds"], r["ng_proposed"], r["ng_accepted"] = f[12], f[13], f[14]
+            if f[15]:
+                r["accepted"] = f[15] - 1
         return r
 
     def lower_bound(self, ts_ms):
@@ -129,6 +131,14 @@ def iter_range(files, t0, t1):
             yield r
 
 
+def accepted_count(r):
+    return r["accepted"] if r["accepted"] is not None else max(0, r["commit"] - r["rounds"])
+
+
+def ngram_counts(r, accepted):
+    return min(r["ng_proposed"], r["proposed"]), min(r["ng_accepted"], accepted)
+
+
 def summarize(recs, label):
     recs = list(recs)
     n = len(recs)
@@ -165,15 +175,19 @@ def summarize(recs, label):
         if not sub:
             continue
         prop = sum(r["proposed"] for r in sub)
-        acc = sum(r["commit"] - r["rounds"] for r in sub)
+        acc = sum(accepted_count(r) for r in sub)
         line = (f"  {dname}: {len(sub)} 请求，接受率 {100.0 * acc / prop:.1f}%"
                 f"（{acc:,}/{prop:,}）")
         sp = [r for r in sub if r["split"]]
         if sp:  # 草稿头 / ngram 分开（v2 记录）
-            ngp = sum(r["ng_proposed"] for r in sp)
-            nga = sum(r["ng_accepted"] for r in sp)
-            mp = sum(r["proposed"] for r in sp) - ngp
-            ma = sum(r["commit"] - r["rounds"] for r in sp) - nga
+            ngp = nga = mp = ma = 0
+            for r in sp:
+                a = accepted_count(r)
+                np, na = ngram_counts(r, a)
+                ngp += np
+                nga += na
+                mp += r["proposed"] - np
+                ma += a - na
             line += (f"；MTP {100.0 * ma / mp:.1f}%（{ma:,}/{mp:,}）" if mp else "；MTP -")
             line += (f" ngram {100.0 * nga / ngp:.1f}%（{nga:,}/{ngp:,}）" if ngp else " ngram -")
             if len(sp) < len(sub):
@@ -207,16 +221,13 @@ def main():
             t = dt.datetime.fromtimestamp(r["ts"] / 1000, dt.timezone.utc)
             fin = FINISH.get(r["flags"] & 0xF, "?")
             dr = DRAFTER.get(r["flags"] >> 4 & 0xF, "?")
-            acc = (
-                f" acc={100.0 * (r['commit'] - r['rounds']) / r['proposed']:.0f}%"
-                if r["proposed"] else ""
-            )
+            accepted = accepted_count(r)
+            acc = f" acc={100.0 * accepted / r['proposed']:.0f}%" if r["proposed"] else ""
             if r["proposed"] and r["split"]:
-                mp = r["proposed"] - r["ng_proposed"]
-                ma = r["commit"] - r["rounds"] - r["ng_accepted"]
+                np, na = ngram_counts(r, accepted)
+                mp, ma = r["proposed"] - np, accepted - na
                 acc += f" mtp={100.0 * ma / mp:.0f}%" if mp else " mtp=-"
-                acc += (f" ngram={100.0 * r['ng_accepted'] / r['ng_proposed']:.0f}%"
-                        f"({r['ng_accepted']}/{r['ng_proposed']})" if r["ng_proposed"] else "")
+                acc += f" ngram={100.0 * na / np:.0f}%({na}/{np})" if np else ""
             print(
                 f"{t:%Y-%m-%d %H:%M:%S} req={r['seq']} {fin:6s} {dr:6s} "
                 f"prompt={r['prompt']}(命中{r['cached']}) gen={r['gen']} "
