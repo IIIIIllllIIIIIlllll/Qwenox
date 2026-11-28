@@ -9,6 +9,7 @@
 #pragma once
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -33,6 +34,7 @@ struct QEntry {
   uint32_t ng_rounds = 0;
   uint32_t ng_proposed = 0;
   uint32_t ng_accepted = 0;
+  std::optional<uint32_t> accepted;  // 旧记录或未知时为空，区别于精确的零
 };
 
 struct ScanInfo {

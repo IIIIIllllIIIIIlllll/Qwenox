@@ -17,6 +17,7 @@
 
 #include <cerrno>
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -475,6 +476,14 @@ GenResult EngineClient::generate(const GenParams& p, const TokenFn& on_token,
             out.ng_rounds = (int)num(10, 0);
             out.ng_proposed = (int)num(11, 0);
             out.ng_accepted = (int)num(12, 0);
+            if (f.size() > 13) {
+                const auto& field = f[13];
+                const char* end = field.data() + field.size();
+                uint32_t accepted = 0;
+                const auto parsed = std::from_chars(field.data(), end, accepted);
+                if (parsed.ec == std::errc{} && parsed.ptr == end && accepted < UINT32_MAX)
+                    out.accepted = accepted;
+            }
             return out;
         }
         // PONG / I / C / anything else: not ours, drop.
