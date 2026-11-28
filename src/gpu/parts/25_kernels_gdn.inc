@@ -1458,7 +1458,7 @@ k_gdn_fused(const float* __restrict__ qkv, const float* __restrict__ gb,
       s_gcum[tid] = (t0 + tid < P) ? gb[(size_t)(t0 + tid) * 48 + h] : 0.f;
       s_bb[tid] = (t0 + tid < P) ? bb[(size_t)(t0 + tid) * 48 + h] : 0.f;
     }
-    __syncthreads();
+    gwmma_sync();
     if (tid == 0) {
       float acc = 0.f;
       for (int i = 0; i < CH; i++) {
@@ -1466,7 +1466,7 @@ k_gdn_fused(const float* __restrict__ qkv, const float* __restrict__ gb,
         s_gcum[i] = acc;
       }
     }
-    __syncthreads();
+    gwmma_sync();
     const float glast = s_gcum[CH - 1];
     if (tid < CH) {
       s_eg[tid] = expf(s_gcum[tid]);
@@ -1494,7 +1494,7 @@ k_gdn_fused(const float* __restrict__ qkv, const float* __restrict__ gb,
         s_attn16[r][col] = gdn2_f2h(a);
       }
     }
-    __syncthreads();
+    gwmma_sync();
     // ---- P2: ut5 solve, verbatim from k_gdn_intra ----
     {
       const int g = tid >> 8, el = tid & 255;
@@ -1512,10 +1512,10 @@ k_gdn_fused(const float* __restrict__ qkv, const float* __restrict__ gb,
             value += __shfl_sync(~0ull, pair, gg, 16);
           if (i == mg && col < i) solved = value;
         }
-        __syncthreads();
+        gwmma_sync();
         if (col < mg) s_attn16[base + mg][base + col] = gdn2_f2h(solved);
       }
-      __syncthreads();
+      gwmma_sync();
       if (g < 3) {
         const int j = g + 1, b = g;
         float a[16];
@@ -1527,7 +1527,7 @@ k_gdn_fused(const float* __restrict__ qkv, const float* __restrict__ gb,
           u += a[n] * gdn2_h2f(s_attn16[b * 16 + n][b * 16 + ec]);
         s_extra[g * 256 + el] = u;
       }
-      __syncthreads();
+      gwmma_sync();
       if (g < 3) {
         const int j = g + 1, b = g;
         float sj[16];
@@ -1539,7 +1539,7 @@ k_gdn_fused(const float* __restrict__ qkv, const float* __restrict__ gb,
           t += sj[m] * s_extra[g * 256 + m * 16 + ec];
         s_extra[1024 + (j * (j - 1) / 2 + b) * 256 + el] = t;
       }
-      __syncthreads();
+      gwmma_sync();
       if (g < 2) {
         const int j = g + 2, b = g;
         float a0[16], a1[16];
@@ -1556,7 +1556,7 @@ k_gdn_fused(const float* __restrict__ qkv, const float* __restrict__ gb,
         }
         s_extra[g * 256 + el] = u;
       }
-      __syncthreads();
+      gwmma_sync();
       if (g < 2) {
         const int j = g + 2, b = g;
         float sj[16];
@@ -1568,7 +1568,7 @@ k_gdn_fused(const float* __restrict__ qkv, const float* __restrict__ gb,
           t += sj[m] * s_extra[g * 256 + m * 16 + ec];
         s_extra[1024 + (j * (j - 1) / 2 + b) * 256 + el] = t;
       }
-      __syncthreads();
+      gwmma_sync();
       if (g == 0) {
         float a0[16], a1[16], a2[16];
 #pragma unroll
@@ -1586,7 +1586,7 @@ k_gdn_fused(const float* __restrict__ qkv, const float* __restrict__ gb,
         }
         s_extra[el] = u;
       }
-      __syncthreads();
+      gwmma_sync();
       if (g == 0) {
         float sj[16];
 #pragma unroll
@@ -1597,7 +1597,7 @@ k_gdn_fused(const float* __restrict__ qkv, const float* __restrict__ gb,
           t += sj[m] * s_extra[m * 16 + ec];
         s_extra[1024 + 3 * 256 + el] = t;
       }
-      __syncthreads();
+      gwmma_sync();
       for (int j = 1; j < 4; j++)
         for (int b = 0; b < j; b++) {
           const int tl = j * (j - 1) / 2 + b;
@@ -1606,9 +1606,9 @@ k_gdn_fused(const float* __restrict__ qkv, const float* __restrict__ gb,
                 gdn2_f2h(s_extra[1024 + tl * 256 + e]);
         }
     }
-    __syncthreads();
+    gwmma_sync();
     if (tid < CH) s_attn16[tid][tid] = gdn2_f2h(gdn2_h2f(s_attn16[tid][tid]) + 1.f);
-    __syncthreads();
+    gwmma_sync();
     // ---- P3a: ks = k16 @ S16T and qS = q @ S16T (WMMA) ----
     // fp32 S stays register-resident; an fp16 transposed copy S16T[dc][j]
     // is staged into s_extra one j-quarter (32) at a time. Each warp owns
@@ -1628,7 +1628,7 @@ k_gdn_fused(const float* __restrict__ qkv, const float* __restrict__ gb,
       gdn2_floatx8 kacc = {0, 0, 0, 0, 0, 0, 0, 0};
       gdn2_floatx8 qacc = {0, 0, 0, 0, 0, 0, 0, 0};
       for (int qt = 0; qt < 4; qt++) {
-        __syncthreads();  // previous quarter's WMMA done with s_extra
+        gwmma_sync();  // previous quarter's WMMA done with s_extra
 #pragma unroll
         for (int t = 0; t < 2; t++) {
           const int mt = m0 + t * 64;
@@ -1641,7 +1641,7 @@ k_gdn_fused(const float* __restrict__ qkv, const float* __restrict__ gb,
                 *(const uint4*)tmp;
           }
         }
-        __syncthreads();
+        gwmma_sync();
         const uint16_t* brow = s16 + (c0 + (lane & 15)) * 32;
 #pragma unroll
         for (int kk = 0; kk < 2; kk++) {
@@ -1676,7 +1676,7 @@ k_gdn_fused(const float* __restrict__ qkv, const float* __restrict__ gb,
         qsc[e] = qacc[e];
       }
     }
-    __syncthreads();  // S16T B-frag reads done; ksc/qsc complete
+    gwmma_sync();  // S16T B-frag reads done; ksc/qsc complete
     // attn2 write goes straight after this barrier; the P3b/P3c barriers
     // below order it before S2 reads it, and S3's first staging barrier
     // orders it before s_extra is reused as ktd.
@@ -1702,7 +1702,7 @@ k_gdn_fused(const float* __restrict__ qkv, const float* __restrict__ gb,
 #pragma unroll
       for (int e = 0; e < 8; e++)
         vv[e] = s_v16[r0 + (lane < 16 ? e : 8 + e)][dc2];
-      __syncthreads();  // all v reads done before WT overwrites the tile
+      gwmma_sync();  // all v reads done before WT overwrites the tile
       uint16_t* WT = (uint16_t*)s_v16;  // [128 dc][72 l]
 #pragma unroll
       for (int e = 0; e < 8; e++) {
@@ -1711,7 +1711,7 @@ k_gdn_fused(const float* __restrict__ qkv, const float* __restrict__ gb,
             gdn2_f2h(s_bb[l] * (gdn2_h2f(vv[e]) - s_eg[l] * ksc[e]));
       }
     }
-    __syncthreads();  // WT complete
+    gwmma_sync();  // WT complete
     // ---- P3c: vnT[dc][r] = sum_l WT[dc][l] * attn16[r][l] (WMMA) ----
     {
       const uint16_t* WT = (const uint16_t*)s_v16;
@@ -1728,7 +1728,7 @@ k_gdn_fused(const float* __restrict__ qkv, const float* __restrict__ gb,
 #pragma unroll
       for (int e = 0; e < 8; e++) vnc[e] = acc[e];
     }
-    __syncthreads();  // WT reads done before vnT overwrites the tile
+    gwmma_sync();  // WT reads done before vnT overwrites the tile
     {
       uint16_t* vnT = (uint16_t*)s_v16;  // [128 dc][72 r]
       const int m0 = (warp >> 2) * 16, n0 = (warp & 3) * 16;
@@ -1739,7 +1739,7 @@ k_gdn_fused(const float* __restrict__ qkv, const float* __restrict__ gb,
         vnT[dcw * 72 + rw] = gdn2_f2h(vnc[e]);
       }
     }
-    __syncthreads();  // vnT ready; s_attn16 reusable
+    gwmma_sync();  // vnT ready; s_attn16 reusable
     // ---- S2: out[r][dc] = eg_r*qS[r][dc] + (attn2 @ vnT)[r][dc] ----
     // o2 via WMMA (32 warps, one 16x16 tile each; B-frags = vnT rows, contig
     // r); qS C-frags from P3a share the same tile layout -> single write.
@@ -1766,7 +1766,7 @@ k_gdn_fused(const float* __restrict__ qkv, const float* __restrict__ gb,
               s_eg[r] * qsc[e] + acc[e];
       }
     }
-    __syncthreads();  // out complete; vnT still live for S3
+    gwmma_sync();  // out complete; vnT still live for S3
     // ---- S3: S[j][dc] = S*egl + sum_r kTdecay[j][r] * vnT[dc][r] ----
     // WMMA accumulate straight into the persistent S C-fragments. A = kT
     // (transposed k16, decay folded in) staged one r-quarter (16) at a time
@@ -1785,7 +1785,7 @@ k_gdn_fused(const float* __restrict__ qkv, const float* __restrict__ gb,
         const int j = i >> 4, r = i & 15;
         ktd[j * 16 + r] = gdn2_f2h(gdn2_h2f(s_k16[r][j]) * s_beta[r]);
       }
-      __syncthreads();
+      gwmma_sync();
       for (int qt = 0; qt < 4; qt++) {
         if (qt + 1 < 4) {
           uint16_t* nb = ktd + ((qt + 1) & 1) * DK * 16;
@@ -1804,10 +1804,10 @@ k_gdn_fused(const float* __restrict__ qkv, const float* __restrict__ gb,
                                                          Sr0);
         Sr1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(gdn2_ld16(arow1), b,
                                                          Sr1);
-        if (qt + 1 < 4) __syncthreads();
+        if (qt + 1 < 4) gwmma_sync();
       }
     }
-    __syncthreads();  // k16/vn reads done before next chunk's staging
+    gwmma_sync();  // k16/vn reads done before next chunk's staging
   }
 #pragma unroll
   for (int e = 0; e < 8; e++) {

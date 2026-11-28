@@ -582,6 +582,7 @@ struct GpuModel {
   }
   bool prefill_fused = getenv("QWENOX_PREFILL_UNFUSED") == nullptr;
   bool gr_bf16 = getenv("QWENOX_GR_BF16") != nullptr && prefill_fused;
+  bool hc_skip_xb_f32_ = false;
   bool gr_scatter_norm = getenv("QWENOX_GR_SCATTER_NORM") != nullptr || gr_bf16;
   // Independent of QWENOX_QSA_DENSE: dense used to force atomic MoE (and so lose
   // MoE_LT), which made it 2x slower in MoE and not a clean attention-only A/B.
@@ -4918,11 +4919,10 @@ struct GpuModel {
                   xp, wp, y, P, (int)K, (int)N, 1);
         else if (gemm_splitk_on() && P >= 8192 && d_skx) {
           // B3 split-K：X 重排成 2 个连续 K=3072 切片（W 维持原布局 strided
-          // 读），slice0 写 Y，slice1 Epi=3 原子加。16K 下单 GEMM 省 ~1.5 ms
-          //（proto x1.13 扣除 repack 0.23 ms）。P<8192 收益消失（x1.01）。
+          // 读），slice0 写 Y，slice1 Epi=3 顺序加。T2b: 若上游已直写 d_skx 则免重排。
           const int ks = 3072;
           const unsigned grid = (unsigned)(((P + 63) / 64) * 20);
-          k_splitk_repack2<<<1024, 256, 0, g_str>>>(xp, d_skx, P, (int)K);
+          if (xp != d_skx) k_splitk_repack2<<<1024, 256, 0, g_str>>>(xp, d_skx, P, (int)K);
           k_gemm_wmma<64, 128, 2, 2, 2, 4, 64, 128>
               <<<grid, 128, 0, g_str>>>(d_skx, wp, y, P, ks, (int)N, 1,
                                         nullptr, nullptr, nullptr, nullptr, 0,
@@ -5216,7 +5216,7 @@ struct GpuModel {
     // still bit-identical (K accumulation order is tile-independent).
     const unsigned grid = (unsigned)(((P + 127) / 128) * (int)(N / 128));
     k_gemm_wmma<128, 128, 4, 2, 2, 4, 32, 256, 1><<<grid, 256, 0, g_str>>>(
-        d_xbf16b, wp, d_xb, P, (int)K, (int)N, 2,
+        d_xbf16b, wp, hc_skip_xb_f32_ ? nullptr : d_xb, P, (int)K, (int)N, 2,
         sc ? (const uint16_t*)d_Rb : d_Rhatbf16, d_xbf16, sc, hw);
     if (prof)
       p_gemm += std::chrono::duration<double, std::milli>(
@@ -5861,14 +5861,24 @@ struct GpuModel {
       npu_z_pend_finish(l, P, xb, zb);  // M3：conv+scan 已盖过 NPU，收尾 z
 #endif
       KP_SUB("gdn:norm");
-      k_gdn_gatednorm_b<true><<<dim3(48, (P + 31) / 32), 128, 0, g_str>>>(
-          convb + 4096, zb, gnw, nullptr, g_cfg.norm_eps, 10240, 6144,
-          xbf16b, P);
+      static const bool sk_fuse = !env_zero("QWENOX_SPLITK_FUSE");
+      static const bool sk_gemm_ok = getenv("QWENOX_GEMM_WMMA") != nullptr &&
+                                     getenv("QWENOX_GEMM_RB") == nullptr &&
+                                     getenv("QWENOX_GEMM_NO_K64") == nullptr;
+      const bool gdn_sk2 = !state_only && sk_fuse && sk_gemm_ok && gemm_splitk_on() &&
+                           P >= 8192 && d_skx && !getenv("QWENOX_VGDUMP");
+      uint16_t* const gdn_op_in = gdn_sk2 ? d_skx : xbf16b;
+      if (gdn_sk2)
+        k_gdn_gatednorm_b<true, true><<<dim3(48, (P + 31) / 32), 128, 0, g_str>>>(
+            convb + 4096, zb, gnw, nullptr, g_cfg.norm_eps, 10240, 6144, gdn_op_in, P);
+      else
+        k_gdn_gatednorm_b<true><<<dim3(48, (P + 31) / 32), 128, 0, g_str>>>(
+            convb + 4096, zb, gnw, nullptr, g_cfg.norm_eps, 10240, 6144, gdn_op_in, P);
       KP_SUB_END();
       vgd_g("gs", convb, (size_t)P * 10240 * 4);
       // d_xbf16b rows are 48*128 = 6144 bf16 (gatednorm writes (t*48+h)*128).
       vgd_g("gz", xbf16b, (size_t)P * 6144 * 2);
-      if (!state_only) gdn_proj_out_b(l, P, convb, yb, xbf16b);
+      if (!state_only) gdn_proj_out_b(l, P, convb, yb, gdn_op_in);
       vgd_g("go", yb, (size_t)P * 2560 * 4);
       return;
     }
@@ -7192,9 +7202,21 @@ struct GpuModel {
         npu_qg_finish_g(l);  // M4：qsa:flash 已跑完，收尾 gate 半
 #endif
         const uint64_t n4 = (uint64_t)P * 6144 / 4;
-        k_sigmoid_gate_bf16_v4<<<(unsigned)((n4 + 255) / 256), 256, 0, g_str>>>(
-            attnb, qgb, xbf16b, n4);
-        attn_bf = xbf16b;
+        static const bool sk_fuse_q = !env_zero("QWENOX_SPLITK_FUSE");
+        static const bool sk_gemm_ok_q = getenv("QWENOX_GEMM_WMMA") != nullptr &&
+                                         getenv("QWENOX_GEMM_RB") == nullptr &&
+                                         getenv("QWENOX_GEMM_NO_K64") == nullptr;
+        const bool qsa_sk2 = !state_only && sk_fuse_q && sk_gemm_ok_q && gemm_splitk_on() &&
+                             P >= 8192 && d_skx;
+        if (qsa_sk2) {
+          k_sigmoid_gate_bf16_v4<true><<<(unsigned)((n4 + 255) / 256), 256, 0, g_str>>>(
+              attnb, qgb, d_skx, n4, P);
+          attn_bf = d_skx;
+        } else {
+          k_sigmoid_gate_bf16_v4<<<(unsigned)((n4 + 255) / 256), 256, 0, g_str>>>(
+              attnb, qgb, xbf16b, n4);
+          attn_bf = xbf16b;
+        }
       } else {
         k_sigmoid_gate<<<(P * 6144 + 255) / 256, 256, 0, g_str>>>(attnb, gsb,
                                                                   attnb, P * 6144);
@@ -8081,6 +8103,8 @@ struct GpuModel {
                   a4m, a4_up ? "up " : "", a4_dn ? "down" : "");
         }
       }
+      static const bool a4_opt = !env_zero("QWENOX_MOE_A4_OPT");
+      static const bool a4_fuse_dn = !env_zero("QWENOX_MOE_A4_FUSE_DN");
       static const bool moe_mt_env = !env_zero("QWENOX_MOE_MT");
       const bool mt = moe_mt_env && !a4 && (int64_t)P * k >= 80 * E;
       // Hybrid tiling (10-14, default on, QWENOX_MOE_HYB=0 = the mt/64 rule
@@ -8105,16 +8129,28 @@ struct GpuModel {
       __half* x16 = (__half*)d_xbf16b;
       __half* hid = (__half*)d_hidb;
       KP("moe:rot_in");
-      v2_rot(d_xb, d, x16, d, gu.suh, nullptr, d, P, true);
+      if (a4_up && a4_opt) {
+        const unsigned waves = (unsigned)P * (d / 128);
+        k_v2_rot_a4<<<(waves + 7) / 8, 256, 0, g_str>>>(d_xb, d, d_a4x, d_a4xs, gu.suh, d, P);
+      } else {
+        v2_rot(d_xb, d, x16, d, gu.suh, nullptr, d, P, true);
+      }
       KP("moe:up");
       // up + mid fused (方向 3): hid = fwht(silu(g)*u*suh) 直接落盘，
       // 省掉 guv16 的写读往返和 k_i4r_mid 那次 launch，数学逐位一致。
+      const bool fused_dn_q = a4_opt && a4_up && a4_dn && a4_fuse_dn;
       if (a4_up) {
-        k_quant_a4<<<(unsigned)(((size_t)P * (d / 128) + 7) / 8), 256, 0, g_str>>>(x16, P, d, d_a4x,
-                                                                                  d_a4xs);
+        if (!a4_opt)
+          k_quant_a4<<<(unsigned)(((size_t)P * (d / 128) + 7) / 8), 256, 0, g_str>>>(
+              x16, P, d, d_a4x, d_a4xs);
         const Iu4W qgu{gu.data, gu.data + gu.rows * gu.cols / 2, 2 * mid, mid};
-        k_moe_iu4<true><<<dim3(mid / 128, max_tiles), 256, 0, g_str>>>(
-            qgu, d_a4x, d_a4xs, d_tokidx, d_moetiles, d_moentiles, hid, mid, d, gu.svh, dn.suh);
+        if (fused_dn_q)
+          k_moe_iu4<true, false, true><<<dim3(mid / 128, max_tiles), 256, 0, g_str>>>(
+              qgu, d_a4x, d_a4xs, d_tokidx, d_moetiles, d_moentiles, hid, mid, d, gu.svh, dn.suh,
+              d_a4h, d_a4hs);
+        else
+          k_moe_iu4<true, false, false><<<dim3(mid / 128, max_tiles), 256, 0, g_str>>>(
+              qgu, d_a4x, d_a4xs, d_tokidx, d_moetiles, d_moentiles, hid, mid, d, gu.svh, dn.suh);
       } else if (a4) {
         moe_lut_up_mid(pgu, x16, d_tokidx, d_moetiles, d_moentiles, max_tiles, hid, gu.svh, dn.suh,
                        mid, d, g_str);
@@ -8138,10 +8174,11 @@ struct GpuModel {
       // 默认开；QWENOX_V2_PAIRS_F16=0 回退 fp32 pairs。
       static const bool pairs_f16 = !env_zero("QWENOX_V2_PAIRS_F16");
       if (a4_dn) {
-        k_quant_a4<<<(unsigned)(((size_t)P * k * (mid / 128) + 7) / 8), 256, 0, g_str>>>(
-            hid, P * k, mid, d_a4h, d_a4hs);
+        if (!fused_dn_q)
+          k_quant_a4<<<(unsigned)(((size_t)P * k * (mid / 128) + 7) / 8), 256, 0, g_str>>>(
+              hid, P * k, mid, d_a4h, d_a4hs);
         const Iu4W qdn{dn.data, dn.data + dn.rows * dn.cols / 2, d, 0};
-        k_moe_iu4<false><<<dim3(d / 128, max_tiles), 256, 0, g_str>>>(
+        k_moe_iu4<false, false, false><<<dim3(d / 128, max_tiles), 256, 0, g_str>>>(
             qdn, d_a4h, d_a4hs, nullptr, d_moetiles, d_moentiles, (__half*)d_guvb, d, mid, nullptr,
             nullptr);
       } else if (a4) {
@@ -9030,6 +9067,10 @@ struct GpuModel {
     snprintf(attn_prefix, sizeof attn_prefix,
              "layers.%d.attn_hyper_connection", l);
     KP("hc");
+    static const bool hc_noxb = !env_zero("QWENOX_HC_NOXB");
+#ifndef QWENOX_NPU
+    hc_skip_xb_f32_ = hc_noxb && !is_qsa(l) && P >= 1024 && !dbg && !getenv("QWENOX_VGDUMP");
+#endif
     if (fuse_prev_mlp) {
       snprintf(mlp_prefix, sizeof mlp_prefix,
                "layers.%d.mlp_hyper_connection", l - 1);
@@ -9037,6 +9078,7 @@ struct GpuModel {
     } else {
       gr_read_b(attn_prefix, P);
     }
+    hc_skip_xb_f32_ = false;
     if (getenv("QWENOX_VGDUMP")) {
       char tag[12];
       snprintf(tag, sizeof tag, "nx%d", l);

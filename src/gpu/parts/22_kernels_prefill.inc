@@ -182,9 +182,11 @@ __global__ void k_f32_to_bf16_v4(const float* __restrict__ x,
 // conversion k_f32_to_bf16_v4 in one pass, bf16 out. The gate is read straight
 // from the q_proj output qg [P][24][2][256] (the half k_qsa_qsplit would copy
 // into gs), so qsplit skips that copy. a/out: [P][6144] flat, n4 = P*6144/4.
+template <bool Split2 = false>
 __global__ void k_sigmoid_gate_bf16_v4(const float* __restrict__ a,
                                        const float* __restrict__ qg,
-                                       uint16_t* __restrict__ out, uint64_t n4) {
+                                       uint16_t* __restrict__ out, uint64_t n4,
+                                       int P = 0) {
   uint64_t i4 = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x;
   if (i4 >= n4) return;
   const uint64_t i = i4 * 4, t = i / 6144, r = i - t * 6144;
@@ -195,7 +197,11 @@ __global__ void k_sigmoid_gate_bf16_v4(const float* __restrict__ a,
   uint2 pk;
   pk.x = (uint32_t)o[0] | ((uint32_t)o[1] << 16);
   pk.y = (uint32_t)o[2] | ((uint32_t)o[3] << 16);
-  *(uint2*)(out + i) = pk;
+  uint16_t* dst = Split2
+      ? (out + (r >= 3072 ? (size_t)P * 3072 : 0) + (size_t)t * 3072 +
+         (r >= 3072 ? r - 3072 : r))
+      : (out + i);
+  *(uint2*)dst = pk;
 }
 
 // Compact BF16 [P,512] V rows into block-transposed
@@ -2415,6 +2421,13 @@ __global__ void __launch_bounds__(128)
 // block ids in ublk; the own-block causal check stays logical).
 // KVT = uint16_t（bf16 位流，默认）或 __half（fp16 位流）；vct 转置 cache
 // 与 K 行主序 cache 同为 KVT 编码，WMMA 走对应的 bf16/f16 指令。
+__device__ __forceinline__ void qsa_lds_sync() {
+  __asm__ volatile(
+      "s_waitcnt lgkmcnt(0)\n\t"
+      "s_waitcnt_vscnt null, 0x0\n\t"
+      "s_barrier" ::
+          : "memory");
+}
 template <bool Paged = false, class KVT = uint16_t>
 __global__ void __launch_bounds__(256)
     k_qsa_wmma_u(const float* __restrict__ q, const KVT* __restrict__ kc,
@@ -2458,14 +2471,14 @@ __global__ void __launch_bounds__(256)
     pk.y = qw_pack2<KVT>(v.z, v.w);
     *(uint2*)(stage + row * 32 + dq) = pk;
   }
-  __syncthreads();
+  qsa_lds_sync();
   qw_shortx16 qf[3][2];
 #pragma unroll
   for (int i = 0; i < 3; ++i)
 #pragma unroll
     for (int t = 0; t < 2; ++t)
       qf[i][t] = qw_ld16(stage + (16 * i + r) * 32 + 16 * t);
-  __syncthreads();
+  qsa_lds_sync();
 
   qw_floatx8 O[3][2];
 #pragma unroll
@@ -2560,7 +2573,7 @@ __global__ void __launch_bounds__(256)
         part[i][w][lane * 2 + 1] = make_float4(sc[i][4], sc[i][5], sc[i][6], sc[i][7]);
       }
     }
-    __syncthreads();
+    qsa_lds_sync();
     if (w < 3) {
       // owner：归约 8 个 warp 的 32 维 partial -> 全 256 维 Sᵀ，再 softmax
       float scf[8];
@@ -2637,7 +2650,7 @@ __global__ void __launch_bounds__(256)
         alpha_s[16 * w + r] = alpha;
       }
     }
-    __syncthreads();
+    qsa_lds_sync();
     float al[3];
 #pragma unroll
     for (int i = 0; i < 3; ++i) al[i] = alpha_s[16 * i + r];
@@ -3014,7 +3027,7 @@ __global__ void __launch_bounds__(NT)
             a += gate * (Sc ? (rv * sv[b]) * wn[b] : rv);
           }
           const float value = a / 4;
-          Y[(size_t)p * d + c] = value;
+          if (Y) Y[(size_t)p * d + c] = value;
           Yb[(size_t)p * d + c] = gw_f2bf(value);
         }
       }
@@ -3035,7 +3048,7 @@ __global__ void __launch_bounds__(NT)
             // 输出元素两次 launch 各属唯一 CTA → 恰好一次 RMW，跨 run 逐
             // bit 确定；与全 K 顺序不同（非逐 bit，KLD 门槛）。
             if constexpr (Epi == 3)
-              atomicAdd(&Y[(size_t)(p0 + e) * N + n], acc[i][j][e]);
+              Y[(size_t)(p0 + e) * N + n] += acc[i][j][e];
             else
               Y[(size_t)(p0 + e) * N + n] = acc[i][j][e];
           }

@@ -1776,7 +1776,7 @@ __global__ void k_gdn_gatednorm(const float* __restrict__ y, const float* __rest
 // the rest -> bit-exact, but one block covers 32 tokens instead of 1.
 // grid (heads, ceil(P/32)), block 128 (4 warps); warp w takes tokens
 // blockIdx.y*32 + k*4 + w, k = 0..7.
-template <bool Bf16 = false>
+template <bool Bf16 = false, bool Split2 = false>
 __global__ void k_gdn_gatednorm_b(const float* __restrict__ y,
                                   const float* __restrict__ z,
                                   const float* __restrict__ w,
@@ -1819,7 +1819,10 @@ __global__ void k_gdn_gatednorm_b(const float* __restrict__ y,
       oh[lane + 96] = r3;
     }
     if (Bf16) {
-      uint16_t* bp = bf16 + ((size_t)t * gridDim.x + h) * 128;
+      uint16_t* bp = Split2
+          ? (bf16 + (h >= 24 ? (size_t)P * 3072 : 0) + (size_t)t * 3072 +
+             (h >= 24 ? h - 24 : h) * 128)
+          : (bf16 + ((size_t)t * gridDim.x + h) * 128);
       bp[lane] = f2bf(r0);
       bp[lane + 32] = f2bf(r1);
       bp[lane + 64] = f2bf(r2);

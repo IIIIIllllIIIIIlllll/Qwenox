@@ -1375,6 +1375,60 @@ static bool moe_ggx_down(int type, const uint8_t* dn, const __half* hid, const M
 namespace moeiu4 {
 typedef int v8i __attribute__((ext_vector_type(8)));
 typedef int v2i __attribute__((ext_vector_type(2)));
+
+// Wave-level A4 quantization from strided FWHT registers: lane holds elements
+// {lane, lane+32, lane+64, lane+96} of a 128-element block. Rounds through f16
+// first for bit-exact parity with the unfused f16 -> k_quant_a4 path, then
+// transposes nibbles to contiguous {4*lane..4*lane+3} via 4 wave shuffles.
+__device__ __forceinline__ void quant_a4_wave_strided(float v[4], int lane,
+                                                      uint8_t* __restrict__ q_blk,
+                                                      float* __restrict__ s_blk) {
+#pragma unroll
+  for (int j = 0; j < 4; ++j) v[j] = __half2float(__float2half(v[j]));
+  float amax = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor(amax, o, 32));
+  float best_s = 0.f, best_e = INFINITY;
+  if (amax > 0.f) {
+    const float cand[5] = {1.0f, 0.9f, 0.8f, 0.7f, 0.6f};
+#pragma unroll
+    for (int c = 0; c < 5; ++c) {
+      const float sc = cand[c] * amax / 7.f, inv = 1.f / sc;
+      float e = 0.f;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const float qi = fminf(fmaxf(rintf(v[i] * inv), -8.f), 7.f);
+        const float d = v[i] - qi * sc;
+        e += d * d;
+      }
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) e += __shfl_xor(e, o, 32);
+      if (e < best_e) {
+        best_e = e;
+        best_s = sc;
+      }
+    }
+  }
+  uint32_t pq = 0;
+  if (best_s > 0.f) {
+    const float inv = 1.f / best_s;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int qi = (int)fminf(fmaxf(rintf(v[i] * inv), -8.f), 7.f);
+      pq |= (uint32_t)(qi & 15) << (8 * i);
+    }
+  }
+  const int shift = (lane >> 3) * 8;
+  const int b0 = (lane * 4) & 31;
+  uint32_t packed = 0;
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+    const uint32_t w = __shfl(pq, b0 + k, 32);
+    packed |= ((w >> shift) & 15u) << (4 * k);
+  }
+  reinterpret_cast<uint16_t*>(q_blk)[lane] = (uint16_t)packed;
+  if (lane == 0) *s_blk = best_s;
+}
 }  // namespace moeiu4
 
 // ---------------------------------------------------------------------------
@@ -1437,12 +1491,14 @@ struct Iu4W {
   int e_rows, up_off;
 };
 
-template <bool kUp, bool kGguf = false>
+template <bool kUp, bool kGguf = false, bool kFuseQ4 = false>
 __launch_bounds__(256) __global__
     void k_moe_iu4(Iu4W p, const uint8_t* __restrict__ x4, const float* __restrict__ xs,
                    const int* __restrict__ tokidx, const MoeTile* __restrict__ tiles,
                    const int* __restrict__ ntiles, __half* __restrict__ out, int m, int k,
-                   const float* __restrict__ svh_gu, const float* __restrict__ suh_dn) {
+                   const float* __restrict__ svh_gu, const float* __restrict__ suh_dn,
+                   uint8_t* __restrict__ out_q4 = nullptr,
+                   float* __restrict__ out_s4 = nullptr) {
   constexpr int BM = 128, BN = 64, T = BN / 16;
   constexpr int kActStrideB = 80;  // 64 B codes + 16 B pad: 8-lane phases conflict-free
   constexpr int kCodeBytes = BM * 64, kWscBytes = BM * 2, kActBytes = BN * kActStrideB,
@@ -1466,8 +1522,6 @@ __launch_bounds__(256) __global__
   const int nst = k / 128, nb = k / 128;
   const size_t wrb = (size_t)k / 2, wsb = (size_t)nb * 2;
 
-  // weight fetch: thread -> LDS slot fs (2 threads/slot, 32 B each); slot
-  // 2l+h of a 16-row wave block holds local row 8h+l (packed C epilogue).
   const int fs = tid >> 1, fpart = tid & 1;
   const int flr = (fs & ~15) | ((fs & 1) << 3) | ((fs & 15) >> 1);
   const uint8_t* fw;
@@ -1477,7 +1531,6 @@ __launch_bounds__(256) __global__
     fw = p.codes + grow * wrb + fpart * 32;
     fsc = p.sc + grow * wsb;
   };
-  // activation fetch: thread -> (token at, 16 B chunk ac)
   const int at = tid >> 2, ac = tid & 3;
   const uint8_t* fa = nullptr;
   const float* fas = nullptr;
@@ -1564,19 +1617,19 @@ __launch_bounds__(256) __global__
     fetch(0);
     for (int st = 0; st < nst; ++st) {
       commit();
-      __syncthreads();
+      gwmma_sync();
       if (st + 1 < nst) fetch(st + 1);
       compute();
-      __syncthreads();
+      gwmma_sync();
     }
     if constexpr (kUp) spill(reinterpret_cast<__half*>(lds) + (pass ? kPlaneB / 2 : 0));
   }
 
   if constexpr (kUp) {
-    __syncthreads();
+    gwmma_sync();
     const __half* gplane = reinterpret_cast<const __half*>(lds);
     const __half* uplane = gplane + kPlaneB / 2;
-    for (int s = wave; s < nrows; s += 8) {  // == k_moe_lut kMid mid_slot
+    for (int s = wave; s < nrows; s += 8) {
       const __half* gr = gplane + s * kMidRow;
       const __half* ur = uplane + s * kMidRow;
       float g[4], u[4];
@@ -1586,7 +1639,7 @@ __launch_bounds__(256) __global__
         u[j] = __half2float(ur[j * 32 + lane]);
       }
       float v[4];
-      if constexpr (kGguf) {  // GGUF: weights are already in the plain basis
+      if constexpr (kGguf) {
 #pragma unroll
         for (int j = 0; j < 4; ++j) v[j] = g[j] / (1.f + expf(-g[j])) * u[j];
       } else {
@@ -1600,10 +1653,18 @@ __launch_bounds__(256) __global__
           v[j] = gg / (1.f + expf(-gg)) * uu * suh_dn[i];
         }
         hv2::fwht128(v[0], v[1], v[2], v[3], lane);
-      }
-      __half* o = out + (size_t)(slot0 + s) * m + r_block;
 #pragma unroll
-      for (int j = 0; j < 4; ++j) o[j * 32 + lane] = __float2half(v[j] * (kGguf ? 1.f : hv2::kRs128));
+        for (int j = 0; j < 4; ++j) v[j] *= hv2::kRs128;
+      }
+      if constexpr (kFuseQ4) {
+        moeiu4::quant_a4_wave_strided(
+            v, lane, out_q4 + (size_t)(slot0 + s) * (m / 2) + (r_block / 2),
+            out_s4 + (size_t)(slot0 + s) * (m / 128) + (r_block / 128));
+      } else {
+        __half* o = out + (size_t)(slot0 + s) * m + r_block;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) o[j * 32 + lane] = __float2half(v[j]);
+      }
     }
   } else {
     const int rr = r_block + wave * 16 + half * 8;

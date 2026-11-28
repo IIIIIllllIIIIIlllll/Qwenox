@@ -95,6 +95,31 @@ __global__ __launch_bounds__(256) void k_v2_rot(const TX* __restrict__ x, uint64
   }
 }
 
+// Fused v2_rot + k_quant_a4 (for MOE_A4 up input): avoids writing x16 to DRAM
+// and reading it back in k_quant_a4. Bit-identical to k_v2_rot<float,true> + k_quant_a4.
+__global__ __launch_bounds__(256) void k_v2_rot_a4(const float* __restrict__ x, uint64_t xs,
+                                                   uint8_t* __restrict__ q,
+                                                   float* __restrict__ s,
+                                                   const float* __restrict__ pre, int n, int P) {
+  const int lane = threadIdx.x & 31;
+  const int gw = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  const int nb = n >> 7;
+  if (gw >= P * nb) return;
+  const int p = gw / nb, b = gw - p * nb;
+  const float* xr = x + (size_t)p * xs + b * 128;
+  float v[4];
+#pragma unroll
+  for (int j = 0; j < 4; j++) {
+    const int i = j * 32 + lane;
+    v[j] = xr[i] * (pre ? pre[b * 128 + i] : 1.f);
+  }
+  hv2::fwht128(v[0], v[1], v[2], v[3], lane);
+#pragma unroll
+  for (int j = 0; j < 4; j++) v[j] *= hv2::kRs128;
+  moeiu4::quant_a4_wave_strided(v, lane, q + (size_t)p * (n / 2) + b * 64,
+                                s + (size_t)p * nb + b);
+}
+
 // i4r expert middle, one block per slot, 2*mid/128 waves:
 //   g|u = svh_gu . H(z) / sqrt128   (z = rotated gate_up output, 2*mid wide,
 //                                    f32 from the GEMVs or f16 from the LUT)
