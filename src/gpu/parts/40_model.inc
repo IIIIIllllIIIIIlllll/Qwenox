@@ -1093,7 +1093,8 @@ struct GpuModel {
   int last_spec_rounds = 0;
   int last_spec_commit = 0;
   int last_spec_rollbacks = 0;
-  int last_spec_proposed = 0;  // sum of drafts offered (D line trailing field)
+  int last_spec_proposed = 0;
+  int last_spec_accepted = 0;  // 实际保留的草稿，不含纠正、续接或串行 token
   // The n-gram (prompt lookup) rounds' share of the counters above, so the
   // draft head's own acceptance can be reported apart (D line, 11-10).
   int last_ng_rounds = 0;
@@ -1119,7 +1120,7 @@ struct GpuModel {
   unsigned prog_gen = 0;
   unsigned prog_ev_gen[64] = {};
   int live_spec_rounds = 0;
-  int live_spec_commits = 0;
+  int live_spec_accepted = 0;
   int live_spec_proposed = 0;
   // Trunk rollback checkpoint for verify: S + convst + PLE ring + trunk iraw,
   // plus a separate tiny slot for the MTP indexer ring (saved post-draft-1).
@@ -1310,8 +1311,8 @@ struct GpuModel {
   X(cut_alloc_s_fn) X(cut_done_fn) X(d_mR)                                    \
   X(prog_total) X(prog_base) X(prog_last_est) X(prog_req) X(prog_t0) X(pf_end) \
   X(prog_last) X(prog_snap_last) X(prog_snap_last_est) X(last_spec_rounds) X(last_spec_commit) X(last_spec_rollbacks) \
-  X(last_spec_proposed) X(last_ng_rounds) X(last_ng_proposed)                \
-  X(last_ng_accepted) X(live_spec_rounds) X(live_spec_commits)                \
+  X(last_spec_proposed) X(last_spec_accepted) X(last_ng_rounds) X(last_ng_proposed) \
+  X(last_ng_accepted) X(live_spec_rounds) X(live_spec_accepted)                \
   X(live_spec_proposed) X(g1_exec) X(g2_exec) X(gall_exec) X(gall_samp_exec)   \
   X(gall_pipe_exec) X(gall_pipe_exec2) X(d_S) X(d_S_bf16) X(s_bf16_valid) X(d_convst) X(d_ring) X(d_iraw) X(d_R) X(d_pos) X(d_ringpos) \
   X(d_miraw) X(d_mpos) X(d_ckpt) X(d_mring_ckpt)
@@ -11898,7 +11899,8 @@ struct GpuModel {
       const std::function<bool(int)>& emit = nullptr) {
     last_spec_rounds = last_spec_commit = last_spec_rollbacks = last_spec_proposed = 0;
     last_ng_rounds = last_ng_proposed = last_ng_accepted = 0;
-    live_spec_rounds = live_spec_commits = live_spec_proposed = 0;
+    last_spec_accepted = 0;
+    live_spec_rounds = live_spec_accepted = live_spec_proposed = 0;
     std::vector<int> out;
     out.reserve(std::max(0, gen));
     const int maxg = std::min({64, std::max(1, gamma), maxbatch - 1});
@@ -11984,11 +11986,12 @@ struct GpuModel {
       last_ng_proposed += (int)draft.size();
       last_ng_accepted += keep;
       live_spec_rounds = last_spec_rounds;
-      live_spec_commits = accepted + last_spec_rounds;
+      live_spec_accepted = accepted;
       live_spec_proposed = last_spec_proposed;
       if (stop) break;
     }
     last_spec_commit = (int)out.size();
+    last_spec_accepted = live_spec_accepted;
     fprintf(stderr, "%s ngram: tokens=%d rounds=%d accepted=%d proposed=%d "
                     "fallback=%d rollbacks=%d verify=%.1fms replay=%.1fms\n",
             log_ts(), last_spec_commit, last_spec_rounds, accepted,
@@ -12521,7 +12524,8 @@ struct GpuModel {
                              bool limit_gamma = true) {
     last_spec_rounds = last_spec_commit = last_spec_rollbacks = 0;
     last_ng_rounds = last_ng_proposed = last_ng_accepted = 0;
-    live_spec_rounds = live_spec_commits = live_spec_proposed = 0;
+    last_spec_accepted = 0;
+    live_spec_rounds = live_spec_accepted = live_spec_proposed = 0;
     std::vector<int> out;
     out.reserve(gen + 1);
     GammaCtl gctl(gamma, false);
@@ -12665,9 +12669,6 @@ struct GpuModel {
       if (g > 0) gctl.update(g, a);  // γ = 0 rounds carry no draft evidence
       occ.update(g, a);
       rounds++;
-      live_spec_rounds = rounds;
-      live_spec_proposed += g;
-      live_spec_commits = (int)out.size();  // pre-emit; one round of lag is fine
       // emit() streams each committed token as it lands; returning false
       // stops the round and leaves THIS token out of the trunk state (eos,
       // or cancel after it was streamed — the next turn re-ingests it via
@@ -12733,6 +12734,9 @@ struct GpuModel {
         mtp_pos = q + 1;
         CK(hipMemcpyAsync(d_mpos, &mtp_pos, 4, hipMemcpyHostToDevice, g_str));
       }
+      live_spec_rounds = rounds;
+      live_spec_proposed += g;
+      live_spec_accepted += d;
       if (stop) break;
       auto t5 = std::chrono::steady_clock::now();
       t_draft += ms(t0, t1);
@@ -12762,6 +12766,7 @@ struct GpuModel {
     occ.report("spec");
     last_spec_rounds = rounds;
     last_spec_commit = (int)out.size();
+    last_spec_accepted = live_spec_accepted;
     last_spec_proposed = live_spec_proposed;
     last_spec_rollbacks = rollbacks;
     return out;
@@ -12778,7 +12783,8 @@ struct GpuModel {
     last_spec_rounds = last_spec_commit = last_spec_rollbacks =
         last_spec_proposed = 0;
     last_ng_rounds = last_ng_proposed = last_ng_accepted = 0;
-    live_spec_rounds = live_spec_commits = live_spec_proposed = 0;
+    last_spec_accepted = 0;
+    live_spec_rounds = live_spec_accepted = live_spec_proposed = 0;
     std::vector<int> out;
     out.reserve(std::max(0, gen));
     const int maxg = std::min({64, std::max(1, ngram.n_max), maxbatch - 1});
@@ -13205,7 +13211,7 @@ struct GpuModel {
       }
       ++last_spec_rounds;
       live_spec_rounds = last_spec_rounds;
-      live_spec_commits = (int)out.size();
+      live_spec_accepted = accepted;
       live_spec_proposed = last_spec_proposed;
       if (stop) break;
     }
@@ -13213,6 +13219,7 @@ struct GpuModel {
         std::chrono::duration<double>(std::chrono::steady_clock::now() - T0)
             .count();
     last_spec_commit = (int)out.size();
+    last_spec_accepted = live_spec_accepted;
     last_spec_rollbacks = ng_roll + mtp_roll;
     fprintf(stderr,
             "%s chain: %d tokens in %.2f s = %.1f tok/s | rounds=%d (ngram=%d "
@@ -13253,7 +13260,8 @@ struct GpuModel {
       bool limit_gamma = true) {
     last_spec_rounds = last_spec_commit = last_spec_rollbacks = 0;
     last_ng_rounds = last_ng_proposed = last_ng_accepted = 0;
-    live_spec_rounds = live_spec_commits = live_spec_proposed = 0;
+    last_spec_accepted = 0;
+    live_spec_rounds = live_spec_accepted = live_spec_proposed = 0;
     std::vector<int> out;
     out.reserve(gen + 1);
     GammaCtl gctl(gamma, true);
@@ -13437,9 +13445,6 @@ struct GpuModel {
       }
       gctl.update(g, a);
       rounds++;
-      live_spec_rounds = rounds;
-      live_spec_proposed += g;
-      live_spec_commits = (int)out.size();  // pre-emit; one round of lag is fine
 
       int d = a, stopped_token = -1;
       bool stop = false, keep_next = true;
@@ -13506,6 +13511,9 @@ struct GpuModel {
         mtp_pos = q + 1;
         CK(hipMemcpyAsync(d_mpos, &mtp_pos, 4, hipMemcpyHostToDevice, g_str));
       }
+      live_spec_rounds = rounds;
+      live_spec_proposed += g;
+      live_spec_accepted += d;
       if (stop) break;
       auto t5 = std::chrono::steady_clock::now();
       t_draft += ms(t0, t1);
@@ -13532,6 +13540,7 @@ struct GpuModel {
     gctl.report("spec-sample");
     last_spec_rounds = rounds;
     last_spec_commit = (int)out.size();
+    last_spec_accepted = live_spec_accepted;
     last_spec_proposed = live_spec_proposed;
     last_spec_rollbacks = rollbacks;
     return out;
@@ -13555,7 +13564,8 @@ struct GpuModel {
     last_spec_rounds = last_spec_commit = last_spec_rollbacks =
         last_spec_proposed = 0;
     last_ng_rounds = last_ng_proposed = last_ng_accepted = 0;
-    live_spec_rounds = live_spec_commits = live_spec_proposed = 0;
+    last_spec_accepted = 0;
+    live_spec_rounds = live_spec_accepted = live_spec_proposed = 0;
     std::vector<int> out;
     out.reserve(std::max(0, gen));
     const int maxg = std::min({64, std::max(1, ngram.n_max), maxbatch - 1});
@@ -14321,7 +14331,7 @@ struct GpuModel {
       }
       ++last_spec_rounds;
       live_spec_rounds = last_spec_rounds;
-      live_spec_commits = (int)out.size();
+      live_spec_accepted = accepted;
       live_spec_proposed = last_spec_proposed;
       if (stop) break;
     }
@@ -14329,6 +14339,7 @@ struct GpuModel {
         std::chrono::duration<double>(std::chrono::steady_clock::now() - T0)
             .count();
     last_spec_commit = (int)out.size();
+    last_spec_accepted = live_spec_accepted;
     last_spec_rollbacks = ng_roll + mtp_roll;
     fprintf(stderr,
             "%s chain-sample: %d tokens in %.2f s = %.1f tok/s | rounds=%d "

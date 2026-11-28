@@ -1467,8 +1467,9 @@ std::vector<int> GpuModel::df2_spec_loop(
     ~EndDump() { df2_ring_dump(m.df2, m.pos, "end"); }
   } end_dump{*this};
   last_spec_rounds = last_spec_commit = last_spec_rollbacks = 0;
+  last_spec_proposed = last_spec_accepted = 0;
   last_ng_rounds = last_ng_proposed = last_ng_accepted = 0;
-  live_spec_rounds = live_spec_commits = live_spec_proposed = 0;
+  live_spec_rounds = live_spec_accepted = live_spec_proposed = 0;
   std::vector<int> out;
   out.reserve((size_t)std::max(0, gen) + 1);
   // QWENOX_DF2_GAMMA overrides; otherwise confidence truncation picks the
@@ -1682,9 +1683,6 @@ std::vector<int> GpuModel::df2_spec_loop(
       }
     }
     rounds++;
-    live_spec_rounds = rounds;
-    live_spec_proposed += g;
-    live_spec_commits = (int)out.size();
     int d = a;
     bool stop = false, keep_v = true;
     if (emit) {
@@ -1782,12 +1780,16 @@ std::vector<int> GpuModel::df2_spec_loop(
     t_draft += ms(t0, t1);
     t_verify += ms(t1, t2);
     t_roll += ms(t3, t5);
+    live_spec_rounds = rounds;
+    live_spec_proposed += g;
+    live_spec_accepted += d;
     if (stop) break;
   }
   double sec = std::chrono::duration<double>(now() - T0).count();
   last_spec_rounds = rounds;
   last_spec_commit = (int)out.size();
   last_spec_proposed = live_spec_proposed;
+  last_spec_accepted = live_spec_accepted;
   last_spec_rollbacks = rollbacks;
   if (!bench_quiet) {
     fprintf(stderr,
@@ -1841,8 +1843,9 @@ std::vector<int> GpuModel::df2_spec_loop_sample(
     int cur, int gen, Sampler& sampler,
     const std::function<bool(int, float)>& emit) {
   last_spec_rounds = last_spec_commit = last_spec_rollbacks = 0;
+  last_spec_proposed = last_spec_accepted = 0;
   last_ng_rounds = last_ng_proposed = last_ng_accepted = 0;
-  live_spec_rounds = live_spec_commits = live_spec_proposed = 0;
+  live_spec_rounds = live_spec_accepted = live_spec_proposed = 0;
   std::vector<int> out;
   out.reserve((size_t)std::max(0, gen) + 1);
   static const float sconf = [] {
@@ -1985,9 +1988,6 @@ std::vector<int> GpuModel::df2_spec_loop_sample(
       if (j < a) depth_hits[j]++;
     }
     rounds++;
-    live_spec_rounds = rounds;
-    live_spec_proposed += g;
-    live_spec_commits = (int)out.size();
     int d = a, stopped_token = -1;
     bool stop = false, keep_next = true;
     if (emit) {
@@ -2044,12 +2044,16 @@ std::vector<int> GpuModel::df2_spec_loop_sample(
     t_draft += ms(t0, t1);
     t_verify += ms(t1, t2);
     t_roll += ms(t3, t5);
+    live_spec_rounds = rounds;
+    live_spec_proposed += g;
+    live_spec_accepted += d;
     if (stop) break;
   }
   double sec = std::chrono::duration<double>(now() - T0).count();
   last_spec_rounds = rounds;
   last_spec_commit = (int)out.size();
   last_spec_proposed = live_spec_proposed;
+  last_spec_accepted = live_spec_accepted;
   last_spec_rollbacks = rollbacks;
   if (!bench_quiet) {
     fprintf(stderr,

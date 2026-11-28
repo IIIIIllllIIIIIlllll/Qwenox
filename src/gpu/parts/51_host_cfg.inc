@@ -3830,6 +3830,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       }
     }
     m.last_spec_rounds = m.last_spec_commit = m.last_spec_rollbacks = 0;
+    m.last_spec_proposed = m.last_spec_accepted = 0;
     m.last_ng_rounds = m.last_ng_proposed = m.last_ng_accepted = 0;
     // Prompt ingest. A failure here (or a KvOverflow anywhere below) lands
     // in the catch at the end: the slot is reset, the client gets D error.
@@ -3893,7 +3894,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
                     (int)use_spec, (int)chain_mtp, (int)use_df2, cuts.size());
     // live spec counters reset per request, or a serial decode after a
     // speculative one would report the previous request's acceptance
-    m.live_spec_rounds = m.live_spec_commits = m.live_spec_proposed = 0;
+    m.live_spec_rounds = m.live_spec_accepted = m.live_spec_proposed = 0;
     std::vector<kvsnap::Pending> pend;  // SSD captures, committed at turn end
     // Only prompt ingest passes its request's cancellation flag. Keep it on
     // the call stack across GPU handoffs; another slot must not overwrite it.
@@ -4028,10 +4029,19 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     int ngen = 0;
     bool dead = false;
     std::string reason = "length";
-    // 1s-cadence decode stats (2026-09-13): instantaneous + average t/s,
-    // with the live MTP acceptance the spec loops bump every round.
-    // committed drafts = commits - rounds (each round also emits the
-    // verify/bonus token), acceptance = committed / proposed.
+    int spec_r = 0, spec_c = 0, spec_p = 0, spec_a = 0;
+    int ng_r = 0, ng_p = 0, ng_a = 0;
+    auto collect_spec_stats = [&] {
+      spec_r += m.last_spec_rounds;
+      spec_c += m.last_spec_commit;
+      spec_p += m.last_spec_proposed;
+      spec_a += m.last_spec_accepted;
+      ng_r += m.last_ng_rounds;
+      ng_p += m.last_ng_proposed;
+      ng_a += m.last_ng_accepted;
+      // CKPT 暂停期间也会打点，刚结算的分段不能再计入实时值。
+      m.live_spec_rounds = m.live_spec_accepted = m.live_spec_proposed = 0;
+    };
     // perfsnap（托盘 tooltip / 悬浮窗）走独立的 200ms 节奏：不满 1s 的短
     // 请求在首个日志点之前结束，快照照样有数据；stderr 日志维持 1s。
     auto dl_t0 = std::chrono::steady_clock::now();
@@ -4043,29 +4053,24 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       auto now = std::chrono::steady_clock::now();
       const double el = std::chrono::duration<double>(now - dl_t0).count();
       const double siv = std::chrono::duration<double>(now - dl_snap_last).count();
+      const int proposed = spec_p + m.live_spec_proposed;
+      const int accepted = spec_a + m.live_spec_accepted;
+      const double accept_pct = proposed > 0 ? 100.0 * accepted / proposed : -1.0;
       if (siv >= 0.2) {
         perfsnap::write_decode((uint64_t)g.req, (ngen - dl_snap_last_ngen) / siv,
-                               el > 0 ? ngen / el : 0.0,
-                               m.live_spec_rounds > 0 && m.live_spec_proposed
-                                   ? 100.0 * (m.live_spec_commits - m.live_spec_rounds) /
-                                         (double)m.live_spec_proposed
-                                   : -1.0);
+                               el > 0 ? ngen / el : 0.0, accept_pct);
         dl_snap_last = now;
         dl_snap_last_ngen = ngen;
       }
       double iv = std::chrono::duration<double>(now - dl_last).count();
       if (iv < 1.0) return;
-      if (m.live_spec_rounds > 0) {
-        int acc_n = m.live_spec_commits - m.live_spec_rounds;
+      if (proposed > 0) {
         fprintf(stderr,
                 "%s req %lld | n_decoded = %d | t = %.0f s | tg = %.1f "
                 "tok/s (avg %.1f) | accept %.1f%% (%d/%d)\n",
                 log_ts(), (long long)g.req, ngen, el,
                 (ngen - dl_last_ngen) / iv, el > 0 ? ngen / el : 0.0,
-                m.live_spec_proposed
-                    ? 100.0 * acc_n / m.live_spec_proposed
-                    : 0.0,
-                acc_n, m.live_spec_proposed);
+                accept_pct, accepted, proposed);
       } else {
         fprintf(stderr,
                 "%s req %lld | n_decoded = %d | t = %.0f s | tg = %.1f "
@@ -4076,7 +4081,7 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
       dl_last = now;
       dl_last_ngen = ngen;
       crashdiag::note("req %lld decode n=%d pos=%d rounds=%d", (long long)g.req, ngen, m.pos,
-                      m.live_spec_rounds);
+                      spec_r + m.live_spec_rounds);
     };
     // Token line; the X verb (reader thread) raises `cancel`.
     auto send_tok = [&](int tok, bool with_lp, float lp) -> bool {
@@ -4102,11 +4107,9 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
     // from the previous prompt-end cut), then ingests the token serially --
     // MTP boundary pairing first, while d_R is still h_{pos-1} -- and the
     // caller re-enters the loop. The loops reset their spec counters at
-    // entry, so they are accumulated across pauses and written back.
+    // entry, so the request accumulates each completed segment separately.
     int pause_tok = -1;
     float pause_lp = 0.0f;
-    int spec_r = 0, spec_c = 0, spec_p = 0;
-    int ng_r = 0, ng_p = 0, ng_a = 0;  // n-gram share, summed like spec_*
     // The one pause checkpoint per turn that also goes to the SSD tier (from
     // its RAM copy, at the end of the turn: kvsnap::capture_ram), so a
     // re-rendered reply still resumes inside it after a restart or RAM
@@ -4191,21 +4194,10 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
                                      chain_mtp, emit_ng_smp, g.seeded, sg_env != nullptr);
           else if (chain) m.spec_loop_chain(cur, g.max_tokens - 1, spec_gamma, emit_ng, sg_env != nullptr);
           else m.spec_loop_ngram(cur, g.max_tokens - 1, m.ngram.n_max, emit_ng);
-          spec_r += m.last_spec_rounds;
-          spec_c += m.last_spec_commit;
-          spec_p += m.last_spec_proposed;
-          ng_r += m.last_ng_rounds;
-          ng_p += m.last_ng_proposed;
-          ng_a += m.last_ng_accepted;
+          collect_spec_stats();
           if (pause_tok < 0 || dead || cancel || reason == "done") break;
           if (!ckpt_pause(chain)) break;
         }
-        m.last_spec_rounds = spec_r;
-        m.last_spec_commit = spec_c;
-        m.last_spec_proposed = spec_p;
-        m.last_ng_rounds = ng_r;
-        m.last_ng_proposed = ng_p;
-        m.last_ng_accepted = ng_a;
       }
       hist.assign(m.chist.begin(), m.chist.end());
     } else if (use_df2) {
@@ -4244,14 +4236,9 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
             m.df2_spec_loop(cur, g.max_tokens - 1, spec_gamma, emit, df2_hyb,
                             spec_gamma);
           }
-          spec_r += m.last_spec_rounds;
-          spec_c += m.last_spec_commit;
-          spec_p += m.last_spec_proposed;
+          collect_spec_stats();
           break;  // no ckpt-pause tokens on the dflash2 path
         }
-        m.last_spec_rounds = spec_r;
-        m.last_spec_commit = spec_c;
-        m.last_spec_proposed = spec_p;
         hist.assign(m.chist.begin(), m.chist.end());
       }
     } else if (use_spec) {
@@ -4297,15 +4284,10 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
               m.spec_loop(cur, g.max_tokens - 1, spec_gamma, emit, sg_env != nullptr);
             }
           }
-          spec_r += m.last_spec_rounds;
-          spec_c += m.last_spec_commit;
-          spec_p += m.last_spec_proposed;
+          collect_spec_stats();
           if (pause_tok < 0 || dead || cancel || reason == "done") break;
           if (!ckpt_pause(true)) break;
         }
-        m.last_spec_rounds = spec_r;
-        m.last_spec_commit = spec_c;
-        m.last_spec_proposed = spec_p;
         // Trunk ingested exactly chist tokens; hist must match for the
         // next turn's KV-reuse prefix check.
         hist.assign(m.chist.begin(), m.chist.end());
@@ -4581,18 +4563,14 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
                         .count();
     if (cancel)
       snprintf(db, sizeof db, "D %lld cancel 0 0 0.0 0.0\n", (long long)g.req);
-    else if ((use_spec || use_ngram || use_chain || use_df2) &&
-             m.last_spec_rounds > 0)
+    else if (spec_r > 0)
       snprintf(db, sizeof db,
-               "D %lld %s %zu %d %.1f %.1f %d %d %d %d %d %d %d %d\n",
+               "D %lld %s %zu %d %.1f %.1f %d %d %d %d %d %d %d %d %d\n",
                (long long)g.req, reason.c_str(), g.ids.size(), ngen, pre_ms,
                ngen > 1 ? dec_ms : 0.0,
                use_chain ? (chain_mtp ? 4 : 3)
                          : (use_ngram ? 3 : (use_df2 ? 2 : 1)),
-               m.last_spec_rounds,
-               m.last_spec_commit, n_cached, m.last_spec_proposed,
-               // n-gram share of rounds / proposed / accepted (11-10)
-               m.last_ng_rounds, m.last_ng_proposed, m.last_ng_accepted);
+               spec_r, spec_c, n_cached, spec_p, ng_r, ng_p, ng_a, spec_a);
     else
       // trailing "0 0 0 <n_cached> 0": drafter/rounds/commit placeholders
       // so n_cached lands in the protocol's cache column (parts[10]);
@@ -4627,32 +4605,23 @@ static void gen_one(GpuModel& m, Conn& c, GenReq g,
                 cancel ? "cancel" : reason.c_str());
       crashdiag::note("req %lld done gen=%d (%s)", (long long)g.req, ngen,
                       cancel ? "cancel" : reason.c_str());
-      if ((use_spec || use_ngram || use_chain) && m.last_spec_rounds > 0) {
-        // Request totals (summed across ckpt pauses): the draft head's own
-        // rate and the n-gram leg's, reported apart (11-10).
-        const int all_acc = std::max(0, m.last_spec_commit - m.last_spec_rounds);
-        const int mtp_p = m.last_spec_proposed - m.last_ng_proposed;
-        const int mtp_a = std::max(0, all_acc - m.last_ng_accepted);
-        fprintf(stderr,
-                "%s req %lld | draft split: mtp %.3f (%d/%d) | ngram %.3f (%d/%d, %d "
-                "rounds)\n",
-                log_ts(), (long long)g.req, mtp_p > 0 ? (double)mtp_a / mtp_p : 0.0, mtp_a,
-                mtp_p, m.last_ng_proposed > 0 ? (double)m.last_ng_accepted / m.last_ng_proposed : 0.0,
-                m.last_ng_accepted, m.last_ng_proposed, m.last_ng_rounds);
-        int acc_n = m.live_spec_commits - m.live_spec_rounds;
+      if (spec_p > 0) {
+        if (!use_df2) {
+          const int mtp_p = spec_p - ng_p;
+          const int mtp_a = spec_a - ng_a;
+          fprintf(stderr,
+                  "%s req %lld | draft split: mtp %.3f (%d/%d) | ngram %.3f (%d/%d, %d "
+                  "rounds)\n",
+                  log_ts(), (long long)g.req, mtp_p > 0 ? (double)mtp_a / mtp_p : 0.0,
+                  mtp_a, mtp_p, ng_p > 0 ? (double)ng_a / ng_p : 0.0, ng_a, ng_p, ng_r);
+        }
         fprintf(stderr,
                 "%s req %lld | draft acceptance = %.3f (%d accepted / %d "
                 "proposed), mean len = %.2f, drafter %s\n",
-                log_ts(), (long long)g.req,
-                m.live_spec_proposed
-                    ? (double)acc_n / m.live_spec_proposed
-                    : 0.0,
-                acc_n, m.live_spec_proposed,
-                m.last_spec_rounds
-                    ? (double)m.live_spec_commits / m.last_spec_rounds
-                    : 0.0,
+                log_ts(), (long long)g.req, (double)spec_a / spec_p, spec_a, spec_p,
+                (double)spec_c / spec_r,
                 use_chain ? (chain_mtp ? "chain" : "ngram")
-                          : (use_ngram ? "ngram" : "mtp"));
+                          : (use_ngram ? "ngram" : (use_df2 ? "dflash2" : "mtp")));
       }
       // D2-S2: rendezvous pool snapshot + batch-size histogram (histogram
       // buckets = segments per batch, 8 = 8+).

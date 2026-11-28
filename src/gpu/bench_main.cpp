@@ -771,7 +771,7 @@ static int run_decode(GpuModel& model, const BenchConfig& config, int maxctx,
       elapsed += seconds_since(start);
       decoded += output.size();
       proposed += model.last_spec_proposed;
-      accepted += std::max(0, model.last_spec_commit - model.last_spec_rounds);
+      accepted += model.last_spec_accepted;
     }
     const double rate = decoded / elapsed;
     const double acceptance = proposed > 0 ? accepted / proposed : 0;
